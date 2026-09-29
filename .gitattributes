@@ -1,0 +1,3 @@
+* text=auto
+# cmd.exe špatně čte dávkové soubory s unixovými konci řádků
+*.bat text eol=crlf

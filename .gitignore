@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Sestavení (build.bat / PyInstaller)
+build/
+dist/
+*.spec
+
+# Osobní nastavení aplikace (cesty k úložišti, vzhled oken)
+settings.json
