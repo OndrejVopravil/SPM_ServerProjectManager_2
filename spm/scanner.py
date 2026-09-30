@@ -6,6 +6,7 @@ import fnmatch
 import hashlib
 import os
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
@@ -99,6 +100,8 @@ def copy_with_hash(src: Path, dst: Path) -> str:
     aby přerušené kopírování nezanechalo poškozený cílový soubor.
     """
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        set_readonly(dst, False)  # soubor jen pro čtení nejde ve Windows nahradit
     tmp = dst.with_name(dst.name + ".spmtmp")
     h = hashlib.sha256()
     try:
@@ -115,6 +118,35 @@ def copy_with_hash(src: Path, dst: Path) -> str:
         tmp.unlink(missing_ok=True)
         raise
     return h.hexdigest()
+
+
+def set_readonly(path: Path, readonly: bool) -> None:
+    """Nastaví / zruší atribut „jen pro čtení“. Soubory, které uživatel nemá zamčené,
+    jsou v místní kopii jen pro čtení, aby je omylem neupravil (Cimatron je otevře jen pro čtení)."""
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode & ~stat.S_IWRITE if readonly else mode | stat.S_IWRITE)
+    except FileNotFoundError:
+        pass
+
+
+def _clear_readonly_and_retry(func, path, _exc) -> None:
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
+def rmtree(path: Path) -> None:
+    """shutil.rmtree, které smaže i soubory jen pro čtení; ostatní chyby ignoruje."""
+    try:
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+    except OSError:
+        pass
+
+
+def move_file(src: Path, dst: Path) -> None:
+    """Přesun souboru i přes atribut jen pro čtení (atribut zůstane zachován)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dst)
 
 
 def same_stat(a_size: int, a_mtime: float, b_size: int, b_mtime: float) -> bool:

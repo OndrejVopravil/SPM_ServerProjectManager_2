@@ -26,24 +26,27 @@ from ..config import Settings
 from ..db import ProjectDB
 from ..names import format_invalid
 from ..sync import (
-    DeactivationPlan,
-    DeactivationResult,
     ProjectManager,
     ProjectStatus,
+    RefreshResult,
+    UploadPlan,
+    UploadResult,
     validate_project_name,
 )
-from .deactivate_dialog import DeactivateDialog
+from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
 from .settings_dialog import SettingsDialog
 from .ui_state import restore_geometry, restore_header, save_geometry, save_header
+from .upload_dialog import UploadDialog
 from .worker import run_task
 
 REFRESH_MS = 30_000
 COLOR_MINE = QColor("#2e8b57")      # aktivováno mnou
-COLOR_OTHER = QColor("#c0392b")     # aktivováno jiným uživatelem
+COLOR_OTHER = QColor("#2f6fb5")     # pracují na něm jiní (lze se přidat)
 COLOR_INVALID = QColor("#e67e22")   # nepovolené znaky v názvech – nelze aktivovat
 
-COLUMNS = ["Projekt", "Stav", "Aktivoval", "Počítač", "Od", "Místní kopie"]
+COLUMNS = ["Projekt", "Stav", "Aktivováno", "Od", "Místní kopie"]
+HEADER_KEY = "main.v2"  # změna sloupců -> neobnovovat šířky uložené pro starší rozvržení
 
 
 class NameCheckThread(QThread):
@@ -70,6 +73,16 @@ def normalize(text: str) -> str:
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
+def format_refresh(res: RefreshResult) -> str:
+    lines = [f"Staženo: {len(res.downloaded)}   Přesunuto: {len(res.moved)}   Odstraněno: {len(res.removed)}"]
+    for title, items in (("Staženo", res.downloaded), ("Přesunuto", res.moved), ("Odstraněno", res.removed)):
+        if items:
+            lines.append(f"\n{title}:\n  " + "\n  ".join(items[:15]) + ("\n  …" if len(items) > 15 else ""))
+    if res.conflicts:
+        lines.append("\nNepřevzato kvůli místním změnám:\n  " + "\n  ".join(res.conflicts[:15]))
+    return "\n".join(lines)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings: Settings):
         super().__init__()
@@ -80,7 +93,7 @@ class MainWindow(QMainWindow):
         self._name_check: NameCheckThread | None = None
         self._name_check_again = False
         self.setWindowTitle(f"SPM – Server Project Manager {__version__}")
-        self.resize(950, 560)
+        self.resize(1000, 560)
         restore_geometry(settings, "main", self)
 
         self.table = QTableWidget(0, len(COLUMNS))
@@ -92,7 +105,7 @@ class MainWindow(QMainWindow):
         self.table.setWordWrap(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         # šířky sloupců: uložené od minula, jinak se jednou nastaví podle obsahu
-        self._columns_sized = restore_header(settings, "main", self.table.horizontalHeader())
+        self._columns_sized = restore_header(settings, HEADER_KEY, self.table.horizontalHeader())
         self.table.itemSelectionChanged.connect(self._on_selection)
         # dvojklik otevírá jen složku projektu, ne celé místní úložiště
         self.table.doubleClicked.connect(lambda _: self.open_local(root_fallback=False))
@@ -103,18 +116,28 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
         self.act_refresh = self._action(tb, "Obnovit", self.refresh, QKeySequence.StandardKey.Refresh)
         tb.addSeparator()
-        self.act_activate = self._action(tb, "Aktivovat", self.activate)
-        self.act_deactivate = self._action(tb, "Deaktivovat…", self.deactivate)
+        self.act_activate = self._action(tb, "Aktivovat…", self.activate,
+                                         tip="Stáhne projekt a zamkne vybrané soubory k úpravě")
+        self.act_submit = self._action(tb, "Odevzdat…", self.submit,
+                                       tip="Nahraje vybrané změny na server a uvolní je – projekt zůstane aktivovaný")
+        self.act_update = self._action(tb, "Aktualizovat", self.update_from_server,
+                                       tip="Stáhne ze serveru soubory, které odevzdali ostatní")
+        self.act_take = self._action(tb, "Převzít…", self.take,
+                                     tip="Zamkne další volné soubory k úpravě")
+        self.act_deactivate = self._action(tb, "Deaktivovat…", self.deactivate,
+                                           tip="Odevzdá vše, uvolní všechny zámky a ukončí aktivaci")
+        tb.addSeparator()
         self.act_publish = self._action(tb, "Publikovat…", self.publish)
         self.act_open = self._action(tb, "Otevřít místní složku", self.open_local)
         self.act_history = self._action(tb, "Historie", self.history)
         tb.addSeparator()
-        self.act_cancel = self._action(tb, "Zrušit aktivaci", self.cancel_activation)
-        self.act_unlock = self._action(tb, "Odebrat zámek…", self.force_unlock)
-        tb.addSeparator()
         self._action(tb, "Nastavení", self.open_settings)
 
-        # jen v kontextovém menu (pravé tlačítko) a pod klávesou F2
+        # jen v kontextovém menu (pravé tlačítko)
+        self.act_cancel = QAction("Zrušit aktivaci…", self)
+        self.act_cancel.triggered.connect(lambda: self.cancel_activation())
+        self.act_unlock = QAction("Odebrat zámky uživatele…", self)
+        self.act_unlock.triggered.connect(lambda: self.force_unlock())
         self.act_rename = QAction("Přejmenovat…", self)
         self.act_rename.setShortcut(QKeySequence(Qt.Key.Key_F2))
         self.act_rename.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
@@ -151,11 +174,13 @@ class MainWindow(QMainWindow):
         self._update_status_bar()
         QTimer.singleShot(0, self._startup)
 
-    def _action(self, tb: QToolBar, text: str, slot, shortcut=None) -> QAction:
+    def _action(self, tb: QToolBar, text: str, slot, shortcut=None, tip: str = "") -> QAction:
         act = QAction(text, self)
         act.triggered.connect(lambda: slot())
         if shortcut:
             act.setShortcut(shortcut)
+        if tip:
+            act.setToolTip(tip)
         tb.addAction(act)
         return act
 
@@ -196,12 +221,12 @@ class MainWindow(QMainWindow):
         self._start_name_check()
 
     def _start_name_check(self) -> None:
-        """Na pozadí zkontroluje názvy složek a souborů v neaktivovaných projektech."""
+        """Na pozadí zkontroluje názvy složek a souborů v projektech, které nemám aktivované."""
         if self._name_check and self._name_check.isRunning():
             self._name_check_again = True
             return
         self._name_check_again = False
-        projects = [p for p in self.projects if not p.active]
+        projects = [p for p in self.projects if not p.mine]
         self._name_check = NameCheckThread(self.pm, projects)
         self._name_check.done.connect(self._on_name_check)
         self._name_check.start()
@@ -214,7 +239,7 @@ class MainWindow(QMainWindow):
             self._start_name_check()
 
     def issues_of(self, p: ProjectStatus | None) -> list[str]:
-        return self.name_issues.get(p.name, []) if p and not p.active else []
+        return self.name_issues.get(p.name, []) if p and not p.mine else []
 
     def _render(self, current: str | None) -> None:
         color_local = self.palette().color(QPalette.ColorRole.PlaceholderText)
@@ -228,12 +253,12 @@ class MainWindow(QMainWindow):
             elif p.mine:
                 state = "Aktivováno mnou"
             elif p.active:
-                state = "Aktivováno"
+                state = "Pracují jiní"
             else:
                 state = "Volný"
-            lock = p.lock
-            values = [p.name, state, lock.user if lock else "", lock.pc if lock else "",
-                      lock.since.replace("T", " ") if lock else "", "ano" if p.local_exists else ""]
+            names = ["já" if not any(u is o for o in p.others) else u.user for u in p.users]
+            since = min((u.since for u in p.users), default="").replace("T", " ")
+            values = [p.name, state, ", ".join(names), since, "ano" if p.local_exists else ""]
             for c, v in enumerate(values):
                 item = QTableWidgetItem(v)
                 if issues:
@@ -246,6 +271,8 @@ class MainWindow(QMainWindow):
                     item.setToolTip("Složka existuje jen v místním úložišti – lze ji publikovat na server.")
                 elif p.active:
                     item.setForeground(COLOR_MINE if p.mine else COLOR_OTHER)
+                    item.setToolTip("Aktivováno:\n" + "\n".join(
+                        f"{u.label} od {u.since.replace('T', ' ')}" for u in p.users))
                 self.table.setItem(r, c, item)
             if p.name == current:
                 self.table.selectRow(r)
@@ -298,7 +325,7 @@ class MainWindow(QMainWindow):
         if self._name_check:
             self._name_check.wait(5000)
         save_geometry(self.settings, "main", self)
-        save_header(self.settings, "main", self.table.horizontalHeader())
+        save_header(self.settings, HEADER_KEY, self.table.horizontalHeader())
         try:
             self.settings.save()
         except OSError:
@@ -315,18 +342,19 @@ class MainWindow(QMainWindow):
     def _update_actions(self) -> None:
         p = self.selected()
         issues = bool(self.issues_of(p))
-        self.act_activate.setEnabled(bool(p and not p.active and not p.local_only and not issues))
-        self.act_deactivate.setEnabled(bool(p and p.mine))
+        mine = bool(p and p.mine)
+        self.act_activate.setEnabled(bool(p and not p.mine and not p.local_only and not issues))
+        for act in (self.act_submit, self.act_update, self.act_take, self.act_deactivate, self.act_cancel):
+            act.setEnabled(mine)
         self.act_publish.setEnabled(bool(p and p.local_only and not issues))
         self.act_invalid.setEnabled(issues)
-        self.act_cancel.setEnabled(bool(p and p.mine))
         self.act_open.setEnabled(bool(self.settings.local_root))
         self.act_open.setToolTip(
             "Otevře místní složku vybraného projektu" if p and p.local_exists
             else "Otevře místní složku pro projekty")
         self.act_history.setEnabled(bool(p and not p.local_only))
         self.act_rename.setEnabled(bool(p and not p.active and not p.local_only))
-        self.act_unlock.setEnabled(bool(p and p.active and not p.mine))
+        self.act_unlock.setEnabled(bool(p and p.others))
 
     def _context_menu(self, pos) -> None:
         row = self.table.rowAt(pos.y())
@@ -334,9 +362,9 @@ class MainWindow(QMainWindow):
             return
         self.table.selectRow(row)
         menu = QMenu(self)
-        actions = [self.act_activate, self.act_deactivate, self.act_publish, None,
-                   self.act_open, self.act_history, None, self.act_rename, None,
-                   self.act_cancel, self.act_unlock]
+        actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
+                   self.act_deactivate, self.act_publish, None, self.act_open, self.act_history,
+                   None, self.act_rename, None, self.act_cancel, self.act_unlock]
         if self.act_invalid.isEnabled():
             actions[:0] = [self.act_invalid, None]
         for act in actions:
@@ -347,6 +375,125 @@ class MainWindow(QMainWindow):
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     # --- akce ----------------------------------------------------------------
+
+    def _entries(self, p: ProjectStatus):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return self.pm.file_entries(p.name)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Chyba", str(e))
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def activate(self) -> None:
+        p = self.selected()
+        if not p:
+            return
+        entries = self._entries(p)
+        if entries is None:
+            return
+        others = ", ".join(u.label for u in p.others)
+        intro = ("Vyberte soubory, které budete upravovat – zamknou se pro vás. Můžete zaškrtnout "
+                 "celou složku a pak odškrtnout podsložku. Ostatní soubory se stáhnou jen pro čtení. "
+                 "Nové soubory můžete vytvářet kdekoliv.")
+        if others:
+            intro += f"\n\nNa projektu právě pracuje: {others}. Jejich soubory vybrat nelze."
+        dlg = FileSelectDialog(f"Aktivovat projekt {p.name}", intro, entries, "Aktivovat", self)
+        accepted = self._exec_dialog(dlg, "select_files")
+        paths = dlg.selected_paths()
+        dlg.deleteLater()
+        if not accepted:
+            return
+
+        def done(moved: Path | None) -> None:
+            msg = (f"Projekt {p.name} byl aktivován a zkopírován do:\n{self.pm.local_dir(p.name)}\n\n"
+                   f"Zamčeno k úpravě: {len(paths)} souborů, ostatní jsou jen pro čtení.")
+            if moved:
+                msg += f"\n\nPůvodní místní složka byla přesunuta do:\n{moved}"
+            self.refresh()
+            QMessageBox.information(self, "Aktivace", msg)
+
+        run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
+                 on_done=done, on_error=lambda _: self.refresh())
+
+    def take(self) -> None:
+        p = self.selected()
+        if not p or not p.mine:
+            return
+        entries = self._entries(p)
+        if entries is None:
+            return
+        dlg = FileSelectDialog(
+            f"Převzít soubory k úpravě – {p.name}",
+            "Vyberte volné soubory, které chcete upravovat. Zamknou se pro vás a stáhne se jejich "
+            "aktuální verze ze serveru. Soubory, které držíte vy („já“) nebo jiní, vybrat nelze.",
+            entries, "Převzít", self, allow_empty=False)
+        accepted = self._exec_dialog(dlg, "select_files")
+        paths = dlg.selected_paths()
+        dlg.deleteLater()
+        if not accepted:
+            return
+
+        def done(res: RefreshResult) -> None:
+            self.refresh()
+            msg = f"Převzato k úpravě: {len(paths)} souborů."
+            if res.conflicts:
+                msg += "\n\n" + "\n".join(res.conflicts)
+            QMessageBox.information(self, "Převzít", msg)
+
+        run_task(self, f"Převzetí souborů – {p.name}", self.pm.take, p.name, paths,
+                 on_done=done, on_error=lambda _: self.refresh())
+
+    def update_from_server(self) -> None:
+        p = self.selected()
+        if not p or not p.mine:
+            return
+
+        def done(res: RefreshResult) -> None:
+            self.refresh()
+            if res.total == 0 and not res.conflicts:
+                QMessageBox.information(self, "Aktualizovat", "Místní kopie je aktuální.")
+            else:
+                QMessageBox.information(self, "Aktualizovat", format_refresh(res))
+
+        run_task(self, f"Aktualizace ze serveru – {p.name}", self.pm.refresh, p.name,
+                 on_done=done, on_error=lambda _: self.refresh())
+
+    def submit(self) -> None:
+        self._start_upload(end_session=False)
+
+    def deactivate(self) -> None:
+        self._start_upload(end_session=True)
+
+    def _start_upload(self, end_session: bool) -> None:
+        p = self.selected()
+        if not p or not p.mine:
+            return
+        run_task(self, "Porovnávání souborů", self.pm.plan_upload, p.name,
+                 on_done=lambda plan: self._confirm_upload(plan, end_session))
+
+    def _confirm_upload(self, plan: UploadPlan, end_session: bool) -> None:
+        dlg = UploadDialog(plan, end_session, self)
+        accepted = self._exec_dialog(dlg, "upload")
+        assignments, comment, selected = dlg.assignments(), dlg.comment_text(), dlg.selected_keys()
+        dlg.deleteLater()
+        if not accepted:
+            return
+        title = "Deaktivace" if end_session else "Odevzdání"
+
+        def done(res: UploadResult) -> None:
+            self.refresh()
+            msg = ((f"Projekt {plan.name} byl deaktivován." if end_session else "Změny byly odevzdány.")
+                   + f"\n\nUpravené: {res.modified}\nNové: {res.added}\n"
+                   f"Přejmenované: {res.renamed}\nSmazané: {res.deleted}\nUvolněno: {res.released}")
+            if end_session and self.settings.delete_local_after_deactivate and not res.local_deleted:
+                msg += "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
+            QMessageBox.information(self, title, msg)
+
+        run_task(self, f"{title} – nahrávání projektu {plan.name}", self.pm.upload, plan,
+                 assignments, comment, selected, end_session, on_done=done,
+                 on_error=lambda _: self.refresh())
 
     def rename_project(self) -> None:
         p = self.selected()
@@ -386,49 +533,6 @@ class MainWindow(QMainWindow):
             msg += (f"\n\nV místním úložišti zůstala složka se starým názvem „{p.name}“. "
                     "Nyní se zobrazuje jako „Jen místně“ – pokud ji nepotřebujete, smažte ji.")
         QMessageBox.information(self, "Přejmenovat projekt", msg)
-
-    def activate(self) -> None:
-        p = self.selected()
-        if not p:
-            return
-
-        def done(moved: Path | None) -> None:
-            msg = f"Projekt {p.name} byl aktivován a zkopírován do:\n{self.pm.local_dir(p.name)}"
-            if moved:
-                msg += f"\n\nPůvodní místní složka byla přesunuta do:\n{moved}"
-            self.refresh()
-            QMessageBox.information(self, "Aktivace", msg)
-
-        run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name,
-                 on_done=done, on_error=lambda _: self.refresh())
-
-    def deactivate(self) -> None:
-        p = self.selected()
-        if not p:
-            return
-        run_task(self, "Porovnávání souborů", self.pm.plan_deactivation, p.name,
-                 on_done=self._confirm_deactivation)
-
-    def _confirm_deactivation(self, plan: DeactivationPlan) -> None:
-        dlg = DeactivateDialog(plan, self)
-        accepted = self._exec_dialog(dlg, "deactivate")
-        assignments, comment = dlg.assignments(), dlg.comment_text()
-        dlg.deleteLater()
-        if not accepted:
-            return
-
-        def done(res: DeactivationResult) -> None:
-            self.refresh()
-            msg = (f"Projekt {plan.name} byl deaktivován.\n\n"
-                   f"Upravené: {res.modified}\nNové: {res.added}\n"
-                   f"Přejmenované: {res.renamed}\nSmazané: {res.deleted}")
-            if self.settings.delete_local_after_deactivate and not res.local_deleted:
-                msg += "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
-            QMessageBox.information(self, "Deaktivace", msg)
-
-        run_task(self, f"Nahrávání projektu {plan.name}", self.pm.deactivate, plan,
-                 assignments, comment, on_done=done,
-                 on_error=lambda _: self.refresh())
 
     def publish(self) -> None:
         p = self.selected()
@@ -490,30 +594,38 @@ class MainWindow(QMainWindow):
 
     def cancel_activation(self) -> None:
         p = self.selected()
-        if not p:
+        if not p or not p.mine:
             return
         answer = QMessageBox.question(
             self, "Zrušit aktivaci",
-            f"Zrušit aktivaci projektu {p.name}?\n\nŽádné změny se nenahrají na server. "
-            "Místní kopie zůstane zachována, ale už ji nepůjde nahrát zpět.",
+            f"Zrušit aktivaci projektu {p.name}?\n\nŽádné změny se nenahrají na server a všechny "
+            "vaše zámky se uvolní. Místní kopie zůstane zachována, ale neodevzdané změny z ní už "
+            "nepůjde nahrát.",
         )
         if answer == QMessageBox.StandardButton.Yes:
             self._safe(lambda: self.pm.cancel_activation(p.name))
 
     def force_unlock(self) -> None:
         p = self.selected()
-        if not p or not p.lock:
+        if not p or not p.others:
             return
+        user = p.others[0]
+        if len(p.others) > 1:
+            labels = [u.label for u in p.others]
+            label, ok = QInputDialog.getItem(self, "Odebrat zámky", "Uživatel:", labels, 0, False)
+            if not ok:
+                return
+            user = p.others[labels.index(label)]
         answer = QMessageBox.warning(
-            self, "Odebrat zámek",
-            f"Projekt {p.name} má aktivovaný uživatel {p.lock.user} ({p.lock.pc}).\n\n"
-            "Po odebrání zámku nebude moci své změny nahrát zpět na server. "
-            "Použijte pouze, pokud uživatel není dostupný.\n\nOpravdu odebrat zámek?",
+            self, "Odebrat zámky",
+            f"Projekt {p.name} má aktivovaný uživatel {user.label}.\n\n"
+            "Po odebrání zámků nebude moci své neodevzdané změny nahrát na server. "
+            "Použijte pouze, pokud uživatel není dostupný.\n\nOpravdu odebrat jeho zámky?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer == QMessageBox.StandardButton.Yes:
-            self._safe(lambda: self.pm.force_unlock(p.name))
+            self._safe(lambda: self.pm.force_unlock(p.name, user.user, user.pc))
 
     def _safe(self, fn) -> None:
         try:

@@ -3,7 +3,7 @@ import pytest
 from spm import db as dbm
 from spm.config import Settings
 from spm.db import ProjectDB
-from spm.lock import read_lock
+from spm.lock import active_users
 from spm.sync import ProjectManager, SyncError, validate_project_name
 
 
@@ -28,20 +28,20 @@ def test_rename_moves_folder_and_logs_history(pm):
     assert names(pm) == ["Hala_Brno_2026", "Sklad"]
     new = pm.server_dir("Hala_Brno_2026")
     assert (new / "vykresy" / "a.dwg").exists()
-    assert read_lock(new) is None
+    assert active_users(new) == []
     with ProjectDB.for_project(new) as db:
-        last = db.sessions()[0]
-        assert last["status"] == dbm.PROJECT_RENAMED
+        last = db.commits()[0]
+        assert last["kind"] == dbm.PROJECT_RENAMED
         assert last["user"] == "alice"
         assert "Hala → Hala_Brno_2026" in last["comment"]
-        # historie se přenesla s projektem: sezení práce (aktivace–deaktivace) + přejmenování
-        assert [s["status"] for s in db.sessions()] == [dbm.PROJECT_RENAMED, "done"]
+        # historie se přenesla s projektem: načtení při aktivaci + přejmenování
+        assert [c["kind"] for c in db.commits()] == [dbm.PROJECT_RENAMED, dbm.SYNC]
 
 
 def test_rename_creates_db_for_never_activated_project(pm):
     pm.rename_project("Sklad", "Sklad_Ostrava")
     with ProjectDB.for_project(pm.server_dir("Sklad_Ostrava")) as db:
-        assert db.sessions()[0]["status"] == dbm.PROJECT_RENAMED
+        assert db.commits()[0]["kind"] == dbm.PROJECT_RENAMED
 
 
 def test_rename_then_activate_works(pm):
@@ -57,7 +57,7 @@ def test_case_only_rename(pm):
 
 def test_refused_when_active(pm):
     pm.activate("Hala")
-    with pytest.raises(SyncError, match="deaktivovaný"):
+    with pytest.raises(SyncError, match="aktivovaný"):
         pm.rename_project("Hala", "Jiny")
     assert pm.server_dir("Hala").exists()
 
@@ -65,7 +65,7 @@ def test_refused_when_active(pm):
 def test_refused_when_target_exists(pm):
     with pytest.raises(SyncError, match="existuje"):
         pm.rename_project("Hala", "sklad")
-    assert read_lock(pm.server_dir("Hala")) is None
+    assert not (pm.server_dir("Hala") / ".spm" / "write.lock").exists()
 
 
 def test_refused_when_local_folder_with_new_name_exists(pm):

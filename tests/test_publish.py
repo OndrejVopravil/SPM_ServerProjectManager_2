@@ -5,7 +5,7 @@ import pytest
 from spm import db as dbm
 from spm.config import Settings
 from spm.db import ProjectDB
-from spm.lock import read_lock
+from spm.lock import active_users
 from spm.sync import ProjectManager, SyncError
 
 
@@ -41,16 +41,16 @@ def test_publish_moves_project_to_server(pm):
     assert (server / "vykresy" / "pudorys.dwg").read_text(encoding="utf-8") == "pudorys"
     assert not (server / "~$zprava.docx").exists()   # ignorované soubory se nenahrávají
     assert not pm.local_dir("Novy projekt").exists()
-    assert read_lock(server) is None
+    assert active_users(server) == []
 
     st = statuses(pm)["Novy projekt"]
     assert not st.local_only and not st.active
 
     with ProjectDB.for_project(server) as db:
         assert set(db.active_files()) == {"vykresy/pudorys.dwg", "zprava.docx"}
-        [session] = db.sessions()
-        assert (session["user"], session["comment"], session["status"]) == ("alice", "zalozeni projektu", "done")
-        assert {c["change_type"] for c in db.changes(session["session_id"])} == {dbm.PUBLISHED}
+        [commit] = db.commits()
+        assert (commit["user"], commit["comment"], commit["kind"]) == ("alice", "zalozeni projektu", dbm.PUBLISH)
+        assert {c["change_type"] for c in db.changes(commit["commit_id"])} == {dbm.PUBLISHED}
 
 
 def test_published_project_can_be_activated(pm):

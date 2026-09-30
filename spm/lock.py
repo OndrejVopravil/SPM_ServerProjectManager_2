@@ -1,18 +1,27 @@
-"""Zámek projektu – soubor .spm/lock.json na síťovém úložišti.
+"""Souběžná práce na projektu – kdo má projekt aktivovaný a krátký zámek pro zápis.
 
-Soubor se vytváří pomocí O_CREAT | O_EXCL, což je atomické i na SMB sdílení:
-pokud dva uživatelé aktivují projekt současně, uspěje pouze jeden.
+- Značky aktivních uživatelů: .spm/active/<uživatel>@<počítač>.json. Slouží jen pro rychlé
+  zobrazení v seznamu projektů (bez otevírání databáze); rozhodující je databáze.
+- Zámek zápisu: .spm/write.lock. Do databáze projektu může zapisovat víc uživatelů, ale
+  SQLite na síťovém disku se na vlastní zamykání spolehnout nemůže. Každý zápis (krátká
+  transakce) se proto provádí jen při držení tohoto souboru. Soubor se vytváří pomocí
+  O_CREAT | O_EXCL, což je atomické i na SMB.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
 from . import SPM_DIR
+
+WRITE_LOCK_TIMEOUT = 30.0   # jak dlouho čekat, než je databáze volná
+WRITE_LOCK_STALE = 120.0    # starší zámek zápisu je pozůstatek spadlé aplikace
 
 
 class LockError(Exception):
@@ -21,6 +30,7 @@ class LockError(Exception):
 
 @dataclass
 class LockInfo:
+    """Aktivní uživatel projektu."""
     user: str
     pc: str
     since: str
@@ -29,46 +39,92 @@ class LockInfo:
     def is_mine(self, user: str, pc: str) -> bool:
         return self.user.lower() == user.lower() and self.pc.lower() == pc.lower()
 
+    @property
+    def label(self) -> str:
+        return f"{self.user} ({self.pc})"
 
-def lock_path(project_dir: Path) -> Path:
-    return project_dir / SPM_DIR / "lock.json"
+
+def _safe(text: str) -> str:
+    return re.sub(r"[^\w.-]", "_", text)
 
 
-def read_lock(project_dir: Path) -> LockInfo | None:
-    """Vrátí informace o zámku, nebo None, pokud projekt není aktivován."""
-    path = lock_path(project_dir)
+def active_dir(project_dir: Path) -> Path:
+    return project_dir / SPM_DIR / "active"
+
+
+def marker_path(project_dir: Path, user: str, pc: str) -> Path:
+    return active_dir(project_dir) / f"{_safe(user)}@{_safe(pc)}.json".lower()
+
+
+def active_users(project_dir: Path) -> list[LockInfo]:
+    """Uživatelé, kteří mají projekt aktivovaný (podle značek)."""
+    folder = active_dir(project_dir)
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return LockInfo(**data)
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError, TypeError):
-        # Zámek existuje, ale nejde přečíst (právě se zapisuje / poškozen)
-        return LockInfo(user="?", pc="?", since="")
+        entries = sorted(folder.glob("*.json"))
+    except OSError:
+        return []
+    result = []
+    for path in entries:
+        try:
+            result.append(LockInfo(**json.loads(path.read_text(encoding="utf-8"))))
+        except (OSError, ValueError, TypeError):
+            continue  # značka se právě zapisuje / je poškozená
+    return result
 
 
-def acquire_lock(project_dir: Path, user: str, pc: str) -> LockInfo:
-    path = lock_path(project_dir)
+def add_marker(project_dir: Path, info: LockInfo) -> None:
+    path = marker_path(project_dir, info.user, info.pc)
     path.parent.mkdir(parents=True, exist_ok=True)
-    info = LockInfo(user=user, pc=pc, since=datetime.now().isoformat(timespec="seconds"))
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        other = read_lock(project_dir)
-        who = f"{other.user} ({other.pc})" if other else "jiný uživatel"
-        raise LockError(f"Projekt je již aktivován uživatelem {who}.") from None
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(asdict(info), f, ensure_ascii=False)
-    return info
+    path.write_text(json.dumps(asdict(info), ensure_ascii=False), encoding="utf-8")
 
 
-def update_lock(project_dir: Path, info: LockInfo) -> None:
-    """Přepíše obsah existujícího zámku (např. doplnění session_id)."""
-    lock_path(project_dir).write_text(json.dumps(asdict(info), ensure_ascii=False), encoding="utf-8")
+def remove_marker(project_dir: Path, user: str, pc: str) -> None:
+    marker_path(project_dir, user, pc).unlink(missing_ok=True)
 
 
-def release_lock(project_dir: Path) -> None:
-    try:
-        lock_path(project_dir).unlink()
-    except FileNotFoundError:
-        pass
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+class WriteLock:
+    """Krátkodobý zámek pro zápis do databáze projektu (with WriteLock(...): ...)."""
+
+    def __init__(self, project_dir: Path, user: str, pc: str,
+                 timeout: float = WRITE_LOCK_TIMEOUT, stale: float = WRITE_LOCK_STALE):
+        self.path = project_dir / SPM_DIR / "write.lock"
+        self.user, self.pc = user, pc
+        self.timeout, self.stale = timeout, stale
+
+    def __enter__(self) -> "WriteLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if self._is_stale():
+                    self.path.unlink(missing_ok=True)
+                    continue
+                if time.monotonic() > deadline:
+                    raise LockError(
+                        "Databáze projektu je zaneprázdněná (zapisuje do ní jiný uživatel). "
+                        "Zkuste to prosím za chvíli znovu."
+                    ) from None
+                time.sleep(0.2)
+                continue
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"user": self.user, "pc": self.pc, "since": now_iso()}, f)
+            return self
+
+    def _is_stale(self) -> bool:
+        try:
+            return time.time() - self.path.stat().st_mtime > self.stale
+        except FileNotFoundError:
+            return False
+
+    def __exit__(self, *exc) -> None:
+        self.path.unlink(missing_ok=True)
+
+    def moved_to(self, project_dir: Path) -> None:
+        """Projektová složka byla přejmenována – zámek je teď na nové cestě."""
+        self.path = project_dir / SPM_DIR / "write.lock"

@@ -1,4 +1,4 @@
-"""Historie projektu: sezení (kdo, kdy, komentář) a změny souborů v každém z nich."""
+"""Historie projektu: odevzdání (kdo, kdy, komentář) a změny souborů v každém z nich."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ class HistoryDialog(QDialog):
         self.setWindowTitle(f"Historie projektu {name}")
         self.resize(1000, 650)
 
-        self.sessions = _table(["Uživatel", "PC", "Aktivováno", "Deaktivováno", "Stav", "Změn", "Komentář"])
+        self.sessions = _table(["Datum", "Uživatel", "PC", "Akce", "Změn", "Komentář"])
         self.changes = _table(["Změna", "Původní cesta", "Nová cesta", "Záloha / koš"])
         self.changes.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.changes.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -54,7 +54,7 @@ class HistoryDialog(QDialog):
         bottom = QWidget()
         lay = QVBoxLayout(bottom)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(QLabel("<b>Změny ve vybraném sezení</b>"))
+        lay.addWidget(QLabel("<b>Změny ve vybraném záznamu</b>"))
         lay.addWidget(self.show_imported)
         lay.addWidget(self.changes)
         splitter.addWidget(bottom)
@@ -62,11 +62,11 @@ class HistoryDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(splitter)
 
-        self._session_rows = db.sessions()
+        self._session_rows = db.commits()
         self.sessions.setRowCount(len(self._session_rows))
         for r, s in enumerate(self._session_rows):
-            values = [s["user"], s["pc"], _fmt(s["activated_at"]), _fmt(s["deactivated_at"]),
-                      dbm.STATUS_LABELS.get(s["status"], s["status"]), str(s["n_changes"]),
+            values = [_fmt(s["created_at"]), s["user"], s["pc"],
+                      dbm.COMMIT_LABELS.get(s["kind"], s["kind"]), str(s["n_changes"]),
                       s["comment"] or ""]
             for c, v in enumerate(values):
                 item = QTableWidgetItem(v)
@@ -82,7 +82,7 @@ class HistoryDialog(QDialog):
         self.changes.setRowCount(0)
         if not rows:
             return
-        sid = self._session_rows[rows[0].row()]["session_id"]
+        sid = self._session_rows[rows[0].row()]["commit_id"]
         items = [c for c in self.db.changes(sid)
                  if self.show_imported.isChecked() or c["change_type"] != dbm.IMPORTED]
         self.changes.setRowCount(len(items))

@@ -11,3 +11,6 @@ dist/
 
 # Osobní nastavení aplikace (cesty k úložišti, vzhled oken)
 settings.json
+
+# Zástupci Windows (obsahují cesty z konkrétního počítače)
+*.lnk

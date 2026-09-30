@@ -1,20 +1,31 @@
-"""Aktivace a deaktivace projektů – hlavní logika aplikace (bez GUI)."""
+"""Aktivace, odevzdání, aktualizace a deaktivace projektů – hlavní logika aplikace (bez GUI).
+
+Model spolupráce: projekt může mít aktivovaný víc uživatelů současně. Každý má v místním
+úložišti celou kopii projektu, ale upravovat smí jen soubory, které má zamčené – ostatní
+jsou v místní kopii jen pro čtení. Nové soubory může vytvářet kdokoliv; patří tomu, kdo je
+vytvořil. Odevzdané soubory se nahrají na server a uvolní, ostatní si je stáhnou
+aktualizací ze serveru.
+"""
 
 from __future__ import annotations
 
 import os
 import re
 import shutil
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable, Iterator
 
 from . import SPM_DIR
 from . import db as dbm
 from .config import Settings
-from .db import DbFile, ProjectDB
+from .db import DbFile, LockOwner, ProjectDB, db_path
 from .identity import current_pc, current_user
-from .lock import LockInfo, acquire_lock, read_lock, release_lock, update_lock
+from .lock import LockInfo, WriteLock, active_users, add_marker, now_iso, remove_marker
+from .manifest import Entry, Manifest
 from .matcher import RenameSuggestion, similarity, suggest_renames
 from .names import describe_chars, find_invalid_names, forbidden_in, format_invalid, invalid_rel_paths
 from .scanner import (
@@ -23,9 +34,12 @@ from .scanner import (
     copy_with_hash,
     file_hash,
     list_files,
+    move_file,
     remove_empty_parents,
+    rmtree,
     same_stat,
     scan,
+    set_readonly,
     to_abs,
     to_rel,
 )
@@ -37,7 +51,8 @@ class SyncError(Exception):
 
 # Složky, do kterých aktivace odkládá dřívější místní kopii (viz activate) – nejsou to projekty.
 ORIGINAL_COPY_RE = re.compile(r"_puvodni_\d{8}_\d{6}$")
-
+# Dočasná složka na serveru při publikování (tečka na začátku = v seznamu projektů se nezobrazí)
+PUBLISH_TMP_PREFIX = ".spm_publish_"
 
 INVALID_NAME_CHARS = set('<>:"/\\|?*')
 RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
@@ -69,28 +84,43 @@ def validate_project_name(name: str) -> str | None:
 @dataclass
 class ProjectStatus:
     name: str
-    lock: LockInfo | None
+    users: list[LockInfo]     # kdo má projekt aktivovaný
     local_exists: bool
-    mine: bool
+    mine: bool                # mám projekt aktivovaný já
     local_only: bool = False  # složka je jen v místním úložišti (lze ji publikovat)
+    others: list[LockInfo] = field(default_factory=list)  # aktivní uživatelé kromě mě
 
     @property
     def active(self) -> bool:
-        return self.lock is not None
+        return bool(self.users)
 
 
 @dataclass
-class DeactivationPlan:
+class FileEntry:
+    """Soubor projektu pro výběr v dialogu (zamknutí při aktivaci / převzetí)."""
+    path: str
+    owner: LockOwner | None
+    mine: bool
+
+    @property
+    def free(self) -> bool:
+        return self.owner is None
+
+
+@dataclass
+class UploadPlan:
+    """Porovnání místní kopie se serverem – podklad pro odevzdání i deaktivaci."""
     name: str
     session_id: int
     local_files: dict[str, FileInfo]
     unchanged: list[str]
-    modified: list[tuple[DbFile, FileInfo]]
-    missing: list[DbFile]                   # v databázi, ale lokálně chybí
-    new: list[FileInfo]                     # lokálně, ale ne v databázi
+    modified: list[tuple[DbFile, FileInfo]]    # vlastní (zamčené) soubory se změnou
+    missing: list[DbFile]                      # vlastní soubory, které v místní kopii chybí
+    new: list[FileInfo]                        # nové soubory (nejsou v evidenci)
+    locked_unchanged: list[DbFile]             # vlastní soubory beze změny (lze je jen uvolnit)
     suggestions: list[RenameSuggestion]
     conflicts: list[str] = field(default_factory=list)
-    invalid_names: list[str] = field(default_factory=list)  # názvy s nepovolenými znaky
+    invalid_names: list[str] = field(default_factory=list)
 
     def default_assignments(self) -> dict[str, str | None]:
         """file_id chybějícího souboru -> nová cesta (nebo None = smazán)."""
@@ -104,13 +134,31 @@ class DeactivationPlan:
         return bool(self.modified or self.missing or self.new)
 
 
+def new_key(path: str) -> str:
+    """Klíč nového souboru ve výběru pro odevzdání (ostatní položky mají klíč = file_id)."""
+    return "new:" + path
+
+
 @dataclass
-class DeactivationResult:
+class UploadResult:
     renamed: int = 0
     modified: int = 0
     added: int = 0
     deleted: int = 0
+    released: int = 0
     local_deleted: bool = False
+
+
+@dataclass
+class RefreshResult:
+    downloaded: list[str] = field(default_factory=list)
+    moved: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return len(self.downloaded) + len(self.moved) + len(self.removed)
 
 
 class ProjectManager:
@@ -146,15 +194,17 @@ class ProjectManager:
             if not entry.is_dir() or entry.name.startswith("."):
                 continue
             server_names.add(entry.name.lower())
-            lock = read_lock(entry)
+            users = active_users(entry)
+            others = [u for u in users if not u.is_mine(self.user, self.pc)]
             result.append(ProjectStatus(
                 name=entry.name,
-                lock=lock,
+                users=users,
                 local_exists=self.local_dir(entry.name).exists(),
-                mine=bool(lock and lock.is_mine(self.user, self.pc)),
+                mine=len(others) < len(users),
+                others=others,
             ))
         for name in self.local_only_projects(server_names):
-            result.append(ProjectStatus(name=name, lock=None, local_exists=True, mine=False,
+            result.append(ProjectStatus(name=name, users=[], local_exists=True, mine=False,
                                         local_only=True))
         result.sort(key=lambda p: p.name.lower())
         return result
@@ -171,124 +221,22 @@ class ProjectManager:
             and not ORIGINAL_COPY_RE.search(e.name)
         ]
 
-    def _require_my_lock(self, name: str) -> LockInfo:
-        lock = read_lock(self.server_dir(name))
-        if lock is None:
-            raise SyncError(f"Projekt {name} není aktivován.")
-        if not lock.is_mine(self.user, self.pc):
-            raise SyncError(f"Projekt {name} je aktivován uživatelem {lock.user} ({lock.pc}).")
-        return lock
-
-    # --- aktivace ----------------------------------------------------------
-
-    def activate(self, name: str, progress: Progress | None = None) -> Path | None:
-        """Zamkne projekt a zkopíruje jej do místního úložiště.
-
-        Vrací cestu, kam byla přesunuta původní místní složka (pokud existovala).
-        """
+    def file_entries(self, name: str) -> list[FileEntry]:
+        """Soubory projektu na serveru a kdo je drží – pro výběr souborů k zamknutí."""
         server = self.server_dir(name)
-        local = self.local_dir(name)
-        if not server.is_dir():
-            raise SyncError(f"Projekt neexistuje: {server}")
-        self.check_names(server, name)
-        self.local_root.mkdir(parents=True, exist_ok=True)
-
-        lock = acquire_lock(server, self.user, self.pc)
-        moved_to: Path | None = None
-        try:
-            if local.is_dir() and not any(local.iterdir()):
-                local.rmdir()
-            if local.exists():
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                moved_to = local.with_name(f"{name}_puvodni_{stamp}")
-                local.rename(moved_to)
-
-            files = list_files(server, self.settings.ignore_patterns)
-            copied: list[FileInfo] = []
-            for i, src in enumerate(files):
-                rel = to_rel(server, src)
-                if progress:
-                    progress(i, len(files), rel)
-                st = src.stat()
-                sha = copy_with_hash(src, to_abs(local, rel))
-                copied.append(FileInfo(rel, st.st_size, st.st_mtime, sha))
-            local.mkdir(parents=True, exist_ok=True)
-            if progress:
-                progress(len(files), len(files), "Zápis do databáze…")
-
-            with ProjectDB.for_project(server, create=True) as db:
-                with db.conn:
-                    session_id = db.start_session(self.user, self.pc)
-                    self._sync_baseline(db, session_id, copied)
-            lock.session_id = session_id
-            update_lock(server, lock)
-        except BaseException:
-            shutil.rmtree(local, ignore_errors=True)
-            if moved_to is not None:
-                moved_to.rename(local)
-                moved_to = None
-            release_lock(server)
-            raise
-        return moved_to
-
-    # --- publikování ----------------------------------------------------------
-
-    def publish(self, name: str, comment: str, progress: Progress | None = None) -> bool:
-        """Přesune projekt, který existuje jen v místním úložišti, na server.
-
-        Soubory se nahrají, ověří (hash obsahu na serveru) a zapíší do nové databáze
-        projektu. Teprve potom se místní složka smaže. Vrací True, pokud se ji podařilo
-        smazat celou (jinak je některý soubor otevřen v jiné aplikaci).
-        """
-        comment = comment.strip()
-        if not comment:
-            raise SyncError("Bez komentáře nelze projekt publikovat.")
-        local = self.local_dir(name)
-        server = self.server_dir(name)
-        if not local.is_dir():
-            raise SyncError(f"Místní složka neexistuje:\n{local}")
-        if not self.server_root.is_dir():
-            raise SyncError(f"Síťová složka není dostupná:\n{self.server_root}")
-        self.check_names(local, name)
-        try:
-            server.mkdir()  # atomické – selže, pokud projekt mezitím založil někdo jiný
-        except FileExistsError:
-            raise SyncError(f"Na serveru už projekt {name} existuje.") from None
-
-        # nikdo ho nesmí aktivovat, než se publikování dokončí; pokud zámek mezitím získal
-        # někdo jiný (aktivoval prázdnou složku), složku nemažeme
-        acquire_lock(server, self.user, self.pc)
-        try:
-            files = list_files(local, self.settings.ignore_patterns)
-            uploaded: list[FileInfo] = []
-            for i, src in enumerate(files):
-                rel = to_rel(local, src)
-                if progress:
-                    progress(i, len(files), rel)
-                dst = to_abs(server, rel)
-                sha = copy_with_hash(src, dst)
-                if file_hash(dst) != sha:
-                    raise SyncError(f"Kontrola nahraného souboru selhala:\n{rel}")
-                st = dst.stat()
-                uploaded.append(FileInfo(rel, st.st_size, st.st_mtime, sha))
-            if progress:
-                progress(len(files), len(files), "Zápis do databáze…")
-
-            with ProjectDB.for_project(server, create=True) as db:
-                with db.conn:
-                    sid = db.start_session(self.user, self.pc)
-                    for fi in uploaded:
-                        fid = db.add_file(fi.path, fi.size, fi.mtime, fi.sha256)
-                        db.add_change(sid, fid, dbm.PUBLISHED, None, fi.path, fi.size, fi.mtime, fi.sha256)
-                    db.finish_session(sid, comment)
-            release_lock(server)
-        except BaseException:
-            # projekt jsme právě založili a byl zamčený – nikdo jiný ho nemohl použít
-            shutil.rmtree(server, ignore_errors=True)
-            raise
-
-        shutil.rmtree(local, ignore_errors=True)
-        return not local.exists()
+        paths = [to_rel(server, p) for p in list_files(server, self.settings.ignore_patterns)]
+        files: dict[str, DbFile] = {}
+        owners: dict[str, LockOwner] = {}
+        if db_path(server).exists():
+            with ProjectDB.for_project(server) as db:
+                files = db.active_files(include_pending=True)
+                owners = db.lock_owners()
+        result = []
+        for path in paths:
+            f = files.get(path)
+            owner = owners.get(f.file_id) if f else None
+            result.append(FileEntry(path, owner, bool(owner and owner.is_me(self.user, self.pc))))
+        return result
 
     # --- kontrola názvů -------------------------------------------------------
 
@@ -309,81 +257,149 @@ class ProjectManager:
                 + format_invalid(invalid)
             )
 
-    # --- přejmenování ---------------------------------------------------------
+    # --- pomocné: databáze a sezení -------------------------------------------
 
-    def rename_project(self, name: str, new_name: str) -> None:
-        """Přejmenuje složku projektu na síťovém úložišti a zapíše to do databáze projektu.
+    @contextmanager
+    def _write(self, server: Path, create: bool = False) -> Iterator[ProjectDB]:
+        """Zápis do databáze projektu: zámek zápisu + jedna transakce."""
+        with WriteLock(server, self.user, self.pc):
+            with ProjectDB.for_project(server, create=create) as db:
+                with db.conn:
+                    yield db
 
-        Projekt nesmí být aktivován. Po dobu přejmenování se zamkne, aby ho nikdo
-        neaktivoval. Místní úložiště se nemění.
+    def _my_session(self, db: ProjectDB, expected: int | None = None) -> int:
+        sid = db.active_session(self.user, self.pc)
+        if sid is None or (expected is not None and sid != expected):
+            raise SyncError("Projekt u vás není aktivován (aktivace byla zrušena nebo vám "
+                            "byly zámky odebrány).")
+        return sid
+
+    def _manifest(self, name: str) -> tuple[Path, Manifest]:
+        local = self.local_dir(name)
+        manifest = Manifest.load(local) if local.is_dir() else None
+        if manifest is None:
+            raise SyncError(f"Místní kopie projektu neexistuje nebo je poškozená:\n{local}")
+        return local, manifest
+
+    # --- aktivace ----------------------------------------------------------
+
+    def activate(self, name: str, lock_paths: Iterable[str] | None = None,
+                 progress: Progress | None = None) -> Path | None:
+        """Stáhne projekt do místního úložiště a zamkne vybrané soubory.
+
+        lock_paths: soubory, které chce uživatel upravovat (None = všechny volné).
+        Ostatní soubory budou v místní kopii jen pro čtení.
+        Vrací cestu, kam byla přesunuta původní místní složka (pokud existovala).
         """
-        new_name = new_name.strip()
-        if new_name == name:
-            return
-        error = validate_project_name(new_name)
-        if error:
-            raise SyncError(error)
         server = self.server_dir(name)
-        target = self.server_dir(new_name)
+        local = self.local_dir(name)
         if not server.is_dir():
             raise SyncError(f"Projekt neexistuje: {server}")
-        case_only = new_name.lower() == name.lower()
-        if not case_only and target.exists():
-            raise SyncError(f"Na serveru už projekt {new_name} existuje.")
-        if not case_only and self.local_dir(new_name).exists():
-            raise SyncError(
-                f"V místním úložišti už existuje složka {new_name}.\n"
-                "Zvolte jiný název, nebo tuto místní složku nejdřív přejmenujte či odstraňte."
-            )
+        self.check_names(server, name)
+        if db_path(server).exists():
+            with ProjectDB.for_project(server) as db:
+                if db.active_session(self.user, self.pc):
+                    raise SyncError(f"Projekt {name} už máte aktivovaný.")
+        self.local_root.mkdir(parents=True, exist_ok=True)
 
-        lock = read_lock(server)
-        if lock is not None:
-            raise SyncError(f"Projekt je aktivován uživatelem {lock.user} ({lock.pc}). "
-                            "Přejmenovat lze jen deaktivovaný projekt.")
-        acquire_lock(server, self.user, self.pc)
+        moved_to: Path | None = None
+        sid: int | None = None
         try:
-            server.rename(target)
-        except FileExistsError:
-            release_lock(server)
-            raise SyncError(f"Na serveru už projekt {new_name} existuje.") from None
-        except PermissionError:
-            release_lock(server)
-            raise SyncError(
-                "Složku projektu nelze přejmenovat – některý soubor nebo složka projektu je na "
-                "serveru otevřená (např. v Průzkumníku nebo jiné aplikaci)."
-            ) from None
+            if local.is_dir() and not any(local.iterdir()):
+                local.rmdir()
+            if local.exists():
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                moved_to = local.with_name(f"{name}_puvodni_{stamp}")
+                local.rename(moved_to)
+
+            files = list_files(server, self.settings.ignore_patterns)
+            copied: list[FileInfo] = []
+            for i, src in enumerate(files):
+                rel = to_rel(server, src)
+                if progress:
+                    progress(i, len(files), rel)
+                st = src.stat()
+                sha = copy_with_hash(src, to_abs(local, rel))
+                copied.append(FileInfo(rel, st.st_size, st.st_mtime, sha))
+            local.mkdir(parents=True, exist_ok=True)
+            if progress:
+                progress(len(files), len(files), "Zamykání souborů…")
+
+            with self._write(server, create=True) as db:
+                if db.active_session(self.user, self.pc):
+                    raise SyncError(f"Projekt {name} už máte aktivovaný.")
+                sid = db.start_session(self.user, self.pc)
+                self._sync_baseline(db, sid, copied)
+                all_files = db.active_files(include_pending=True)
+                owners = db.lock_owners()
+                if lock_paths is None:
+                    want = [f.file_id for f in all_files.values() if f.file_id not in owners]
+                else:
+                    want = [all_files[p].file_id for p in lock_paths if p in all_files]
+                taken = db.lock(sid, want)
+                if taken:
+                    by_id = {f.file_id: f for f in all_files.values()}
+                    raise SyncError("Některé soubory mezitím zamkl jiný uživatel:\n" + "\n".join(
+                        f"{by_id[f].path} – {owners[f].label}" for f in taken[:15]))
+                locked = db.locked_by(sid)
+
+            manifest = Manifest(name, sid)
+            for fi in copied:
+                f = all_files.get(fi.path)
+                if f is None:
+                    continue
+                manifest.files[fi.path] = Entry(f.file_id, fi.sha256)
+                if f.file_id not in locked:
+                    set_readonly(to_abs(local, fi.path), True)
+            manifest.save(local)
+            add_marker(server, LockInfo(self.user, self.pc, now_iso(), sid))
         except BaseException:
-            release_lock(server)
+            if sid is not None:
+                try:
+                    with self._write(server) as db:
+                        db.end_session(sid, "cancelled")
+                except Exception:  # noqa: BLE001 – původní chyba je důležitější
+                    pass
+            rmtree(local)
+            if moved_to is not None:
+                moved_to.rename(local)
+                moved_to = None
             raise
+        return moved_to
 
-        try:
-            with ProjectDB.for_project(target, create=True) as db:
-                with db.conn:
-                    sid = db.start_session(self.user, self.pc)
-                    db.finish_session(sid, f"Projekt přejmenován: {name} → {new_name}",
-                                      status=dbm.PROJECT_RENAMED)
-        finally:
-            release_lock(target)
+    def _sync_baseline(self, db: ProjectDB, session_id: int, server_files: list[FileInfo]) -> None:
+        """Srovná evidenci v databázi se skutečným stavem serveru v okamžiku aktivace.
 
-    @staticmethod
-    def _sync_baseline(db: ProjectDB, session_id: int, server_files: list[FileInfo]) -> None:
-        """Srovná evidenci v databázi se skutečným stavem serveru v okamžiku aktivace."""
-        baseline = db.active_files()
+        Soubory, které drží jiní uživatelé nebo se právě nahrávají, se nemění – jejich stav
+        v databázi je platný. Změny se zapíší jako odevzdání „Změny mimo aplikaci“."""
+        baseline = db.active_files(include_pending=True)
+        protected = set(db.lock_owners()) | {f.file_id for f in baseline.values() if f.pending}
         on_server = {fi.path for fi in server_files}
+        commit_id: int | None = None
+
+        def commit() -> int:
+            nonlocal commit_id
+            if commit_id is None:
+                commit_id = db.add_commit(session_id, self.user, self.pc, dbm.SYNC,
+                                          "Změny provedené mimo aplikaci, zjištěné při aktivaci.")
+            return commit_id
+
         # Soubory, které z evidence zmizely – mohly být přejmenovány ručně přímo na serveru.
         # Stejný obsah (hash) = stejný soubor, historie se zachová pod novým názvem.
         missing_by_hash: dict[str, list[DbFile]] = {}
         for path, bf in baseline.items():
-            if path not in on_server:
+            if path not in on_server and bf.file_id not in protected:
                 missing_by_hash.setdefault(bf.sha256, []).append(bf)
 
         renamed: set[str] = set()
         for fi in server_files:
             bf = baseline.get(fi.path)
             if bf is not None:
+                if bf.file_id in protected:
+                    continue
                 db.update_file(bf.file_id, fi.path, fi.size, fi.mtime, fi.sha256)
                 if bf.sha256 != fi.sha256:
-                    db.add_change(session_id, bf.file_id, dbm.EXTERNAL_MODIFIED, fi.path, fi.path,
+                    db.add_change(commit(), bf.file_id, dbm.EXTERNAL_MODIFIED, fi.path, fi.path,
                                   fi.size, fi.mtime, fi.sha256)
                 continue
             candidates = missing_by_hash.get(fi.sha256)
@@ -393,81 +409,230 @@ class ProjectManager:
                 candidates.remove(old)
                 renamed.add(old.path)
                 db.update_file(old.file_id, fi.path, fi.size, fi.mtime, fi.sha256)
-                db.add_change(session_id, old.file_id, dbm.EXTERNAL_RENAMED, old.path, fi.path,
+                db.add_change(commit(), old.file_id, dbm.EXTERNAL_RENAMED, old.path, fi.path,
                               fi.size, fi.mtime, fi.sha256)
             else:
                 fid = db.add_file(fi.path, fi.size, fi.mtime, fi.sha256)
-                db.add_change(session_id, fid, dbm.IMPORTED, None, fi.path, fi.size, fi.mtime, fi.sha256)
+                db.add_change(commit(), fid, dbm.IMPORTED, None, fi.path, fi.size, fi.mtime, fi.sha256)
         for path, bf in baseline.items():
-            if path not in on_server and path not in renamed:
+            if path not in on_server and path not in renamed and bf.file_id not in protected:
                 db.mark_deleted(bf.file_id)
-                db.add_change(session_id, bf.file_id, dbm.EXTERNAL_DELETED, path, None)
+                db.add_change(commit(), bf.file_id, dbm.EXTERNAL_DELETED, path, None)
 
-    # --- deaktivace ----------------------------------------------------------
+    # --- aktualizace ze serveru a převzetí ------------------------------------
 
-    def plan_deactivation(self, name: str, progress: Progress | None = None) -> DeactivationPlan:
+    def refresh(self, name: str, progress: Progress | None = None) -> RefreshResult:
+        """Stáhne ze serveru nové a změněné soubory, které nemám zamčené.
+
+        Místně změněné cizí soubory se nepřepisují – nahlásí se jako konflikt."""
+        server = self.server_dir(name)
+        local, manifest = self._manifest(name)
+        with ProjectDB.for_project(server) as db:
+            self._my_session(db, manifest.session_id)
+            files = db.active_files(include_pending=True)
+            mine = db.locked_by(manifest.session_id)
+        result = RefreshResult()
+        local_by_id = manifest.by_file_id()
+        server_ids = {f.file_id for f in files.values()}
+
+        todo = [f for f in files.values() if f.file_id not in mine and not f.pending]
+        for i, f in enumerate(todo):
+            if progress:
+                progress(i, len(todo), f.path)
+            lpath = local_by_id.get(f.file_id)
+            if lpath is None:  # nový soubor na serveru
+                dst = to_abs(local, f.path)
+                if dst.exists() or f.path in manifest.files:
+                    result.conflicts.append(f"{f.path} – v místní kopii je jiný soubor se stejným názvem")
+                    continue
+                sha = copy_with_hash(to_abs(server, f.path), dst)
+                set_readonly(dst, True)
+                manifest.files[f.path] = Entry(f.file_id, sha)
+                result.downloaded.append(f.path)
+                continue
+
+            entry = manifest.files[lpath]
+            lp = to_abs(local, lpath)
+            changed_locally = not lp.exists() or file_hash(lp) != entry.sha256
+            if lpath != f.path:  # přejmenován jiným uživatelem
+                if changed_locally or to_abs(local, f.path).exists():
+                    result.conflicts.append(f"{lpath} – na serveru přejmenován na {f.path}, "
+                                            "ale místní kopie je změněná")
+                    continue
+                move_file(lp, to_abs(local, f.path))
+                remove_empty_parents(local, lpath)
+                manifest.files[f.path] = manifest.files.pop(lpath)
+                lp = to_abs(local, f.path)
+                result.moved.append(f"{lpath} → {f.path}")
+            if f.sha256 != entry.sha256:  # změněn na serveru
+                if changed_locally:
+                    result.conflicts.append(f"{f.path} – změněn na serveru i v místní kopii")
+                    continue
+                entry.sha256 = copy_with_hash(to_abs(server, f.path), lp)
+                set_readonly(lp, True)
+                result.downloaded.append(f.path)
+
+        for lpath, entry in list(manifest.files.items()):
+            if entry.file_id in server_ids or entry.file_id in mine:
+                continue
+            lp = to_abs(local, lpath)  # smazán na serveru jiným uživatelem
+            if lp.exists():
+                if file_hash(lp) != entry.sha256:
+                    result.conflicts.append(f"{lpath} – smazán na serveru, ale místní kopie je změněná")
+                    continue
+                set_readonly(lp, False)
+                lp.unlink()
+                remove_empty_parents(local, lpath)
+            del manifest.files[lpath]
+            result.removed.append(lpath)
+
+        manifest.save(local)
+        if progress:
+            progress(len(todo), len(todo), "")
+        return result
+
+    def take(self, name: str, paths: Iterable[str], progress: Progress | None = None) -> RefreshResult:
+        """Převezme (zamkne) další soubory k úpravě a stáhne jejich aktuální verzi."""
+        server = self.server_dir(name)
+        local, manifest = self._manifest(name)
+        paths = list(paths)
+        with self._write(server) as db:
+            sid = self._my_session(db, manifest.session_id)
+            files = db.active_files(include_pending=True)
+            unknown = [p for p in paths if p not in files]
+            if unknown:
+                raise SyncError("Soubory nejsou v evidenci projektu (zkuste Aktualizovat):\n"
+                                + "\n".join(unknown[:15]))
+            owners = db.lock_owners()
+            taken = db.lock(sid, [files[p].file_id for p in paths])
+            if taken:
+                by_id = {f.file_id: f for f in files.values()}
+                raise SyncError("Soubory drží jiný uživatel:\n" + "\n".join(
+                    f"{by_id[f].path} – {owners[f].label}" for f in taken[:15]))
+
+        result = RefreshResult()
+        local_by_id = manifest.by_file_id()
+        for i, p in enumerate(paths):
+            if progress:
+                progress(i, len(paths), p)
+            f = files[p]
+            lpath = local_by_id.get(f.file_id)
+            lp = to_abs(local, lpath or f.path)
+            if lpath is None or lpath != f.path:
+                # ještě nestažený / přejmenovaný – nejdřív aktualizovat jeho místní kopii
+                if lpath is not None and lp.exists():
+                    move_file(lp, to_abs(local, f.path))
+                    remove_empty_parents(local, lpath)
+                    manifest.files[f.path] = manifest.files.pop(lpath)
+                lp = to_abs(local, f.path)
+                if lpath is None:
+                    manifest.files[f.path] = Entry(f.file_id, copy_with_hash(to_abs(server, f.path), lp))
+                    result.downloaded.append(f.path)
+            entry = manifest.files[f.path]
+            if f.sha256 != entry.sha256:
+                if lp.exists() and file_hash(lp) != entry.sha256:
+                    result.conflicts.append(f"{f.path} – změněn na serveru i ve vaší místní kopii; "
+                                            "vaše místní verze zůstala")
+                else:
+                    entry.sha256 = copy_with_hash(to_abs(server, f.path), lp)
+                    result.downloaded.append(f.path)
+            set_readonly(lp, False)
+        manifest.save(local)
+        return result
+
+    # --- odevzdání a deaktivace ----------------------------------------------
+
+    def plan_upload(self, name: str, progress: Progress | None = None) -> UploadPlan:
         """Porovná místní kopii s evidencí a připraví návrh změn (nic nezapisuje)."""
         server = self.server_dir(name)
-        local = self.local_dir(name)
-        lock = self._require_my_lock(name)
-        if not local.is_dir():
-            raise SyncError(f"Místní kopie projektu neexistuje:\n{local}")
-
+        local, manifest = self._manifest(name)
         with ProjectDB.for_project(server) as db:
-            baseline = db.active_files()
-            session_id = lock.session_id or db.open_session(self.user, self.pc)
-        if session_id is None:
-            raise SyncError("Aktivace nebyla dokončena. Zrušte ji a projekt aktivujte znovu.")
+            sid = self._my_session(db, manifest.session_id)
+            files_all = db.active_files(include_pending=True)
+            mine = db.locked_by(sid)
+            owners = db.lock_owners()
+        by_id = {f.file_id: f for f in files_all.values()}
 
         local_files = scan(local, self.settings.ignore_patterns, progress)
-
-        unchanged, modified, missing = [], [], []
-        for path, bf in baseline.items():
+        unchanged: list[str] = []
+        modified: list[tuple[DbFile, FileInfo]] = []
+        missing: list[DbFile] = []
+        locked_unchanged: list[DbFile] = []
+        conflicts: list[str] = []
+        for path, entry in manifest.files.items():
             lf = local_files.get(path)
-            if lf is None:
-                missing.append(bf)
-            elif lf.sha256 != bf.sha256:
-                modified.append((bf, lf))
+            dbf = by_id.get(entry.file_id)
+            if entry.file_id in mine and dbf is not None:
+                base = DbFile(entry.file_id, path, dbf.size, dbf.mtime, entry.sha256)
+                if lf is None:
+                    missing.append(base)
+                elif lf.sha256 != entry.sha256:
+                    modified.append((base, lf))
+                else:
+                    locked_unchanged.append(base)
+                    unchanged.append(path)
+                if not dbf.pending and lf is not None:
+                    try:
+                        st = to_abs(server, dbf.path).stat()
+                        if not same_stat(st.st_size, st.st_mtime, dbf.size, dbf.mtime):
+                            conflicts.append(f"{path} – změněn na serveru mimo aplikaci (bude přepsán)")
+                    except FileNotFoundError:
+                        conflicts.append(f"{path} – smazán na serveru mimo aplikaci")
+            elif lf is None:
+                conflicts.append(f"{path} – smazán v místní kopii, ale nemáte ho zamčený "
+                                 "(na serveru zůstane)")
+            elif lf.sha256 != entry.sha256:
+                who = owners.get(entry.file_id)
+                conflicts.append(f"{path} – změněn v místní kopii, ale nemáte ho zamčený"
+                                 + (f" (drží {who.label})" if who else "") + " – změna se nenahraje")
             else:
                 unchanged.append(path)
-        new = [lf for path, lf in local_files.items() if path not in baseline]
-        suggestions = suggest_renames(missing, new, self.settings.rename_threshold)
 
-        conflicts = []
-        for path, bf in baseline.items():
-            sp = to_abs(server, path)
-            try:
-                st = sp.stat()
-            except FileNotFoundError:
-                conflicts.append(f"{path} – mezitím smazán na serveru")
+        by_lower = {p.lower(): f for p, f in files_all.items()}
+        new: list[FileInfo] = []
+        for path, lf in local_files.items():
+            if path in manifest.files:
                 continue
-            if not same_stat(st.st_size, st.st_mtime, bf.size, bf.mtime):
-                conflicts.append(f"{path} – mezitím změněn na serveru (bude přepsán)")
-        for lf in new:
-            if to_abs(server, lf.path).exists():
-                conflicts.append(f"{lf.path} – na serveru mezitím vznikl soubor se stejným názvem")
+            f = by_lower.get(path.lower())
+            if f is not None and not (f.file_id in mine and f.pending):
+                conflicts.append(f"{path} – na serveru už je soubor se stejným názvem (nelze nahrát)")
+                continue
+            new.append(lf)
 
-        return DeactivationPlan(name, session_id, local_files, unchanged, modified, missing,
-                                new, suggestions, conflicts, invalid_rel_paths(local_files))
+        suggestions = suggest_renames(missing, new, self.settings.rename_threshold)
+        invalid = invalid_rel_paths([lf.path for lf in new] + [lf.path for _, lf in modified])
+        return UploadPlan(name, sid, local_files, unchanged, modified, missing, new,
+                          locked_unchanged, suggestions, conflicts, invalid)
 
-    def deactivate(
+    # zpětně čitelné názvy pro deaktivaci
+    plan_deactivation = plan_upload
+
+    def deactivate(self, plan: UploadPlan, assignments: dict[str, str | None], comment: str,
+                   progress: Progress | None = None) -> UploadResult:
+        """Nahraje všechny vlastní změny, uvolní všechny zámky a ukončí aktivaci."""
+        return self.upload(plan, assignments, comment, None, end_session=True, progress=progress)
+
+    def upload(
         self,
-        plan: DeactivationPlan,
+        plan: UploadPlan,
         assignments: dict[str, str | None],
         comment: str,
+        selected: set[str] | None = None,
+        end_session: bool = False,
         progress: Progress | None = None,
-    ) -> DeactivationResult:
-        """Nahraje změny na server, zapíše je do databáze a uvolní zámek.
+    ) -> UploadResult:
+        """Odevzdá vybrané změny na server a uvolní odevzdané soubory.
 
-        assignments: file_id chybějícího souboru -> nová cesta (přejmenování), nebo None (smazán).
+        assignments: file_id chybějícího souboru -> nová cesta (přejmenování) / None (smazán).
+        selected:    klíče položek k odevzdání (file_id, u nových souborů new_key(cesta));
+                     None = vše. Při end_session se vždy odevzdá vše a uvolní všechny zámky.
         """
+        if end_session:
+            selected = None
         comment = comment.strip()
-        if not comment:
-            raise SyncError("Bez komentáře nelze projekt deaktivovat.")
-        if plan.invalid_names:
-            raise SyncError("Projekt obsahuje názvy s nepovolenými znaky – nejdřív je opravte:\n\n"
-                            + format_invalid(plan.invalid_names))
-        self._require_my_lock(plan.name)
+
+        def sel(key: str) -> bool:
+            return selected is None or key in selected
 
         new_by_path = {lf.path: lf for lf in plan.new}
         targets = [p for p in assignments.values() if p]
@@ -475,16 +640,53 @@ class ProjectManager:
             raise SyncError("Jeden nový soubor je přiřazen k více původním souborům.")
         if any(p not in new_by_path for p in targets):
             raise SyncError("Přiřazení obsahuje soubor, který není mezi novými soubory.")
+        missing_by_id = {bf.file_id: bf for bf in plan.missing}
+        renames = [(missing_by_id[fid], new_by_path[p]) for fid, p in assignments.items()
+                   if p and sel(fid)]
+        deleted = [bf for bf in plan.missing if not assignments.get(bf.file_id) and sel(bf.file_id)]
+        modified = [(bf, lf) for bf, lf in plan.modified if sel(bf.file_id)]
+        added = [lf for lf in plan.new if lf.path not in set(targets) and sel(new_key(lf.path))]
+        release_only = [bf for bf in plan.locked_unchanged if sel(bf.file_id)]
+        has_changes = bool(renames or deleted or modified or added)
+
+        if has_changes and not comment:
+            raise SyncError("Bez komentáře nelze změny odevzdat.")
+        invalid = invalid_rel_paths([lf.path for _, lf in renames + modified] + [lf.path for lf in added])
+        if invalid:
+            raise SyncError("Soubory mají názvy s nepovolenými znaky – nejdřív je opravte:\n\n"
+                            + format_invalid(invalid))
+        if not (has_changes or release_only or end_session):
+            raise SyncError("Není vybráno nic k odevzdání.")
 
         server = self.server_dir(plan.name)
         local = self.local_dir(plan.name)
         sid = plan.session_id
-        missing_by_id = {bf.file_id: bf for bf in plan.missing}
-        renames = [(missing_by_id[fid], new_by_path[p]) for fid, p in assignments.items() if p]
-        deleted = [bf for fid, bf in missing_by_id.items() if not assignments.get(fid)]
-        added = [lf for lf in plan.new if lf.path not in set(targets)]
 
-        total = 2 * len(renames) + len(plan.modified) + len(added) + len(deleted)
+        # 1) Rezervace: nové názvy a soubory, které se budou měnit, se označí jako „nahrávají se“
+        #    (ostatní uživatelé je zatím nestahují a nikdo jiný si stejný název nezabere).
+        new_ids: dict[str, str] = {}
+        with self._write(server) as db:
+            self._my_session(db, sid)
+            mine = db.locked_by(sid)
+            by_lower = {p.lower(): f for p, f in db.active_files(include_pending=True).items()}
+            for lf in added:
+                f = by_lower.get(lf.path.lower())
+                if f is not None and f.file_id in mine and f.pending:
+                    new_ids[lf.path] = f.file_id  # rezervace z přerušeného pokusu
+                    continue
+                if f is not None or to_abs(server, lf.path).exists():
+                    raise SyncError(f"Na serveru už je soubor se stejným názvem:\n{lf.path}")
+                fid = db.add_file(lf.path, None, None, None, pending=True)
+                db.lock(sid, [fid])
+                new_ids[lf.path] = fid
+            for bf, lf in renames:
+                f = by_lower.get(lf.path.lower())
+                if f is not None and f.file_id != bf.file_id:
+                    raise SyncError(f"Na serveru už je soubor se stejným názvem:\n{lf.path}")
+            db.set_pending([bf.file_id for bf, _ in renames + modified] + [bf.file_id for bf in deleted])
+
+        # 2) Soubory na serveru
+        total = 2 * len(renames) + len(modified) + len(added) + len(deleted)
         step = 0
 
         def tick(text: str) -> None:
@@ -493,12 +695,10 @@ class ProjectManager:
                 progress(step, total, text)
             step += 1
 
-        with ProjectDB.for_project(server) as db:
-            db.set_session_status(sid, "uploading")
-            ops: list[tuple] = []  # záznamy pro databázi, zapisují se na konci v jedné transakci
-
-            # 1) Přejmenování – dvoufázově přes .spm/tmp, aby fungovala i záměna názvů (a <-> b)
-            tmp_dir = server / SPM_DIR / "tmp"
+        ops: list[tuple] = []
+        tmp_dir = server / SPM_DIR / "tmp"
+        if renames:
+            # dvoufázově přes .spm/tmp, aby fungovala i záměna názvů (a <-> b)
             tmp_dir.mkdir(parents=True, exist_ok=True)
             for bf, _ in renames:
                 tick(f"Přejmenování {bf.path}")
@@ -519,92 +719,212 @@ class ProjectManager:
                 backup = None
                 if changed or not dst.exists():
                     backup = self._upload(server, local, lf, backup_existing=changed)
-                kind = dbm.RENAMED_MODIFIED if changed else dbm.RENAMED
-                ops.append((kind, bf.file_id, bf.path, lf, backup))
+                ops.append((dbm.RENAMED_MODIFIED if changed else dbm.RENAMED, bf.file_id, bf.path, lf, backup))
 
-            # 2) Upravené soubory
-            for bf, lf in plan.modified:
-                tick(f"Nahrávání {lf.path}")
-                backup = self._upload(server, local, lf, backup_existing=True)
-                ops.append((dbm.MODIFIED, bf.file_id, bf.path, lf, backup))
+        for bf, lf in modified:
+            tick(f"Nahrávání {lf.path}")
+            backup = self._upload(server, local, lf, backup_existing=True)
+            ops.append((dbm.MODIFIED, bf.file_id, bf.path, lf, backup))
 
-            # 3) Nové soubory
-            for lf in added:
-                tick(f"Nahrávání {lf.path}")
-                if to_abs(server, lf.path).exists() and not self._already_uploaded(server, local, lf.path, lf.sha256):
-                    self._to_trash(server, sid, lf.path)
-                self._upload(server, local, lf, backup_existing=False)
-                ops.append((dbm.ADDED, None, None, lf, None))
+        for lf in added:
+            tick(f"Nahrávání {lf.path}")
+            self._upload(server, local, lf, backup_existing=False)
+            ops.append((dbm.ADDED, new_ids[lf.path], None, lf, None))
 
-            # 4) Smazané soubory – na serveru se nemažou, ale přesouvají do .spm/trash/<sezení>/
-            for bf in deleted:
-                tick(f"Mazání {bf.path}")
-                trash = self._to_trash(server, sid, bf.path)
-                remove_empty_parents(server, bf.path)
-                ops.append((dbm.DELETED, bf.file_id, bf.path, None, trash))
+        for bf in deleted:
+            # na serveru se nemažou, ale přesouvají do .spm/trash/<sezení>/
+            tick(f"Mazání {bf.path}")
+            trash = self._to_trash(server, sid, bf.path)
+            remove_empty_parents(server, bf.path)
+            ops.append((dbm.DELETED, bf.file_id, bf.path, None, trash))
 
-            if progress:
-                progress(total, total, "Zápis do databáze…")
-            with db.conn:
-                for kind, file_id, old_path, lf, backup in ops:
-                    if kind == dbm.DELETED:
-                        db.mark_deleted(file_id)
-                        db.add_change(sid, file_id, kind, old_path, None, backup_path=backup)
-                        continue
-                    st = to_abs(server, lf.path).stat()
-                    if kind == dbm.ADDED:
-                        file_id = db.add_file(lf.path, st.st_size, st.st_mtime, lf.sha256)
-                    else:
-                        db.update_file(file_id, lf.path, st.st_size, st.st_mtime, lf.sha256)
-                    db.add_change(sid, file_id, kind, old_path, lf.path, st.st_size,
-                                  st.st_mtime, lf.sha256, backup)
-                db.finish_session(sid, comment)
+        # 3) Zápis do databáze a uvolnění zámků
+        if progress:
+            progress(total, total, "Zápis do databáze…")
+        released: list[str] = []
+        with self._write(server) as db:
+            self._my_session(db, sid)
+            commit_id = db.add_commit(sid, self.user, self.pc, dbm.UPLOAD, comment) if has_changes else None
+            for kind, file_id, old_path, lf, backup in ops:
+                if kind == dbm.DELETED:
+                    db.mark_deleted(file_id)
+                    db.add_change(commit_id, file_id, kind, old_path, None, backup_path=backup)
+                    continue
+                st = to_abs(server, lf.path).stat()
+                db.update_file(file_id, lf.path, st.st_size, st.st_mtime, lf.sha256)
+                db.add_change(commit_id, file_id, kind, old_path, lf.path, st.st_size,
+                              st.st_mtime, lf.sha256, backup)
+                released.append(file_id)
+            released += [bf.file_id for bf in release_only]
+            if end_session:
+                db.end_session(sid, "done")
+            else:
+                db.release(sid, released)
+        if renames:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        release_lock(server)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # 4) Místní kopie: manifest a atribut „jen pro čtení“ u odevzdaných souborů
+        _, manifest = self._manifest(plan.name)
+        for kind, file_id, old_path, lf, _ in ops:
+            if kind == dbm.DELETED:
+                manifest.files.pop(old_path, None)
+                continue
+            if old_path and old_path != lf.path:
+                manifest.files.pop(old_path, None)
+            manifest.files[lf.path] = Entry(file_id, lf.sha256)
+            set_readonly(to_abs(local, lf.path), True)
+        for bf in release_only:
+            set_readonly(to_abs(local, bf.path), True)
 
-        result = DeactivationResult(
-            renamed=len(renames), modified=len(plan.modified), added=len(added), deleted=len(deleted)
-        )
-        if self.settings.delete_local_after_deactivate:
-            shutil.rmtree(local, ignore_errors=True)
-            result.local_deleted = not local.exists()
+        result = UploadResult(renamed=len(renames), modified=len(modified), added=len(added),
+                              deleted=len(deleted), released=len(released))
+        if end_session:
+            remove_marker(server, self.user, self.pc)
+            if self.settings.delete_local_after_deactivate:
+                rmtree(local)
+                result.local_deleted = not local.exists()
+            else:
+                manifest.save(local)
+        else:
+            manifest.save(local)
         return result
 
     def cancel_activation(self, name: str) -> None:
-        """Zruší vlastní aktivaci bez nahrání změn. Místní kopie zůstane beze změny."""
+        """Zruší vlastní aktivaci bez nahrání změn a uvolní všechny zámky.
+        Místní kopie zůstane beze změny."""
         server = self.server_dir(name)
-        lock = self._require_my_lock(name)
-        self._close_session(server, lock, "Aktivace zrušena bez nahrání změn.")
-        release_lock(server)
+        with self._write(server) as db:
+            sid = self._my_session(db)
+            db.add_commit(sid, self.user, self.pc, dbm.CANCELLED,
+                          "Aktivace zrušena bez nahrání změn.")
+            db.end_session(sid, "cancelled")
+        remove_marker(server, self.user, self.pc)
 
-    def force_unlock(self, name: str) -> None:
-        """Odebere zámek jiného uživatele (např. když je nedostupný). Změny u něj se nenahrají."""
+    def force_unlock(self, name: str, user: str, pc: str) -> None:
+        """Odebere zámky jiného uživatele (např. když je nedostupný). Jeho neodevzdané změny
+        se už nenahrají."""
         server = self.server_dir(name)
-        lock = read_lock(server)
-        if lock is None:
+        if db_path(server).exists():
+            with self._write(server) as db:
+                sid = db.active_session(user, pc)
+                if sid is not None:
+                    db.add_commit(sid, self.user, self.pc, dbm.FORCE_UNLOCK,
+                                  f"Zámky uživatele {user} ({pc}) odebrány uživatelem {self.user}.")
+                    db.end_session(sid, "cancelled")
+        remove_marker(server, user, pc)
+
+    # --- publikování ----------------------------------------------------------
+
+    def publish(self, name: str, comment: str, progress: Progress | None = None) -> bool:
+        """Přesune projekt, který existuje jen v místním úložišti, na server.
+
+        Soubory se nahrají do skryté dočasné složky, ověří (hash obsahu na serveru)
+        a zapíší do nové databáze projektu. Pak se složka atomicky přejmenuje na název
+        projektu (selže, pokud mezitím projekt stejného názvu založil někdo jiný).
+        Teprve potom se místní složka smaže. Vrací True, pokud se ji podařilo smazat celou.
+        """
+        comment = comment.strip()
+        if not comment:
+            raise SyncError("Bez komentáře nelze projekt publikovat.")
+        local = self.local_dir(name)
+        server = self.server_dir(name)
+        if not local.is_dir():
+            raise SyncError(f"Místní složka neexistuje:\n{local}")
+        if not self.server_root.is_dir():
+            raise SyncError(f"Síťová složka není dostupná:\n{self.server_root}")
+        self.check_names(local, name)
+        if server.exists():
+            raise SyncError(f"Na serveru už projekt {name} existuje.")
+
+        tmp = self.server_root / f"{PUBLISH_TMP_PREFIX}{uuid.uuid4().hex}"
+        try:
+            tmp.mkdir()
+            files = list_files(local, self.settings.ignore_patterns)
+            uploaded: list[FileInfo] = []
+            for i, src in enumerate(files):
+                rel = to_rel(local, src)
+                if progress:
+                    progress(i, len(files), rel)
+                dst = to_abs(tmp, rel)
+                sha = copy_with_hash(src, dst)
+                if file_hash(dst) != sha:
+                    raise SyncError(f"Kontrola nahraného souboru selhala:\n{rel}")
+                st = dst.stat()
+                uploaded.append(FileInfo(rel, st.st_size, st.st_mtime, sha))
+            if progress:
+                progress(len(files), len(files), "Zápis do databáze…")
+
+            with ProjectDB.for_project(tmp, create=True) as db:
+                with db.conn:
+                    cid = db.add_commit(None, self.user, self.pc, dbm.PUBLISH, comment)
+                    for fi in uploaded:
+                        fid = db.add_file(fi.path, fi.size, fi.mtime, fi.sha256)
+                        db.add_change(cid, fid, dbm.PUBLISHED, None, fi.path, fi.size, fi.mtime, fi.sha256)
+            try:
+                tmp.rename(server)
+            except FileExistsError:
+                raise SyncError(f"Na serveru už projekt {name} existuje.") from None
+        except BaseException:
+            rmtree(tmp)
+            raise
+
+        rmtree(local)
+        return not local.exists()
+
+    # --- přejmenování projektu -------------------------------------------------
+
+    def rename_project(self, name: str, new_name: str) -> None:
+        """Přejmenuje složku projektu na síťovém úložišti a zapíše to do databáze projektu.
+
+        Projekt nesmí mít nikdo aktivovaný. Místní úložiště se nemění.
+        """
+        new_name = new_name.strip()
+        if new_name == name:
             return
-        self._close_session(
-            server, lock, f"Zámek uživatele {lock.user} ({lock.pc}) odebrán uživatelem {self.user}."
-        )
-        release_lock(server)
+        error = validate_project_name(new_name)
+        if error:
+            raise SyncError(error)
+        server = self.server_dir(name)
+        target = self.server_dir(new_name)
+        if not server.is_dir():
+            raise SyncError(f"Projekt neexistuje: {server}")
+        case_only = new_name.lower() == name.lower()
+        if not case_only and target.exists():
+            raise SyncError(f"Na serveru už projekt {new_name} existuje.")
+        if not case_only and self.local_dir(new_name).exists():
+            raise SyncError(
+                f"V místním úložišti už existuje složka {new_name}.\n"
+                "Zvolte jiný název, nebo tuto místní složku nejdřív přejmenujte či odstraňte."
+            )
+
+        with WriteLock(server, self.user, self.pc) as wl:
+            users = active_users(server)
+            if db_path(server).exists():
+                with ProjectDB.for_project(server) as db:
+                    users += [LockInfo(r["user"], r["pc"], r["activated_at"]) for r in db.active_sessions()]
+            if users:
+                raise SyncError(f"Projekt má aktivovaný {users[0].label}. "
+                                "Přejmenovat lze jen projekt, který nikdo nemá aktivovaný.")
+            try:
+                server.rename(target)
+            except FileExistsError:
+                raise SyncError(f"Na serveru už projekt {new_name} existuje.") from None
+            except PermissionError:
+                raise SyncError(
+                    "Složku projektu nelze přejmenovat – některý soubor nebo složka projektu je na "
+                    "serveru otevřená (např. v Průzkumníku nebo jiné aplikaci)."
+                ) from None
+            wl.moved_to(target)
+            with ProjectDB.for_project(target, create=True) as db:
+                with db.conn:
+                    db.add_commit(None, self.user, self.pc, dbm.PROJECT_RENAMED,
+                                  f"Projekt přejmenován: {name} → {new_name}")
 
     # --- pomocné -----------------------------------------------------------
 
-    def _close_session(self, server: Path, lock: LockInfo, comment: str) -> None:
-        try:
-            db = ProjectDB.for_project(server)
-        except FileNotFoundError:
-            return
-        with db:
-            sid = lock.session_id or db.open_session(lock.user, lock.pc)
-            if sid is not None:
-                with db.conn:
-                    db.finish_session(sid, comment, status="cancelled")
-
     @staticmethod
     def _already_uploaded(server: Path, local: Path, rel: str, sha256: str) -> bool:
-        """Soubor už byl nahrán (např. při opakování přerušené deaktivace)."""
+        """Soubor už byl nahrán (např. při opakování přerušeného odevzdání)."""
         dst = to_abs(server, rel)
         try:
             s, l = dst.stat(), to_abs(local, rel).stat()
