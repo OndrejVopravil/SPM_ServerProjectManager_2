@@ -4,7 +4,7 @@ import os
 import unicodedata
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QByteArray, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
@@ -35,12 +36,12 @@ from ..sync import (
 )
 from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
+from .project_panel import ProjectPanel
 from .settings_dialog import SettingsDialog
 from .ui_state import restore_geometry, restore_header, save_geometry, save_header
 from .upload_dialog import UploadDialog
 from .worker import run_task
 
-REFRESH_MS = 30_000
 COLOR_MINE = QColor("#2e8b57")      # aktivováno mnou
 COLOR_OTHER = QColor("#2f6fb5")     # pracují na něm jiní (lze se přidat)
 COLOR_INVALID = QColor("#e67e22")   # nepovolené znaky v názvech – nelze aktivovat
@@ -92,6 +93,8 @@ class MainWindow(QMainWindow):
         self.name_issues: dict[str, list[str]] = {}  # projekt -> názvy s nepovolenými znaky
         self._name_check: NameCheckThread | None = None
         self._name_check_again = False
+        self._rendering = False
+        self._closing = False
         self.setWindowTitle(f"SPM – Server Project Manager {__version__}")
         self.resize(1000, 560)
         restore_geometry(settings, "main", self)
@@ -114,10 +117,11 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.addToolBar(tb)
-        self.act_refresh = self._action(tb, "Obnovit", self.refresh, QKeySequence.StandardKey.Refresh)
+        self.act_refresh = self._action(tb, "Obnovit", self.refresh, QKeySequence(Qt.Key.Key_F5),
+                                        tip="Obnoví seznam projektů (F5)")
         tb.addSeparator()
         self.act_activate = self._action(tb, "Aktivovat…", self.activate,
-                                         tip="Stáhne projekt a zamkne vybrané soubory k úpravě")
+                                         tip="Stáhne projekt a zamkne vybrané soubory k úpravě (F3)")
         self.act_submit = self._action(tb, "Odevzdat…", self.submit,
                                        tip="Nahraje vybrané změny na server a uvolní je – projekt zůstane aktivovaný")
         self.act_update = self._action(tb, "Aktualizovat", self.update_from_server,
@@ -125,13 +129,19 @@ class MainWindow(QMainWindow):
         self.act_take = self._action(tb, "Převzít…", self.take,
                                      tip="Zamkne další volné soubory k úpravě")
         self.act_deactivate = self._action(tb, "Deaktivovat…", self.deactivate,
-                                           tip="Odevzdá vše, uvolní všechny zámky a ukončí aktivaci")
+                                           tip="Odevzdá vše, uvolní všechny zámky a ukončí aktivaci (F3)")
         tb.addSeparator()
         self.act_publish = self._action(tb, "Publikovat…", self.publish)
         self.act_open = self._action(tb, "Otevřít místní složku", self.open_local)
         self.act_history = self._action(tb, "Historie", self.history)
         tb.addSeparator()
         self._action(tb, "Nastavení", self.open_settings)
+
+        # F3 = aktivovat / deaktivovat podle stavu vybraného projektu
+        toggle = QAction(self)
+        toggle.setShortcut(QKeySequence(Qt.Key.Key_F3))
+        toggle.triggered.connect(lambda: self.toggle_activation())
+        self.addAction(toggle)
 
         # jen v kontextovém menu (pravé tlačítko)
         self.act_cancel = QAction("Zrušit aktivaci…", self)
@@ -154,11 +164,23 @@ class MainWindow(QMainWindow):
         self.search.setMaximumWidth(320)
         self.search.textChanged.connect(self._apply_filter)
         self.search.returnPressed.connect(self._select_first_visible)
+        # pod seznamem: stav vybraného aktivovaného projektu (kdo drží které soubory)
+        self.panel = ProjectPanel(self.pm)
+        self.panel.hide()
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter.addWidget(self.table)
+        self.splitter.addWidget(self.panel)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setChildrenCollapsible(False)
+        state = settings.ui.get("main.splitter")
+        if state:
+            self.splitter.restoreState(QByteArray.fromBase64(state.encode("ascii")))
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(6, 6, 6, 0)
         layout.addWidget(self.search)
-        layout.addWidget(self.table)
+        layout.addWidget(self.splitter)
         self.setCentralWidget(central)
         focus = QAction(self)
         focus.setShortcut(QKeySequence.StandardKey.Find)
@@ -168,8 +190,8 @@ class MainWindow(QMainWindow):
         clear.activated.connect(self.search.clear)
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(lambda: self.refresh(silent=True))
-        self.timer.start(REFRESH_MS)
+        self.timer.timeout.connect(lambda: self.refresh(silent=True, check_names=False))
+        self._apply_refresh_timer()
 
         self._update_status_bar()
         QTimer.singleShot(0, self._startup)
@@ -203,7 +225,17 @@ class MainWindow(QMainWindow):
         rows = self.table.selectionModel().selectedRows()
         return self.projects[rows[0].row()] if rows else None
 
-    def refresh(self, silent: bool = False) -> None:
+    def _apply_refresh_timer(self) -> None:
+        """Automatické obnovení podle nastavení (-1 = vypnuto)."""
+        seconds = self.settings.auto_refresh_seconds
+        if seconds > 0:
+            self.timer.start(seconds * 1000)
+        else:
+            self.timer.stop()
+
+    def refresh(self, silent: bool = False, check_names: bool = True) -> None:
+        """Obnoví seznam projektů. Kontrola nepovolených znaků (prochází celé stromy projektů
+        na serveru) běží jen při spuštění a při ručním obnovení, ne při automatickém."""
         if not self.settings.is_complete() or getattr(self, "_running_task", None):
             return
         current = self.selected().name if self.selected() else self.settings.ui.get("last_project")
@@ -218,10 +250,14 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
         self._render(current)
-        self._start_name_check()
+        if check_names:
+            self._start_name_check()
+        self.panel.show_project(self.selected())
 
     def _start_name_check(self) -> None:
         """Na pozadí zkontroluje názvy složek a souborů v projektech, které nemám aktivované."""
+        if self._closing:
+            return
         if self._name_check and self._name_check.isRunning():
             self._name_check_again = True
             return
@@ -232,6 +268,8 @@ class MainWindow(QMainWindow):
         self._name_check.start()
 
     def _on_name_check(self, issues: dict) -> None:
+        if self._closing:
+            return
         self.name_issues = issues
         current = self.selected().name if self.selected() else None
         self._render(current)
@@ -242,45 +280,68 @@ class MainWindow(QMainWindow):
         return self.name_issues.get(p.name, []) if p and not p.mine else []
 
     def _render(self, current: str | None) -> None:
-        color_local = self.palette().color(QPalette.ColorRole.PlaceholderText)
-        self.table.setRowCount(len(self.projects))
-        for r, p in enumerate(self.projects):
-            issues = self.issues_of(p)
-            if issues:
-                state = "Nepovolené znaky"
-            elif p.local_only:
-                state = "Jen místně"
-            elif p.mine:
-                state = "Aktivováno mnou"
-            elif p.active:
-                state = "Pracují jiní"
-            else:
-                state = "Volný"
-            names = ["já" if not any(u is o for o in p.others) else u.user for u in p.users]
-            since = min((u.since for u in p.users), default="").replace("T", " ")
-            values = [p.name, state, ", ".join(names), since, "ano" if p.local_exists else ""]
-            for c, v in enumerate(values):
-                item = QTableWidgetItem(v)
-                if issues:
-                    item.setForeground(COLOR_INVALID)
-                    item.setToolTip("Projekt obsahuje názvy s nepovolenými znaky – nelze ho "
-                                    + ("publikovat" if p.local_only else "aktivovat")
-                                    + ", dokud je neopravíte:\n\n" + format_invalid(issues))
-                elif p.local_only:
-                    item.setForeground(color_local)
-                    item.setToolTip("Složka existuje jen v místním úložišti – lze ji publikovat na server.")
-                elif p.active:
-                    item.setForeground(COLOR_MINE if p.mine else COLOR_OTHER)
-                    item.setToolTip("Aktivováno:\n" + "\n".join(
-                        f"{u.label} od {u.since.replace('T', ' ')}" for u in p.users))
-                self.table.setItem(r, c, item)
-            if p.name == current:
-                self.table.selectRow(r)
+        # při překreslení celého seznamu jsou data čerstvá – výběr řádku nemá nic znovu načítat
+        self._rendering = True
+        try:
+            self.table.setRowCount(len(self.projects))
+            for r, p in enumerate(self.projects):
+                self._render_row(r, p)
+                if p.name == current:
+                    self.table.selectRow(r)
+        finally:
+            self._rendering = False
         if not self._columns_sized and self.projects:
             self.table.resizeColumnsToContents()
             self.table.setColumnWidth(0, max(self.table.columnWidth(0), 250))
             self._columns_sized = True
         self._apply_filter()
+
+    def _render_row(self, r: int, p: ProjectStatus) -> None:
+        issues = self.issues_of(p)
+        if issues:
+            state = "Nepovolené znaky"
+        elif p.local_only:
+            state = "Jen místně"
+        elif p.mine:
+            state = "Aktivováno mnou"
+        elif p.active:
+            state = "Pracují jiní"
+        else:
+            state = "Volný"
+        names = ["já" if not any(u is o for o in p.others) else u.user for u in p.users]
+        since = min((u.since for u in p.users), default="").replace("T", " ")
+        values = [p.name, state, ", ".join(names), since, "ano" if p.local_exists else ""]
+        for c, v in enumerate(values):
+            item = QTableWidgetItem(v)
+            if issues:
+                item.setForeground(COLOR_INVALID)
+                item.setToolTip("Projekt obsahuje názvy s nepovolenými znaky – nelze ho "
+                                + ("publikovat" if p.local_only else "aktivovat")
+                                + ", dokud je neopravíte:\n\n" + format_invalid(issues))
+            elif p.local_only:
+                item.setForeground(self.palette().color(QPalette.ColorRole.PlaceholderText))
+                item.setToolTip("Složka existuje jen v místním úložišti – lze ji publikovat na server.")
+            elif p.active:
+                item.setForeground(COLOR_MINE if p.mine else COLOR_OTHER)
+                item.setToolTip("Aktivováno:\n" + "\n".join(
+                    f"{u.label} od {u.since.replace('T', ' ')}" for u in p.users))
+            self.table.setItem(r, c, item)
+
+    def _refresh_selected_row(self) -> ProjectStatus | None:
+        """Po klepnutí na projekt načte jeho aktuální stav (kdo ho má aktivovaný) – levné,
+        takže řádek i panel odpovídají skutečnosti i bez automatického obnovení."""
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        r = rows[0].row()
+        try:
+            status = self.pm.project_status(self.projects[r].name)
+        except OSError:
+            status = None
+        if status is not None:
+            self.projects[r] = status
+            self._render_row(r, status)
+        return self.projects[r]
 
     def show_invalid_names(self) -> None:
         p = self.selected()
@@ -315,15 +376,19 @@ class MainWindow(QMainWindow):
                 return
 
     def _on_selection(self) -> None:
-        p = self.selected()
+        p = self._refresh_selected_row() if not self._rendering else self.selected()
         if p:
             self.settings.ui["last_project"] = p.name
         self._update_actions()
+        self.panel.show_project(p)
 
     def closeEvent(self, event) -> None:
         self.timer.stop()
+        self._closing = True  # výsledky vláken na pozadí už nezobrazovat
         if self._name_check:
             self._name_check.wait(5000)
+        self.panel.stop()
+        self.settings.ui["main.splitter"] = bytes(self.splitter.saveState().toBase64()).decode("ascii")
         save_geometry(self.settings, "main", self)
         save_header(self.settings, HEADER_KEY, self.table.horizontalHeader())
         try:
@@ -399,7 +464,8 @@ class MainWindow(QMainWindow):
                  "Nové soubory můžete vytvářet kdekoliv.")
         if others:
             intro += f"\n\nNa projektu právě pracuje: {others}. Jejich soubory vybrat nelze."
-        dlg = FileSelectDialog(f"Aktivovat projekt {p.name}", intro, entries, "Aktivovat", self)
+        dlg = FileSelectDialog(f"Aktivovat projekt {p.name}", intro, entries, "Aktivovat", self,
+                               root=self.pm.server_dir(p.name))
         accepted = self._exec_dialog(dlg, "select_files")
         paths = dlg.selected_paths()
         dlg.deleteLater()
@@ -428,7 +494,7 @@ class MainWindow(QMainWindow):
             f"Převzít soubory k úpravě – {p.name}",
             "Vyberte volné soubory, které chcete upravovat. Zamknou se pro vás a stáhne se jejich "
             "aktuální verze ze serveru. Soubory, které držíte vy („já“) nebo jiní, vybrat nelze.",
-            entries, "Převzít", self, allow_empty=False)
+            entries, "Převzít", self, allow_empty=False, root=self.pm.local_dir(p.name))
         accepted = self._exec_dialog(dlg, "select_files")
         paths = dlg.selected_paths()
         dlg.deleteLater()
@@ -460,6 +526,13 @@ class MainWindow(QMainWindow):
         run_task(self, f"Aktualizace ze serveru – {p.name}", self.pm.refresh, p.name,
                  on_done=done, on_error=lambda _: self.refresh())
 
+    def toggle_activation(self) -> None:
+        """F3: můj aktivovaný projekt deaktivuje, jinak (lze-li) aktivuje."""
+        if self.act_deactivate.isEnabled():
+            self.deactivate()
+        elif self.act_activate.isEnabled():
+            self.activate()
+
     def submit(self) -> None:
         self._start_upload(end_session=False)
 
@@ -474,7 +547,7 @@ class MainWindow(QMainWindow):
                  on_done=lambda plan: self._confirm_upload(plan, end_session))
 
     def _confirm_upload(self, plan: UploadPlan, end_session: bool) -> None:
-        dlg = UploadDialog(plan, end_session, self)
+        dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name))
         accepted = self._exec_dialog(dlg, "upload")
         assignments, comment, selected = dlg.assignments(), dlg.comment_text(), dlg.selected_keys()
         dlg.deleteLater()
@@ -637,4 +710,5 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         if SettingsDialog(self.settings, self).exec():
             self._update_status_bar()
+            self._apply_refresh_timer()
             self.refresh()

@@ -73,3 +73,18 @@ def test_publish_blocked(pm):
     with pytest.raises(SyncError):
         pm.publish("Novy", "komentar")
     assert not pm.server_dir("Novy").exists()
+
+
+def test_check_can_be_disabled_in_settings(pm):
+    pm.settings.check_forbidden_chars = False
+    (pm.server_dir("Projekt") / "výkres (1).dwg").write_text("x")
+    [status] = pm.list_projects()
+    assert pm.invalid_names(status) == []
+    pm.activate("Projekt")
+    (pm.local_dir("Projekt") / "nová verze.txt").write_text("x")
+    plan = pm.plan_upload("Projekt")
+    assert plan.invalid_names == []
+    pm.deactivate(plan, plan.default_assignments(), "diakritika povolena")
+    assert (pm.server_dir("Projekt") / "nová verze.txt").exists()
+    # název projektu se kontroluje vždy
+    assert validate_project_name("Projekt á")

@@ -85,12 +85,135 @@ def test_upload_dialog_selection(app, pms):
     dlg = UploadDialog(plan, end_session=False)
     ok = dlg.buttons.buttons()[0]
     assert not ok.isEnabled()                      # nic nevybráno
-    item = dlg.list_added.findItems("sestava/elektrody/E03.elt", Qt.MatchFlag.MatchExactly)[0]
-    item.setCheckState(Qt.CheckState.Checked)
+    find(dlg.tree_new, "sestava/elektrody/E03.elt").setCheckState(0, Qt.CheckState.Checked)
     assert dlg.selected_keys() == {new_key("sestava/elektrody/E03.elt")}
+    # zaškrtnutí se přenese do záložky „Vše“
+    assert find(dlg.tree_all, "sestava/elektrody/E03.elt").checkState(0) == Qt.CheckState.Checked
     assert not ok.isEnabled()                      # chybí komentář
     dlg.comment.setPlainText("E03")
     assert ok.isEnabled()
 
     deact = UploadDialog(plan, end_session=True)
     assert deact.selected_keys() is None           # deaktivace = vše
+    assert not deact.tree_all.checkable
+
+
+def test_upload_dialog_whole_folder_in_one_click(app, pms):
+    from PySide6.QtCore import Qt
+
+    from spm.gui.upload_dialog import UploadDialog
+
+    alice, _ = pms
+    alice.activate("Forma")  # zamkne vše
+    local = alice.local_dir("Forma")
+    (local / "sestava" / "elektrody" / "E01.elt").write_text("upravena")   # upravený
+    (local / "sestava" / "elektrody" / "E02.elt").unlink()                  # smazaný
+    (local / "sestava" / "elektrody" / "E03.elt").write_text("nova")       # nový
+    (local / "dily" / "deska.elt").write_text("jina slozka")                # mimo složku
+    plan = alice.plan_upload("Forma")
+    dlg = UploadDialog(plan, end_session=False)
+    ids = {bf.path: bf.file_id for bf in plan.missing + [m[0] for m in plan.modified]}
+    # E02/E03 mají podobné názvy -> aplikace navrhne přejmenování; tady jde o smazání + nový
+    dlg.combos[ids["sestava/elektrody/E02.elt"]].setCurrentIndex(0)
+
+    find(dlg.tree_all, "sestava/elektrody").setCheckState(0, Qt.CheckState.Checked)
+    assert dlg.selected_keys() == {ids["sestava/elektrody/E01.elt"], ids["sestava/elektrody/E02.elt"],
+                                   new_key("sestava/elektrody/E03.elt")}
+    assert find(dlg.tree_all, "sestava").checkState(0) == Qt.CheckState.PartiallyChecked
+
+    dlg.comment.setPlainText("elektrody")
+    res = alice.upload(plan, dlg.assignments(), dlg.comment_text(), dlg.selected_keys())
+    assert (res.modified, res.deleted, res.added) == (1, 1, 1)
+
+
+def test_project_panel_shows_locks_only_for_active_projects(app, pms, tmp_path, monkeypatch):
+    from spm import config
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    alice, bob = pms
+    (tmp_path / "server" / "Volny").mkdir()
+    alice.activate("Forma", lock_paths=["sestava/sestava.elt"])
+    bob.activate("Forma", lock_paths=["dily/deska.elt"])
+
+    w = MainWindow(bob.settings)
+    w.pm = bob
+    w.panel.pm = bob
+    w.refresh()
+    names = [p.name for p in w.projects]
+
+    w.table.selectRow(names.index("Volny"))
+    assert w.panel.isHidden()
+
+    w.table.selectRow(names.index("Forma"))
+    assert not w.panel.isHidden()
+    w.panel._thread.wait()
+    app.processEvents()
+    owners = {e.path: (e.owner.user if e.owner else None, e.mine) for e in w.panel.entries}
+    assert owners["sestava/sestava.elt"] == ("alice", False)
+    assert owners["dily/deska.elt"] == ("bob", True)
+    assert owners["sestava/elektrody/E01.elt"] == (None, False)
+    assert "alice (PC-alice): <b>1</b>" in w.panel.summary.text()
+    assert find(w.panel.tree, "sestava/sestava.elt").text(1) == "alice (PC-alice)"
+
+    w.panel.only_locked.setChecked(True)
+    assert sorted(i.data(0, 256 + 1) for i in w.panel.tree.leaf_items()) == ["dily/deska.elt", "sestava/sestava.elt"]
+    w._name_check and w._name_check.wait()
+    w.close()
+
+
+def test_click_refreshes_row_without_full_refresh(app, pms, tmp_path, monkeypatch):
+    from spm import config
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    alice, bob = pms
+    (tmp_path / "server" / "Volny").mkdir()
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    names = [p.name for p in w.projects]
+    w.table.selectRow(names.index("Volny"))
+    assert w.table.item(names.index("Forma"), 1).text() == "Volný"
+
+    alice.activate("Forma", lock_paths=[])   # mezitím, bez obnovení seznamu
+    w.table.selectRow(names.index("Forma"))  # klepnutí na projekt
+    row = names.index("Forma")
+    assert w.table.item(row, 1).text() == "Pracují jiní"
+    assert w.table.item(row, 2).text() == "alice"
+    assert not w.panel.isHidden()
+    w.panel._thread.wait()
+    w.close()
+
+
+def test_f3_toggles_activation(app, pms, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QKeySequence
+
+    from spm import config
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    alice, bob = pms
+    (tmp_path / "server" / "Moje").mkdir()
+    bob.activate("Moje")
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    calls = []
+    monkeypatch.setattr(w, "activate", lambda: calls.append("activate"))
+    monkeypatch.setattr(w, "deactivate", lambda: calls.append("deactivate"))
+    w.refresh(check_names=False)
+    names = [p.name for p in w.projects]
+
+    keys = {a.shortcut().toString() for a in w.actions() + w.findChildren(type(w.act_refresh))}
+    assert {"F3", "F5"} <= keys
+
+    w.table.selectRow(names.index("Forma"))   # volný -> aktivovat
+    w.toggle_activation()
+    w.table.selectRow(names.index("Moje"))    # můj -> deaktivovat
+    w.toggle_activation()
+    w.table.clearSelection()                  # nic vybráno -> nic
+    w.toggle_activation()
+    assert calls == ["activate", "deactivate"]
+    w.panel._thread and w.panel._thread.wait()
+    w.close()

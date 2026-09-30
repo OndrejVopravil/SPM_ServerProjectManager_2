@@ -1,11 +1,17 @@
 """Dialog odevzdání a deaktivace: přiřazení přejmenovaných souborů, výběr, komentář.
 
-- Odevzdání: uživatel zaškrtne, které změny nahrát. Odevzdané soubory se uvolní
-  (i zamčené soubory beze změny lze jen uvolnit). Projekt zůstává aktivovaný.
+- Odevzdání: uživatel zaškrtne ve stromu složek, co nahrát (zaškrtnutím složky celý její
+  obsah). Odevzdané soubory se uvolní – i zamčené soubory beze změny lze jen uvolnit.
+  Projekt zůstává aktivovaný.
 - Deaktivace: odevzdá se vše, uvolní se všechny zámky a aktivace skončí.
+
+Záložka „Vše“ obsahuje všechny změny v jednom stromu, ostatní záložky jsou jen filtry;
+zaškrtnutí se mezi záložkami přenáší.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -18,7 +24,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QListWidget,
-    QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
     QTableWidget,
@@ -29,21 +34,36 @@ from PySide6.QtWidgets import (
 )
 
 from ..names import format_invalid
+from ..scanner import to_abs
 from ..sync import UploadPlan, new_key
+from .check_tree import CheckTree, TreeEntry
 
 DELETED_LABEL = "— smazán —"
 KEY_ROLE = Qt.ItemDataRole.UserRole
 
+# záložky: (název, druhy změn, které obsahuje)
+TABS = [
+    ("Vše", {"modified", "renamed", "new", "deleted", "unchanged"}),
+    ("Upravené", {"modified", "renamed"}),
+    ("Nové", {"new"}),
+    ("Smazané", {"deleted"}),
+    ("Zamčené beze změny", {"unchanged"}),
+]
+
 
 class UploadDialog(QDialog):
-    def __init__(self, plan: UploadPlan, end_session: bool, parent: QWidget | None = None):
+    def __init__(self, plan: UploadPlan, end_session: bool, parent: QWidget | None = None,
+                 local: Path | None = None):
+        """local: místní kopie projektu (pro ikony souborů)."""
         super().__init__(parent)
         self.plan = plan
+        self.local = local
         self.end_session = end_session
         self.selectable = not end_session
         self.setWindowTitle(("Deaktivace" if end_session else "Odevzdání") + f" – projekt {plan.name}")
-        self.resize(920, 680)
+        self.resize(920, 700)
         self.suggestions = {s.file_id: s for s in plan.suggestions}
+        self.new_by_path = {lf.path: lf for lf in plan.new}
         self.combos: dict[str, QComboBox] = {}
         self.checked: set[str] = set()   # vybrané klíče (jen při odevzdání)
         self.invalid = set(plan.invalid_names)
@@ -52,9 +72,9 @@ class UploadDialog(QDialog):
         intro = QLabel(
             "Nahrají se všechny vaše změny a uvolní se všechny vaše zámky. Aktivace projektu skončí."
             if end_session else
-            "Zaškrtněte, co chcete odevzdat. Odevzdané soubory se nahrají na server a uvolní – "
-            "ostatní si je mohou stáhnout (Aktualizovat) nebo převzít k úpravě. "
-            "Nezaškrtnuté zůstanou u vás rozpracované a zamčené."
+            "Zaškrtněte, co chcete odevzdat – zaškrtnutím složky vyberete celý její obsah. "
+            "Odevzdané soubory se nahrají na server a uvolní – ostatní si je mohou stáhnout "
+            "(Aktualizovat) nebo převzít k úpravě. Nezaškrtnuté zůstanou u vás rozpracované a zamčené."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -75,18 +95,17 @@ class UploadDialog(QDialog):
                 "spusťte znovu." + ("" if end_session else " Ostatní soubory odevzdat lze.")))
 
         if plan.missing:
-            layout.addWidget(self._build_rename_table(), stretch=2)
+            layout.addWidget(self._build_rename_table(), stretch=1)
 
         self.tabs = QTabWidget()
-        self.list_modified = self._list()
-        self.list_added = self._list()
-        self.list_deleted = self._list()
-        self.list_unchanged = self._list()
-        self.tabs.addTab(self.list_modified, "")
-        self.tabs.addTab(self.list_added, "")
-        self.tabs.addTab(self.list_deleted, "")
-        self.tabs.addTab(self.list_unchanged, "")
-        layout.addWidget(self.tabs, stretch=1)
+        self.trees: list[CheckTree] = []
+        for title, _ in TABS:
+            tree = CheckTree(["Soubor", "Změna"], checkable=self.selectable)
+            tree.toggled.connect(lambda key, on, src=tree: self._on_toggled(key, on, src))
+            self.trees.append(tree)
+            self.tabs.addTab(tree, title)
+        self.tree_all, self.tree_modified, self.tree_new, self.tree_deleted, self.tree_unchanged = self.trees
+        layout.addWidget(self.tabs, stretch=2)
 
         if self.selectable:
             row = QHBoxLayout()
@@ -136,11 +155,6 @@ class UploadDialog(QDialog):
         lay.addWidget(label)
         return box
 
-    def _list(self) -> QListWidget:
-        lst = QListWidget()
-        lst.itemChanged.connect(self._on_item_changed)
-        return lst
-
     def _build_rename_table(self) -> QGroupBox:
         box = QGroupBox("Chybějící soubory – zkontrolujte přiřazení přejmenovaných souborů")
         lay = QVBoxLayout(box)
@@ -155,8 +169,8 @@ class UploadDialog(QDialog):
         table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.rename_table, self.rename_off = table, off
 
-        new_paths = sorted(lf.path for lf in self.plan.new)
-        for row, bf in enumerate(sorted(self.plan.missing, key=lambda f: f.path)):
+        new_paths = sorted(self.new_by_path)
+        for row, bf in enumerate(self._missing_sorted()):
             if self.selectable:
                 check = QTableWidgetItem()
                 check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
@@ -175,10 +189,13 @@ class UploadDialog(QDialog):
             self.combos[bf.file_id] = combo
             table.setCellWidget(row, off + 1, combo)
             table.setItem(row, off + 2, QTableWidgetItem())
-        table.itemChanged.connect(self._on_item_changed)
+        table.itemChanged.connect(self._on_table_changed)
         lay.addWidget(table)
         lay.addWidget(QLabel("Pokud soubor nebyl přejmenován, ale smazán, zvolte „— smazán —“."))
         return box
+
+    def _missing_sorted(self):
+        return sorted(self.plan.missing, key=lambda f: f.path)
 
     # --- výsledky ----------------------------------------------------------
 
@@ -192,52 +209,63 @@ class UploadDialog(QDialog):
         """Vybrané položky k odevzdání (None = vše, při deaktivaci)."""
         return None if self.end_session else set(self.checked)
 
+    # --- položky -----------------------------------------------------------
+
+    def _entries(self) -> list[tuple[str, TreeEntry]]:
+        """Všechny položky k odevzdání jako (druh, položka stromu)."""
+        assigned = self.assignments()
+        used = {p for p in assigned.values() if p}
+
+        def entry(path: str, key: str, note: str, exists: bool = True) -> TreeEntry:
+            file_path = str(to_abs(self.local, path)) if self.local and exists else None
+            return TreeEntry(path, key, [note], file_path=file_path)
+
+        result: list[tuple[str, TreeEntry]] = []
+        for bf, lf in self.plan.modified:
+            result.append(("modified", entry(lf.path, bf.file_id, "upraven")))
+        for bf in self.plan.missing:
+            target = assigned[bf.file_id]
+            if target:
+                changed = self.new_by_path[target].sha256 != bf.sha256
+                note = f"přejmenován z {bf.path}" + (" a upraven" if changed else "")
+                result.append(("renamed", entry(target, bf.file_id, note)))
+            else:
+                result.append(("deleted", entry(bf.path, bf.file_id, "smazán", exists=False)))
+        for lf in self.plan.new:
+            if lf.path not in used:
+                result.append(("new", entry(lf.path, new_key(lf.path), "nový")))
+        for bf in self.plan.locked_unchanged:
+            result.append(("unchanged", entry(bf.path, bf.file_id, "beze změny – jen uvolnit")))
+        return result
+
     # --- chování -----------------------------------------------------------
 
-    def _fill(self, lst: QListWidget, items: list[tuple[str, str]]) -> None:
-        lst.blockSignals(True)
-        lst.clear()
-        for label, key in items:
-            item = QListWidgetItem(label)
-            item.setData(KEY_ROLE, key)
-            if self.selectable:
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Checked if key in self.checked else Qt.CheckState.Unchecked)
-            lst.addItem(item)
-        lst.blockSignals(False)
-
-    def _on_item_changed(self, item) -> None:
-        key = item.data(KEY_ROLE)
-        if not key or not self.selectable:
-            return
-        if item.checkState() == Qt.CheckState.Checked:
-            self.checked.add(key)
-        else:
-            self.checked.discard(key)
-        self._summary()
-
-    def _check_all(self, on: bool) -> None:
-        keys = self._all_keys()
-        self.checked = set(keys) if on else set()
-        self._refresh()
-        if self.plan.missing:
+    def _on_toggled(self, key: str, on: bool, source: CheckTree | None) -> None:
+        (self.checked.add if on else self.checked.discard)(key)
+        for tree in self.trees:
+            if tree is not source:
+                tree.set_key_checked(key, on)
+        if self.plan.missing and self.selectable:
             self.rename_table.blockSignals(True)
             for row in range(self.rename_table.rowCount()):
                 item = self.rename_table.item(row, 0)
-                item.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+                if item.data(KEY_ROLE) == key:
+                    item.setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
             self.rename_table.blockSignals(False)
         self._summary()
 
-    def _all_keys(self) -> list[str]:
-        used = {p for p in self.assignments().values() if p}
-        return ([bf.file_id for bf, _ in self.plan.modified]
-                + [new_key(lf.path) for lf in self.plan.new if lf.path not in used]
-                + [bf.file_id for bf in self.plan.missing]
-                + [bf.file_id for bf in self.plan.locked_unchanged])
+    def _on_table_changed(self, item: QTableWidgetItem) -> None:
+        key = item.data(KEY_ROLE)
+        if key and self.selectable and item.column() == 0:
+            self._on_toggled(key, item.checkState() == Qt.CheckState.Checked, None)
+
+    def _check_all(self, on: bool) -> None:
+        self.checked = {e.key for _, e in self._entries()} if on else set()
+        self._refresh()
 
     def _refresh(self) -> None:
         assigned = self.assignments()
-        for row, bf in enumerate(sorted(self.plan.missing, key=lambda f: f.path)):
+        for row, bf in enumerate(self._missing_sorted()):
             target = assigned[bf.file_id]
             sugg = self.suggestions.get(bf.file_id)
             item = self.rename_table.item(row, self.rename_off + 2)
@@ -251,27 +279,27 @@ class UploadDialog(QDialog):
                 item.setText("ručně")
                 item.setToolTip("Přiřazeno ručně")
 
-        used = {p for p in assigned.values() if p}
-        self._fill(self.list_modified, [(lf.path, bf.file_id) for bf, lf in sorted(
-            self.plan.modified, key=lambda m: m[1].path)])
-        self._fill(self.list_added, [(lf.path, new_key(lf.path)) for lf in sorted(
-            self.plan.new, key=lambda f: f.path) if lf.path not in used])
-        self._fill(self.list_deleted, [(f.path, f.file_id) for f in sorted(
-            self.plan.missing, key=lambda f: f.path) if not assigned[f.file_id]])
-        self._fill(self.list_unchanged, [(f.path, f.file_id) for f in sorted(
-            self.plan.locked_unchanged, key=lambda f: f.path)])
+        entries = self._entries()
+        self.checked &= {e.key for _, e in entries}  # např. nový soubor se stal cílem přejmenování
+        for tree, (_, kinds) in zip(self.trees, TABS):
+            tree.set_entries([e for kind, e in entries if kind in kinds], self.checked)
+        if self.plan.missing and self.selectable:
+            self.rename_table.blockSignals(True)
+            for row in range(self.rename_table.rowCount()):
+                item = self.rename_table.item(row, 0)
+                item.setCheckState(Qt.CheckState.Checked if item.data(KEY_ROLE) in self.checked
+                                   else Qt.CheckState.Unchecked)
+            self.rename_table.blockSignals(False)
         self._summary()
 
     def _summary(self) -> None:
-        used = {p for p in self.assignments().values() if p}
-        n_added = sum(1 for lf in self.plan.new if lf.path not in used)
-        n_deleted = sum(1 for f in self.plan.missing if not self.assignments()[f.file_id])
-        self.tabs.setTabText(0, f"Upravené ({len(self.plan.modified)})")
-        self.tabs.setTabText(1, f"Nové ({n_added})")
-        self.tabs.setTabText(2, f"Smazané ({n_deleted})")
-        self.tabs.setTabText(3, f"Zamčené beze změny ({len(self.plan.locked_unchanged)})")
-        text = (f"Upravené: <b>{len(self.plan.modified)}</b> &nbsp; Nové: <b>{n_added}</b> &nbsp; "
-                f"Přejmenované: <b>{len(used)}</b> &nbsp; Smazané: <b>{n_deleted}</b>")
+        entries = self._entries()
+        counts = {kind: sum(1 for k, _ in entries if k == kind)
+                  for kind in ("modified", "renamed", "new", "deleted", "unchanged")}
+        for i, (title, kinds) in enumerate(TABS):
+            self.tabs.setTabText(i, f"{title} ({sum(counts[k] for k in kinds)})")
+        text = (f"Upravené: <b>{counts['modified']}</b> &nbsp; Nové: <b>{counts['new']}</b> &nbsp; "
+                f"Přejmenované: <b>{counts['renamed']}</b> &nbsp; Smazané: <b>{counts['deleted']}</b>")
         if self.selectable:
             text += f" &nbsp; | &nbsp; Vybráno k odevzdání: <b>{len(self.checked)}</b>"
         self.summary.setText(text)
@@ -279,23 +307,13 @@ class UploadDialog(QDialog):
 
     def _selected_changes(self) -> tuple[bool, list[str]]:
         """Vybrané položky: (obsahují změny?, vybrané názvy s nepovolenými znaky)."""
-        assigned = self.assignments()
-        sel = (lambda k: True) if self.end_session else (lambda k: k in self.checked)
         changes, paths = False, []
-        for bf, lf in self.plan.modified:
-            if sel(bf.file_id):
-                changes = True
-                paths.append(lf.path)
-        for bf in self.plan.missing:
-            if sel(bf.file_id):
-                changes = True
-                if assigned[bf.file_id]:
-                    paths.append(assigned[bf.file_id])
-        used = {p for p in assigned.values() if p}
-        for lf in self.plan.new:
-            if lf.path not in used and sel(new_key(lf.path)):
-                changes = True
-                paths.append(lf.path)
+        for kind, e in self._entries():
+            if kind == "unchanged" or not (self.end_session or e.key in self.checked):
+                continue
+            changes = True
+            if kind != "deleted":
+                paths.append(e.path)
         return changes, [p for p in paths if p in self.invalid]
 
     def _validate(self) -> None:

@@ -194,20 +194,26 @@ class ProjectManager:
             if not entry.is_dir() or entry.name.startswith("."):
                 continue
             server_names.add(entry.name.lower())
-            users = active_users(entry)
-            others = [u for u in users if not u.is_mine(self.user, self.pc)]
-            result.append(ProjectStatus(
-                name=entry.name,
-                users=users,
-                local_exists=self.local_dir(entry.name).exists(),
-                mine=len(others) < len(users),
-                others=others,
-            ))
+            result.append(self._server_status(entry.name))
         for name in self.local_only_projects(server_names):
             result.append(ProjectStatus(name=name, users=[], local_exists=True, mine=False,
                                         local_only=True))
         result.sort(key=lambda p: p.name.lower())
         return result
+
+    def _server_status(self, name: str) -> ProjectStatus:
+        users = active_users(self.server_dir(name))
+        others = [u for u in users if not u.is_mine(self.user, self.pc)]
+        return ProjectStatus(name=name, users=users, local_exists=self.local_dir(name).exists(),
+                             mine=len(others) < len(users), others=others)
+
+    def project_status(self, name: str) -> ProjectStatus | None:
+        """Aktuální stav jednoho projektu (levné – jen výpis .spm/active), None = už neexistuje."""
+        if self.server_dir(name).is_dir():
+            return self._server_status(name)
+        if self.local_dir(name).is_dir():
+            return ProjectStatus(name=name, users=[], local_exists=True, mine=False, local_only=True)
+        return None
 
     def local_only_projects(self, server_names: set[str]) -> list[str]:
         """Složky v místním úložišti, které na serveru nemají projekt (porovnání bez ohledu
@@ -240,16 +246,26 @@ class ProjectManager:
 
     # --- kontrola názvů -------------------------------------------------------
 
+    # Kontrolu lze v nastavení vypnout (check_forbidden_chars); název projektu se kontroluje vždy.
+
+    def _find_invalid(self, root: Path) -> list[str]:
+        if not self.settings.check_forbidden_chars:
+            return []
+        return find_invalid_names(root, self.settings.ignore_patterns)
+
+    def _invalid_paths(self, paths: list[str]) -> list[str]:
+        return invalid_rel_paths(paths) if self.settings.check_forbidden_chars else []
+
     def invalid_names(self, project: ProjectStatus) -> list[str]:
         """Názvy s nepovolenými znaky uvnitř projektu (u „Jen místně“ v místní složce)."""
         root = self.local_dir(project.name) if project.local_only else self.server_dir(project.name)
         try:
-            return find_invalid_names(root, self.settings.ignore_patterns)
+            return self._find_invalid(root)
         except OSError:
             return []
 
     def check_names(self, root: Path, name: str) -> None:
-        invalid = find_invalid_names(root, self.settings.ignore_patterns)
+        invalid = self._find_invalid(root)
         if invalid:
             raise SyncError(
                 f"Projekt {name} obsahuje složky nebo soubory s nepovolenými znaky "
@@ -600,7 +616,7 @@ class ProjectManager:
             new.append(lf)
 
         suggestions = suggest_renames(missing, new, self.settings.rename_threshold)
-        invalid = invalid_rel_paths([lf.path for lf in new] + [lf.path for _, lf in modified])
+        invalid = self._invalid_paths([lf.path for lf in new] + [lf.path for _, lf in modified])
         return UploadPlan(name, sid, local_files, unchanged, modified, missing, new,
                           locked_unchanged, suggestions, conflicts, invalid)
 
@@ -651,7 +667,7 @@ class ProjectManager:
 
         if has_changes and not comment:
             raise SyncError("Bez komentáře nelze změny odevzdat.")
-        invalid = invalid_rel_paths([lf.path for _, lf in renames + modified] + [lf.path for lf in added])
+        invalid = self._invalid_paths([lf.path for _, lf in renames + modified] + [lf.path for lf in added])
         if invalid:
             raise SyncError("Soubory mají názvy s nepovolenými znaky – nejdřív je opravte:\n\n"
                             + format_invalid(invalid))

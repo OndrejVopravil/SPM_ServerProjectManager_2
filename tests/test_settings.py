@@ -93,3 +93,28 @@ def test_main_window_remembers_state(tmp_path):
     assert w2.selected().name == "Beta"
     w2.close()
     app.processEvents()
+
+
+def test_auto_refresh_setting_normalized():
+    from spm.config import normalize_refresh
+    assert Settings().auto_refresh_seconds == -1          # výchozí = vypnuto
+    assert [normalize_refresh(v) for v in (-1, -5, 0, 30, 60, 300, "x", None)] == \
+        [-1, -1, 60, 60, 60, 300, -1, -1]
+    settings_path().parent.mkdir(parents=True, exist_ok=True)
+    settings_path().write_text('{"auto_refresh_seconds": 10}', encoding="utf-8")
+    assert Settings.load().auto_refresh_seconds == 60
+
+
+def test_timer_follows_setting(tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from spm.gui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    w = MainWindow(Settings())
+    assert not w.timer.isActive()
+    w.settings.auto_refresh_seconds = 120
+    w._apply_refresh_timer()
+    assert w.timer.isActive() and w.timer.interval() == 120_000
+    w.close()

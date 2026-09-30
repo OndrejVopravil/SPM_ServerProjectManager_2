@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import Settings
+from ..config import AUTO_REFRESH_MIN, AUTO_REFRESH_OFF, Settings
 
 
 class SettingsDialog(QDialog):
@@ -53,6 +53,26 @@ class SettingsDialog(QDialog):
 
         self.ignore = QLineEdit("; ".join(settings.ignore_patterns))
 
+        self.check_chars = QCheckBox("Kontrolovat nepovolené znaky v názvech souborů a složek")
+        self.check_chars.setToolTip("Česká diakritika, mezera a znaky ( ) & , . ; = ^ "
+                                    "(tečka před příponou souboru je povolená).\n"
+                                    "Projekt s takovými názvy nelze aktivovat ani odevzdat.\n"
+                                    "Název projektu se kontroluje vždy.")
+        self.check_chars.setChecked(settings.check_forbidden_chars)
+
+        auto_on = settings.auto_refresh_seconds > 0
+        self.auto_refresh = QCheckBox("Automaticky obnovovat seznam projektů")
+        self.auto_refresh.setToolTip("Vypnuto: seznam se obnoví při spuštění, tlačítkem Obnovit (F5) "
+                                     "a po klepnutí na projekt (jen jeho řádek).")
+        self.auto_refresh.setChecked(auto_on)
+        self.refresh_seconds = QSpinBox()
+        self.refresh_seconds.setRange(AUTO_REFRESH_MIN, 24 * 3600)
+        self.refresh_seconds.setSingleStep(30)
+        self.refresh_seconds.setSuffix(" s")
+        self.refresh_seconds.setValue(settings.auto_refresh_seconds if auto_on else 300)
+        self.refresh_seconds.setEnabled(auto_on)
+        self.auto_refresh.toggled.connect(self.refresh_seconds.setEnabled)
+
         form = QFormLayout()
         form.addRow("Síťová složka s projekty:", self._with_browse(self.server))
         form.addRow("Místní složka:", self._with_browse(self.local))
@@ -65,6 +85,15 @@ class SettingsDialog(QDialog):
         form.addRow(self.delete_local)
         form.addRow("Min. shoda pro návrh přejmenování:", self.threshold)
         form.addRow("Ignorované soubory:", self.ignore)
+        form.addRow(self.check_chars)
+        form.addRow(self.auto_refresh)
+        refresh_row = QWidget()
+        refresh_lay = QHBoxLayout(refresh_row)
+        refresh_lay.setContentsMargins(0, 0, 0, 0)
+        refresh_lay.addWidget(self.refresh_seconds)
+        refresh_lay.addWidget(QLabel(f"(min. {AUTO_REFRESH_MIN} s)"))
+        refresh_lay.addStretch()
+        form.addRow("Interval obnovení:", refresh_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")
@@ -109,5 +138,8 @@ class SettingsDialog(QDialog):
         s.delete_local_after_deactivate = self.delete_local.isChecked()
         s.rename_threshold = self.threshold.value() / 100
         s.ignore_patterns = [p.strip() for p in self.ignore.text().split(";") if p.strip()]
+        s.check_forbidden_chars = self.check_chars.isChecked()
+        s.auto_refresh_seconds = (self.refresh_seconds.value() if self.auto_refresh.isChecked()
+                                  else AUTO_REFRESH_OFF)
         s.save()
         self.accept()

@@ -13,6 +13,21 @@ from pathlib import Path
 DEFAULT_IGNORE = ["~$*", "*.tmp", ".~lock*", "Thumbs.db", "desktop.ini", "*.spmtmp", "*.lck$"]
 
 
+AUTO_REFRESH_OFF = -1
+AUTO_REFRESH_MIN = 60
+
+
+def normalize_refresh(seconds) -> int:
+    """-1 (nebo jakákoliv záporná / neplatná hodnota) = vypnuto, jinak nejméně 60 s."""
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return AUTO_REFRESH_OFF
+    if seconds < 0:
+        return AUTO_REFRESH_OFF
+    return max(seconds, AUTO_REFRESH_MIN)
+
+
 def _app_dir() -> Path:
     """Složka, ze které se aplikace spouští (u zabalené .exe verze složka s .exe)."""
     if getattr(sys, "frozen", False):
@@ -42,6 +57,10 @@ class Settings:
     backup_count: int = 3
     # Po úspěšné deaktivaci smazat místní kopii projektu
     delete_local_after_deactivate: bool = True
+    # Kontrola nepovolených znaků (diakritika, mezera, ( ) & , . ; = ^) v názvech souborů a složek
+    check_forbidden_chars: bool = True
+    # Automatické obnovení seznamu projektů v sekundách; -1 = vypnuto, jinak nejméně 60
+    auto_refresh_seconds: int = -1
     # Minimální skóre (0–1), od kterého se nabízí přiřazení přejmenovaného souboru
     rename_threshold: float = 0.6
     ignore_patterns: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
@@ -63,6 +82,7 @@ class Settings:
         known = {f.name for f in fields(cls)}
         data.setdefault("known_default_ignore", [])  # starší soubor nastavení tento údaj nemá
         settings = cls(**{k: v for k, v in data.items() if k in known})
+        settings.auto_refresh_seconds = normalize_refresh(settings.auto_refresh_seconds)
         added = settings._add_new_default_ignores()
         if migrate or (added and path == settings_path()):
             try:
