@@ -360,3 +360,94 @@ def test_my_active_projects_listed_first(tmp_path):
     bob.activate("Alfa")    # cizí aktivace se neřadí nahoru
     assert [p.name for p in alice.list_projects()] == ["Beta", "Gama", "Alfa", "Cizi_lokalni", "Delta"]
     assert [p.name for p in bob.list_projects()] == ["Alfa", "Beta", "Delta", "Gama"]
+
+
+# --- automatická deaktivace po odevzdání posledního drženého souboru -------------
+
+def test_submitting_last_held_file_deactivates(electrodes):
+    alice, bob, proj = electrodes
+    local = alice.local_dir("ProjektA")
+    write(local / "sestava" / "sestava.elt", "sestava v2")
+    plan = alice.plan_upload("ProjektA")
+    held = set(plan.held)
+    # nejdřív jen část -> zůstává aktivováno
+    part = {bf.file_id for bf, _ in plan.modified}
+    res = alice.upload(plan, plan.default_assignments(), "sestava", selected=part)
+    assert not res.auto_deactivated and [u.user for u in active_users(proj)] == ["alice"]
+    # zbytek -> poslední držené soubory -> deaktivace
+    plan = alice.plan_upload("ProjektA")
+    res = alice.upload(plan, plan.default_assignments(), "", selected=set(plan.held))
+    assert res.auto_deactivated and active_users(proj) == []
+    assert not local.exists()                      # jako při deaktivaci (smazat místní kopii)
+    with ProjectDB.for_project(proj) as db:
+        assert db.active_sessions() == [] and db.lock_owners() == {}
+    assert held
+
+
+def test_no_auto_deactivation_for_user_without_locks(electrodes):
+    """B nic nedrží, jen přidává NC soubory – po odevzdání pracuje dál."""
+    alice, bob, proj = electrodes
+    bob.activate("ProjektA", lock_paths=[])
+    write(bob.local_dir("ProjektA") / "E01_NC.nc", "nc")
+    plan = bob.plan_upload("ProjektA")
+    res = bob.upload(plan, plan.default_assignments(), "NC")
+    assert not res.auto_deactivated
+    assert "bob" in [u.user for u in active_users(proj)]
+
+
+def test_no_auto_deactivation_with_unsubmitted_new_files(electrodes):
+    alice, bob, proj = electrodes
+    write(alice.local_dir("ProjektA") / "rozpracovany.txt", "x")
+    plan = alice.plan_upload("ProjektA")
+    res = alice.upload(plan, plan.default_assignments(), "", selected=set(plan.held))
+    assert not res.auto_deactivated and "neodevzdaných nových" in res.note
+    assert [u.user for u in active_users(proj)] == ["alice"]
+    assert alice.local_dir("ProjektA").exists()
+
+
+# --- mazání do Koše ------------------------------------------------------------
+
+@pytest.fixture
+def fake_recycle(monkeypatch, tmp_path):
+    """Místo skutečného Koše Windows přesouvá do dočasné složky (testy Koš nezaplní)."""
+    import shutil
+
+    from spm import recycle
+    kos = tmp_path / "kos"
+    kos.mkdir()
+    moved = []
+
+    def fake(paths):
+        for p in paths:
+            shutil.move(str(p), str(kos / f"{len(moved)}_{p.name}"))
+            moved.append(p)
+    monkeypatch.setattr(recycle, "to_recycle_bin", fake)
+    return moved
+
+
+def test_delete_moves_own_files_to_recycle_bin(electrodes, fake_recycle):
+    alice, bob, proj = electrodes
+    local = alice.local_dir("ProjektA")
+    write(local / "sestava" / "novy.txt", "novy")
+    deleted = alice.delete_local("ProjektA", ["sestava/sestava.elt", "sestava/novy.txt"])
+    assert sorted(deleted) == ["sestava/novy.txt", "sestava/sestava.elt"]
+    assert [p.name for p in fake_recycle] == ["sestava.elt", "novy.txt"]
+    assert not (local / "sestava").exists()            # prázdná složka uklizena
+    assert (proj / "sestava" / "sestava.elt").exists()  # na serveru až při odevzdání
+    assert alice.local_deleted_files("ProjektA") == ["sestava/sestava.elt"]
+
+    plan = alice.plan_upload("ProjektA")
+    assert [bf.path for bf in plan.missing] == ["sestava/sestava.elt"]
+    fid = plan.missing[0].file_id
+    alice.upload(plan, {fid: None}, "smazana sestava", selected={fid})
+    assert not (proj / "sestava" / "sestava.elt").exists()
+    assert list((proj / ".spm" / "trash").rglob("sestava.elt"))   # na serveru do koše projektu
+
+
+def test_cannot_delete_foreign_files(electrodes, fake_recycle):
+    alice, bob, proj = electrodes
+    bob.activate("ProjektA", lock_paths=[])
+    with pytest.raises(SyncError, match="nemáte zamčené"):
+        bob.delete_local("ProjektA", ["sestava/sestava.elt"])
+    assert fake_recycle == []
+    assert (bob.local_dir("ProjektA") / "sestava" / "sestava.elt").exists()

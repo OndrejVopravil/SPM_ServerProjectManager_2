@@ -2,6 +2,8 @@
 
 Zobrazuje se pod seznamem projektů jen pro projekty, které má někdo aktivované.
 Strom se načítá na pozadí (prochází složku na serveru a čte databázi projektu).
+U mého aktivovaného projektu obsahuje i nové soubory z místní kopie, které ještě nejsou
+odevzdané (šedě).
 """
 
 from __future__ import annotations
@@ -10,7 +12,7 @@ import os
 from collections import Counter
 
 from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -33,13 +35,21 @@ COLOR_OTHER = QColor("#c0392b")
 class EntriesThread(QThread):
     done = Signal(str, list, str)  # projekt, položky, chyba
 
-    def __init__(self, pm: ProjectManager, name: str):
+    def __init__(self, pm: ProjectManager, name: str, mine: bool):
         super().__init__()
-        self.pm, self.name = pm, name
+        self.pm, self.name, self.mine = pm, name, mine
 
     def run(self) -> None:
         try:
-            self.done.emit(self.name, self.pm.file_entries(self.name), "")
+            entries = self.pm.file_entries(self.name)
+            if self.mine:  # u mého projektu i nové a smazané soubory z místní kopie
+                deleted = set(self.pm.local_deleted_files(self.name))
+                for e in entries:
+                    e.local_deleted = e.mine and e.path in deleted
+                on_server = {e.path.lower() for e in entries}
+                entries += [FileEntry(p, None, False, local_new=True)
+                            for p in self.pm.local_new_files(self.name) if p.lower() not in on_server]
+            self.done.emit(self.name, entries, "")
         except Exception as e:  # noqa: BLE001 – zobrazí se v panelu
             self.done.emit(self.name, [], str(e) or type(e).__name__)
 
@@ -101,7 +111,7 @@ class ProjectPanel(QWidget):
             self._again = True
             return
         self._again = False
-        self._thread = EntriesThread(self.pm, self.project.name)
+        self._thread = EntriesThread(self.pm, self.project.name, self.project.mine)
         self._thread.done.connect(self._on_loaded)
         self._thread.start()
 
@@ -122,35 +132,79 @@ class ProjectPanel(QWidget):
         if self.project is None:
             return
         root = self.pm.server_dir(self.project.name)
-        shown = [e for e in self.entries if e.owner or not self.only_locked.isChecked()]
-        self.tree.set_entries([
-            TreeEntry(e.path, e.path,
-                      ["" if e.free else ("já" if e.mine else e.owner.label)],
-                      color=None if e.free else (COLOR_MINE if e.mine else COLOR_OTHER),
-                      color_name=True,  # zelená = drží ho já, červená = drží ho jiný
-                      file_path=str(to_abs(root, e.path)),
-                      tooltip="Dvojklikem otevřete z místní kopie" if e.mine else "")
-            for e in shown
-        ])
+        local = self.pm.local_dir(self.project.name)
+        color_new = self.palette().color(QPalette.ColorRole.PlaceholderText)
+
+        def tree_entry(e: FileEntry) -> TreeEntry:
+            if e.local_deleted:  # šedě = můj soubor smazaný v místní kopii, ještě neodevzdaný
+                return TreeEntry(e.path, e.path, ["smazán – neodevzdaný"], color=color_new,
+                                 color_name=True, file_path=str(to_abs(root, e.path)),
+                                 tooltip="Soubor je v Koši Windows. Na serveru se smaže až při "
+                                         "odevzdání (do koše projektu).")
+            if e.local_new:  # šedě = nový soubor jen v mé místní kopii
+                return TreeEntry(e.path, e.path, ["nový – neodevzdaný"], color=color_new,
+                                 color_name=True, file_path=str(to_abs(local, e.path)),
+                                 tooltip="Nový soubor ve vaší místní kopii, zatím neodevzdaný.\n"
+                                         "Dvojklikem otevřete.")
+            return TreeEntry(e.path, e.path,
+                             ["" if e.free else ("já" if e.mine else e.owner.label)],
+                             color=None if e.free else (COLOR_MINE if e.mine else COLOR_OTHER),
+                             color_name=True,  # zelená = drží ho já, červená = drží ho jiný
+                             file_path=str(to_abs(root, e.path)),
+                             tooltip="Dvojklikem otevřete z místní kopie" if e.mine else "")
+
+        shown = [e for e in self.entries
+                 if e.owner or e.local_new or not self.only_locked.isChecked()]
+        self.tree.set_entries([tree_entry(e) for e in shown])
         counts = Counter("já" if e.mine else e.owner.label for e in self.entries if e.owner)
         free = sum(1 for e in self.entries if e.free)
+        new = sum(1 for e in self.entries if e.local_new)
         parts = [f"{who}: <b>{n}</b>" for who, n in sorted(counts.items())]
         users = ", ".join(u.label for u in self.project.users)
         self.summary.setText(
             f"Aktivováno: {users}<br>Zamčené soubory – " + (", ".join(parts) or "žádné")
-            + f" &nbsp;|&nbsp; volné: <b>{free}</b> &nbsp;|&nbsp; celkem: {len(self.entries)}")
+            + f" &nbsp;|&nbsp; volné: <b>{free}</b>"
+            + (f" &nbsp;|&nbsp; nové neodevzdané: <b>{new}</b>" if new else "")
+            + f" &nbsp;|&nbsp; na serveru celkem: {len(self.entries) - new}")
 
     def context_actions(self, scope: str) -> dict[str, bool]:
         """Které akce kontextového menu jsou pro soubor / složku dostupné."""
         mine_project = bool(self.project and self.project.mine)
         inside = [e for e in self.entries if in_scope(e.path, scope)]
+        own = any(e.mine or e.local_new for e in inside)  # zamčené mnou nebo moje nové
         return {
-            "open": not scope.endswith("/") and any(e.mine for e in inside),
-            # odevzdat: vlastní zamčené soubory (nové soubory v místní kopii panel nezná,
-            # proto u složky vždy – dialog ukáže, co v ní skutečně je)
-            "submit": mine_project and (scope.endswith("/") or any(e.mine for e in inside)),
+            "open": not scope.endswith("/") and any((e.mine or e.local_new) and not e.local_deleted
+                                                    for e in inside),
+            # u složky vždy – dialog odevzdání ukáže, co v ní skutečně je
+            "submit": mine_project and (scope.endswith("/") or own),
             "take": mine_project and any(e.free for e in inside),
+            "delete": mine_project and bool(self.deletable(scope)),
         }
+
+    def deletable(self, scope: str) -> list[str]:
+        """Soubory v rozsahu, které smím smazat: zamčené mnou nebo moje nové (a ještě nesmazané)."""
+        return [e.path for e in self.entries if in_scope(e.path, scope)
+                and (e.mine or e.local_new) and not e.local_deleted]
+
+    def _delete(self, scope: str) -> None:
+        paths = self.deletable(scope)
+        others = [e.path for e in self.entries if in_scope(e.path, scope)
+                  and not (e.mine or e.local_new) and not e.local_deleted]
+        if not paths or self.project is None:
+            return
+        lines = "\n".join(paths[:15]) + ("\n…" if len(paths) > 15 else "")
+        text = (f"Přesunout do Koše {len(paths)} souborů z vaší místní kopie?\n\n{lines}\n\n"
+                "Na serveru se smažou až při odevzdání (a i tam se jen přesunou do koše projektu).")
+        if others:
+            text += (f"\n\n{len(others)} dalších souborů ve složce nemáte zamčených – ty zůstanou.")
+        answer = QMessageBox.question(self, "Smazat", text)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.pm.delete_local(self.project.name, paths)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Smazat", str(e))
+        self.reload()
 
     def _context_menu(self, pos) -> None:
         item = self.tree.itemAt(pos)
@@ -166,6 +220,9 @@ class ProjectPanel(QWidget):
         act_submit.setEnabled(enabled["submit"])
         act_take = menu.addAction("Převzít…")
         act_take.setEnabled(enabled["take"])
+        menu.addSeparator()
+        act_delete = menu.addAction("Smazat… (do Koše)")
+        act_delete.setEnabled(enabled["delete"])
         if not self.project.mine:
             menu.addSeparator()
             note = menu.addAction("Pro odevzdání a převzetí projekt nejdřív aktivujte")
@@ -177,13 +234,16 @@ class ProjectPanel(QWidget):
             self.submit_requested.emit(scope)
         elif chosen is act_take:
             self.take_requested.emit(scope)
+        elif chosen is act_delete:
+            self._delete(scope)
 
     def _on_double_click(self, item: QTreeWidgetItem, _column: int) -> None:
-        """Dvojklik na soubor, který mám zamčený já, ho otevře z místní kopie
-        (výchozí aplikací Windows, jako dvojklik v Průzkumníku)."""
+        """Dvojklik na soubor, který mám zamčený já (nebo můj nový neodevzdaný), ho otevře
+        z místní kopie (výchozí aplikací Windows, jako dvojklik v Průzkumníku)."""
         path = item.data(0, KEY_ROLE)
         entry = next((e for e in self.entries if e.path == path), None)
-        if self.project is None or entry is None or not entry.mine:
+        if self.project is None or entry is None or not (entry.mine or entry.local_new) \
+                or entry.local_deleted:
             return
         local = to_abs(self.pm.local_dir(self.project.name), path)
         if not local.exists():

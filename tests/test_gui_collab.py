@@ -1,3 +1,4 @@
+from PySide6.QtGui import QPalette
 import os
 
 import pytest
@@ -264,10 +265,10 @@ def test_panel_context_actions_and_preselection(app, pms, tmp_path, monkeypatch)
     app.processEvents()
 
     ca = w.panel.context_actions
-    assert ca("sestava/elektrody/E01.elt") == {"open": True, "submit": True, "take": False}
-    assert ca("sestava/sestava.elt") == {"open": False, "submit": False, "take": False}  # drží alice
-    assert ca("dily/deska.elt") == {"open": False, "submit": False, "take": True}         # volný
-    assert ca("sestava/") == {"open": False, "submit": True, "take": False}
+    assert ca("sestava/elektrody/E01.elt") == {"open": True, "submit": True, "take": False, "delete": True}
+    assert ca("sestava/sestava.elt") == {"open": False, "submit": False, "take": False, "delete": False}  # drží alice
+    assert ca("dily/deska.elt") == {"open": False, "submit": False, "take": True, "delete": False}  # volný
+    assert ca("sestava/") == {"open": False, "submit": True, "take": False, "delete": True}
 
     # menu panelu -> dialogy hlavního okna s předvýběrem
     got = []
@@ -320,4 +321,106 @@ def test_panel_colors_file_names_by_owner(app, pms, tmp_path, monkeypatch):
     assert find(tree, "sestava/sestava.elt").foreground(0).color() == COLOR_OTHER
     free = find(tree, "sestava/elektrody/E01.elt").foreground(0)
     assert free.color() not in (COLOR_MINE, COLOR_OTHER)
+    w.close()
+
+
+def test_panel_shows_new_local_files(app, pms, tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from spm import config
+    from spm.gui import project_panel
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    opened = []
+    monkeypatch.setattr(project_panel.os, "startfile", lambda p: opened.append(Path(p)), raising=False)
+    alice, bob = pms
+    alice.activate("Forma", lock_paths=[])
+    bob.activate("Forma", lock_paths=["dily/deska.elt"])
+    local = bob.local_dir("Forma")
+    (local / "sestava" / "elektrody" / "E03.elt").write_text("nova")
+    (local / "nc" / "E01_NC.nc").parent.mkdir()
+    (local / "nc" / "E01_NC.nc").write_text("nc")
+    (alice.local_dir("Forma") / "cizi_novy.txt").write_text("alice")   # cizí místní – nevidím
+
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    w.panel._thread.wait()
+    app.processEvents()
+
+    new = sorted(e.path for e in w.panel.entries if e.local_new)
+    assert new == ["nc/E01_NC.nc", "sestava/elektrody/E03.elt"]
+    item = find(w.panel.tree, "sestava/elektrody/E03.elt")
+    assert item.text(1) == "nový – neodevzdaný"
+    assert item.foreground(0).color() == w.panel.palette().color(QPalette.ColorRole.PlaceholderText)
+    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"open": True, "submit": True, "take": False, "delete": True}
+    assert w.panel.context_actions("nc/") == {"open": False, "submit": True, "take": False, "delete": True}
+    assert "nové neodevzdané: <b>2</b>" in w.panel.summary.text()
+
+    w.panel._on_double_click(item, 0)
+    assert opened == [local / "sestava" / "elektrody" / "E03.elt"]
+
+    w.panel.only_locked.setChecked(True)   # nové soubory zůstanou vidět
+    assert sorted(i.data(0, 256 + 1) for i in w.panel.tree.leaf_items()) == \
+        ["dily/deska.elt", "nc/E01_NC.nc", "sestava/elektrody/E03.elt"]
+    w.close()
+
+
+def test_upload_dialog_announces_auto_deactivation(app, pms):
+    from spm.gui.upload_dialog import UploadDialog
+
+    alice, _ = pms
+    alice.activate("Forma", lock_paths=["dily/deska.elt"])
+    (alice.local_dir("Forma") / "dily" / "deska.elt").write_text("zmena")
+    plan = alice.plan_upload("Forma")
+    dlg = UploadDialog(plan, end_session=False)
+    assert dlg.auto_info.isHidden()
+    dlg._check_all(True)
+    assert not dlg.auto_info.isHidden() and "deaktivuje" in dlg.auto_info.text()
+    dlg._check_all(False)
+    assert dlg.auto_info.isHidden()
+
+
+def test_panel_delete_to_recycle_bin(app, pms, tmp_path, monkeypatch):
+    import shutil
+
+    from PySide6.QtWidgets import QMessageBox
+
+    from spm import config, recycle
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    kos = tmp_path / "kos"
+    kos.mkdir()
+    monkeypatch.setattr(recycle, "to_recycle_bin",
+                        lambda paths: [shutil.move(str(p), str(kos / p.name)) for p in paths])
+    questions = []
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **k: questions.append(a[2]) or QMessageBox.StandardButton.Yes)
+    alice, bob = pms
+    alice.activate("Forma", lock_paths=["sestava/sestava.elt"])
+    bob.activate("Forma", lock_paths=["sestava/elektrody/E01.elt"])
+    (bob.local_dir("Forma") / "sestava" / "elektrody" / "E09.elt").write_text("nova")
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    w.panel._thread.wait()
+    app.processEvents()
+
+    assert sorted(w.panel.deletable("sestava/")) == ["sestava/elektrody/E01.elt", "sestava/elektrody/E09.elt"]
+    w.panel._delete("sestava/")
+    assert "2 dalších souborů ve složce nemáte zamčených" in questions[0]   # sestava.elt + E02
+    assert sorted(p.name for p in kos.iterdir()) == ["E01.elt", "E09.elt"]
+    w.panel._thread.wait()
+    app.processEvents()
+
+    e01 = next(e for e in w.panel.entries if e.path == "sestava/elektrody/E01.elt")
+    assert e01.local_deleted
+    assert find(w.panel.tree, "sestava/elektrody/E01.elt").text(1) == "smazán – neodevzdaný"
+    assert not any(e.path.endswith("E09.elt") for e in w.panel.entries)   # nový smazán úplně
+    assert w.panel.context_actions("sestava/elektrody/E01.elt")["open"] is False
+    assert w.panel.context_actions("sestava/elektrody/E01.elt")["delete"] is False
     w.close()

@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from . import SPM_DIR
+from . import SPM_DIR, recycle
 from . import db as dbm
 from .config import Settings
 from .db import DbFile, LockOwner, ProjectDB, db_path
@@ -101,10 +101,13 @@ class FileEntry:
     path: str
     owner: LockOwner | None
     mine: bool
+    local_new: bool = False      # nový soubor jen v mé místní kopii (ještě neodevzdaný)
+    local_deleted: bool = False  # můj zamčený soubor, v místní kopii smazaný (do Koše), neodevzdaný
 
     @property
     def free(self) -> bool:
-        return self.owner is None
+        """Volný soubor na serveru (lze převzít)."""
+        return self.owner is None and not self.local_new
 
 
 @dataclass
@@ -121,6 +124,15 @@ class UploadPlan:
     suggestions: list[RenameSuggestion]
     conflicts: list[str] = field(default_factory=list)
     invalid_names: list[str] = field(default_factory=list)
+    # místní práce, kterou nelze nahrát (změněné cizí soubory, nové soubory s obsazeným
+    # názvem) – po smazání místní kopie by se ztratila
+    unsavable: list[str] = field(default_factory=list)
+
+    @property
+    def held(self) -> list[str]:
+        """file_id souborů ze serveru, které držím (zamčené mnou)."""
+        return ([bf.file_id for bf, _ in self.modified] + [bf.file_id for bf in self.missing]
+                + [bf.file_id for bf in self.locked_unchanged])
 
     def default_assignments(self) -> dict[str, str | None]:
         """file_id chybějícího souboru -> nová cesta (nebo None = smazán)."""
@@ -139,6 +151,29 @@ def new_key(path: str) -> str:
     return "new:" + path
 
 
+def auto_deactivation(plan: UploadPlan, assignments: dict[str, str | None],
+                      selected: set[str] | None) -> tuple[bool, str]:
+    """Deaktivuje se projekt po odevzdání? Vrací (ano/ne, důvod, proč ne – nebo "").
+
+    Ano, pokud odevzdáním uvolním poslední soubor ze serveru, který držím.
+    Ne, pokud jsem žádný soubor ze serveru nedržel (jen přidávám nové soubory – např.
+    NC programy k cizím elektrodám; pracuji dál), nebo pokud by se ztratila neodevzdaná
+    místní práce (deaktivace může smazat místní kopii)."""
+    held = plan.held
+    if not held or (selected is not None and any(f not in selected for f in held)):
+        return False, ""
+    targets = {p for p in assignments.values() if p}
+    leftover = [lf.path for lf in plan.new if lf.path not in targets
+                and selected is not None and new_key(lf.path) not in selected]
+    if leftover:
+        return False, (f"Odevzdáváte poslední držené soubory, ale v místní kopii zůstává "
+                       f"{len(leftover)} neodevzdaných nových souborů – projekt zůstane aktivovaný.")
+    if plan.unsavable:
+        return False, ("Odevzdáváte poslední držené soubory, ale místní kopie obsahuje změny, které "
+                       "nelze nahrát (viz Upozornění) – projekt zůstane aktivovaný.")
+    return True, ""
+
+
 @dataclass
 class UploadResult:
     renamed: int = 0
@@ -147,6 +182,8 @@ class UploadResult:
     deleted: int = 0
     released: int = 0
     local_deleted: bool = False
+    auto_deactivated: bool = False   # odevzdán poslední držený soubor -> projekt deaktivován
+    note: str = ""                   # proč se automaticky nedeaktivoval (je-li co říct)
 
 
 @dataclass
@@ -244,6 +281,47 @@ class ProjectManager:
             owner = owners.get(f.file_id) if f else None
             result.append(FileEntry(path, owner, bool(owner and owner.is_me(self.user, self.pc))))
         return result
+
+    def local_new_files(self, name: str) -> list[str]:
+        """Nové soubory v mé místní kopii, které ještě nejsou na serveru (neodevzdané).
+        Jen výpis místní složky – bez čtení obsahu a bez přístupu k serveru."""
+        local = self.local_dir(name)
+        manifest = Manifest.load(local) if local.is_dir() else None
+        if manifest is None:
+            return []
+        known = {p.lower() for p in manifest.files}
+        return [rel for rel in (to_rel(local, f) for f in list_files(local, self.settings.ignore_patterns))
+                if rel.lower() not in known]
+
+    def delete_local(self, name: str, paths: Iterable[str]) -> list[str]:
+        """Přesune soubory z mé místní kopie do Koše Windows (ne trvalé smazání).
+
+        Smí se jen moje soubory: zamčené mnou, nebo nové neodevzdané. Na serveru se smazání
+        projeví až při odevzdání (a i tam se soubor jen přesune do koše projektu).
+        Vrací smazané cesty."""
+        server = self.server_dir(name)
+        local, manifest = self._manifest(name)
+        with ProjectDB.for_project(server) as db:
+            mine = db.locked_by(self._my_session(db, manifest.session_id))
+        paths = [p for p in dict.fromkeys(paths)]
+        not_allowed = [p for p in paths if p in manifest.files and manifest.files[p].file_id not in mine]
+        if not_allowed:
+            raise SyncError("Tyto soubory nemáte zamčené, nelze je smazat:\n" + "\n".join(not_allowed[:15]))
+        existing = [p for p in paths if to_abs(local, p).is_file()]
+        recycle.to_recycle_bin([to_abs(local, p) for p in existing])
+        for p in existing:
+            remove_empty_parents(local, p)
+        return existing
+
+    def local_deleted_files(self, name: str) -> list[str]:
+        """Moje zamčené soubory, které v místní kopii chybí (smazané, ještě neodevzdané)."""
+        local = self.local_dir(name)
+        manifest = Manifest.load(local) if local.is_dir() else None
+        if manifest is None:
+            return []
+        with ProjectDB.for_project(self.server_dir(name)) as db:
+            mine = db.locked_by(manifest.session_id)
+        return [p for p, e in manifest.files.items() if e.file_id in mine and not to_abs(local, p).exists()]
 
     # --- kontrola názvů -------------------------------------------------------
 
@@ -576,6 +654,7 @@ class ProjectManager:
         missing: list[DbFile] = []
         locked_unchanged: list[DbFile] = []
         conflicts: list[str] = []
+        unsavable: list[str] = []
         for path, entry in manifest.files.items():
             lf = local_files.get(path)
             dbf = by_id.get(entry.file_id)
@@ -602,6 +681,7 @@ class ProjectManager:
                 who = owners.get(entry.file_id)
                 conflicts.append(f"{path} – změněn v místní kopii, ale nemáte ho zamčený"
                                  + (f" (drží {who.label})" if who else "") + " – změna se nenahraje")
+                unsavable.append(path)
             else:
                 unchanged.append(path)
 
@@ -613,13 +693,14 @@ class ProjectManager:
             f = by_lower.get(path.lower())
             if f is not None and not (f.file_id in mine and f.pending):
                 conflicts.append(f"{path} – na serveru už je soubor se stejným názvem (nelze nahrát)")
+                unsavable.append(path)
                 continue
             new.append(lf)
 
         suggestions = suggest_renames(missing, new, self.settings.rename_threshold)
         invalid = self._invalid_paths([lf.path for lf in new] + [lf.path for _, lf in modified])
         return UploadPlan(name, sid, local_files, unchanged, modified, missing, new,
-                          locked_unchanged, suggestions, conflicts, invalid)
+                          locked_unchanged, suggestions, conflicts, invalid, unsavable)
 
     # zpětně čitelné názvy pro deaktivaci
     plan_deactivation = plan_upload
@@ -647,6 +728,8 @@ class ProjectManager:
         if end_session:
             selected = None
         comment = comment.strip()
+        # odevzdání posledního drženého souboru = deaktivace (viz auto_deactivation)
+        auto_end, auto_note = (False, "") if end_session else auto_deactivation(plan, assignments, selected)
 
         def sel(key: str) -> bool:
             return selected is None or key in selected
@@ -773,10 +856,12 @@ class ProjectManager:
                               st.st_mtime, lf.sha256, backup)
                 released.append(file_id)
             released += [bf.file_id for bf in release_only]
-            if end_session:
-                db.end_session(sid, "done")
-            else:
+            if not end_session:
                 db.release(sid, released)
+                # pojistka: deaktivovat jen tehdy, když opravdu nic dalšího nedržím
+                auto_end = auto_end and not db.locked_by(sid)
+            if end_session or auto_end:
+                db.end_session(sid, "done")
         if renames:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -794,8 +879,9 @@ class ProjectManager:
             set_readonly(to_abs(local, bf.path), True)
 
         result = UploadResult(renamed=len(renames), modified=len(modified), added=len(added),
-                              deleted=len(deleted), released=len(released))
-        if end_session:
+                              deleted=len(deleted), released=len(released),
+                              auto_deactivated=auto_end, note=auto_note)
+        if end_session or auto_end:
             remove_marker(server, self.user, self.pc)
             if self.settings.delete_local_after_deactivate:
                 rmtree(local)

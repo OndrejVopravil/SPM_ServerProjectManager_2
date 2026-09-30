@@ -346,6 +346,9 @@ class ProjectDB:
         return self.conn.execute(
             "SELECT * FROM changes WHERE commit_id = ? ORDER BY change_id", (commit_id,)).fetchall()
 
+    def all_changes(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM changes ORDER BY change_id").fetchall()
+
     def file_history(self, file_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT x.*, c.user, c.comment, c.created_at FROM changes x JOIN commits c USING(commit_id) "

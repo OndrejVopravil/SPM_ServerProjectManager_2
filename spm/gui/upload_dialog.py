@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 
 from ..names import format_invalid
 from ..scanner import to_abs
-from ..sync import UploadPlan, new_key
+from ..sync import UploadPlan, auto_deactivation, new_key
 from .check_tree import CheckTree, TreeEntry, in_scope
 
 DELETED_LABEL = "— smazán —"
@@ -125,6 +125,12 @@ class UploadDialog(QDialog):
         self.comment.setMaximumHeight(80)
         self.comment.textChanged.connect(self._validate)
         layout.addWidget(self.comment)
+
+        self.auto_info = QLabel()  # odevzdání posledního drženého souboru = deaktivace
+        self.auto_info.setWordWrap(True)
+        self.auto_info.setStyleSheet("color: #2f6fb5; font-weight: bold;")
+        self.auto_info.hide()
+        layout.addWidget(self.auto_info)
 
         self.error = QLabel()
         self.error.setStyleSheet("color: #c0392b;")
@@ -335,3 +341,8 @@ class UploadDialog(QDialog):
             error = "Vyberte, co chcete odevzdat."
         self.error.setText(error)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not error)
+        if self.selectable:
+            ends, note = auto_deactivation(self.plan, self.assignments(), self.checked)
+            self.auto_info.setText("Odevzdáváte poslední soubory, které držíte – projekt se poté "
+                                   "deaktivuje." if ends else note)
+            self.auto_info.setVisible(bool(ends or note))

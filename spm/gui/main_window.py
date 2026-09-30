@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import unicodedata
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QThread, QTimer, Qt, Signal
@@ -37,6 +36,7 @@ from ..sync import (
 from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
 from .project_panel import ProjectPanel
+from .search import normalize
 from .settings_dialog import SettingsDialog
 from .ui_state import restore_geometry, restore_header, save_geometry, save_header
 from .upload_dialog import UploadDialog
@@ -66,12 +66,6 @@ class NameCheckThread(QThread):
             if found:
                 issues[p.name] = found
         self.done.emit(issues)
-
-
-def normalize(text: str) -> str:
-    """Pro vyhledávání: malá písmena a bez diakritiky („Ústí“ -> „usti“)."""
-    decomposed = unicodedata.normalize("NFKD", text.casefold())
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
 
 
 def format_refresh(res: RefreshResult) -> str:
@@ -136,6 +130,15 @@ class MainWindow(QMainWindow):
         self.act_history = self._action(tb, "Historie", self.history)
         tb.addSeparator()
         self._action(tb, "Nastavení", self.open_settings)
+
+        # Popisky zkratek: v liště „Obnovit (F5)“, v kontextové nabídce zarovnaně vpravo.
+        # F3 je jedna zkratka pro dvě akce (viz toggle_activation), proto se u aktivace
+        # a deaktivace jen zobrazuje (text za tabulátorem), nenastavuje se jako shortcut.
+        self.act_refresh.setIconText("Obnovit (F5)")
+        self.act_activate.setText("Aktivovat…\tF3")
+        self.act_activate.setIconText("Aktivovat (F3)")
+        self.act_deactivate.setText("Deaktivovat…\tF3")
+        self.act_deactivate.setIconText("Deaktivovat (F3)")
 
         # F3 = aktivovat / deaktivovat podle stavu vybraného projektu
         toggle = QAction(self)
@@ -431,7 +434,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
                    self.act_deactivate, self.act_publish, None, self.act_open, self.act_history,
-                   None, self.act_rename, None, self.act_cancel, self.act_unlock]
+                   None, self.act_rename, None, self.act_cancel, self.act_unlock,
+                   None, self.act_refresh]
         if self.act_invalid.isEnabled():
             actions[:0] = [self.act_invalid, None]
         for act in actions:
@@ -562,10 +566,16 @@ class MainWindow(QMainWindow):
 
         def done(res: UploadResult) -> None:
             self.refresh()
+            ended = end_session or res.auto_deactivated
             msg = ((f"Projekt {plan.name} byl deaktivován." if end_session else "Změny byly odevzdány.")
                    + f"\n\nUpravené: {res.modified}\nNové: {res.added}\n"
                    f"Přejmenované: {res.renamed}\nSmazané: {res.deleted}\nUvolněno: {res.released}")
-            if end_session and self.settings.delete_local_after_deactivate and not res.local_deleted:
+            if res.auto_deactivated:
+                msg += (f"\n\nOdevzdal jste poslední soubory, které jste držel – projekt {plan.name} "
+                        "byl deaktivován.")
+            elif res.note:
+                msg += "\n\n" + res.note
+            if ended and self.settings.delete_local_after_deactivate and not res.local_deleted:
                 msg += "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
             QMessageBox.information(self, title, msg)
 
