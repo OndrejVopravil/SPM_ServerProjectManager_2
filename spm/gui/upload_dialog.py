@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 from ..names import format_invalid
 from ..scanner import to_abs
 from ..sync import UploadPlan, new_key
-from .check_tree import CheckTree, TreeEntry
+from .check_tree import CheckTree, TreeEntry, in_scope
 
 DELETED_LABEL = "— smazán —"
 KEY_ROLE = Qt.ItemDataRole.UserRole
@@ -53,8 +53,9 @@ TABS = [
 
 class UploadDialog(QDialog):
     def __init__(self, plan: UploadPlan, end_session: bool, parent: QWidget | None = None,
-                 local: Path | None = None):
-        """local: místní kopie projektu (pro ikony souborů)."""
+                 local: Path | None = None, preselect: str | None = None):
+        """local: místní kopie projektu (pro ikony souborů).
+        preselect: soubor nebo složka (zakončená '/'), jejíž změny budou předem zaškrtnuté."""
         super().__init__(parent)
         self.plan = plan
         self.local = local
@@ -137,6 +138,10 @@ class UploadDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
+        if preselect and self.selectable:
+            old_paths = {bf.file_id: bf.path for bf in plan.missing}
+            self.checked = {e.key for _, e in self._entries()
+                            if in_scope(e.path, preselect) or in_scope(old_paths.get(e.key, ""), preselect)}
         self._refresh()
 
     # --- stavba ----------------------------------------------------------

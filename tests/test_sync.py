@@ -342,3 +342,21 @@ def test_force_unlock_and_cancel(electrodes):
         kinds = [c["kind"] for c in db.commits()][:2]
         assert kinds == [dbm.CANCELLED, dbm.FORCE_UNLOCK]
         assert db.lock_owners() == {} and db.active_sessions() == []
+
+
+def test_my_active_projects_listed_first(tmp_path):
+    for name in ("Alfa", "Beta", "Gama", "Delta"):
+        (tmp_path / "server" / name).mkdir(parents=True)
+        (tmp_path / "server" / name / "a.txt").write_text("x")
+    (tmp_path / "local_alice" / "Cizi_lokalni").mkdir(parents=True)
+
+    def pm(user):
+        s = Settings(server_root=str(tmp_path / "server"), local_root=str(tmp_path / f"local_{user}"))
+        return ProjectManager(s, user=user, pc="PC-" + user)
+
+    alice, bob = pm("alice"), pm("bob")
+    alice.activate("Gama")
+    alice.activate("Beta")
+    bob.activate("Alfa")    # cizí aktivace se neřadí nahoru
+    assert [p.name for p in alice.list_projects()] == ["Beta", "Gama", "Alfa", "Cizi_lokalni", "Delta"]
+    assert [p.name for p in bob.list_projects()] == ["Alfa", "Beta", "Delta", "Gama"]

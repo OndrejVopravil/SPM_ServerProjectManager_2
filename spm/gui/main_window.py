@@ -167,6 +167,8 @@ class MainWindow(QMainWindow):
         # pod seznamem: stav vybraného aktivovaného projektu (kdo drží které soubory)
         self.panel = ProjectPanel(self.pm)
         self.panel.hide()
+        self.panel.submit_requested.connect(self.submit)
+        self.panel.take_requested.connect(self.take)
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.addWidget(self.table)
         self.splitter.addWidget(self.panel)
@@ -483,7 +485,8 @@ class MainWindow(QMainWindow):
         run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
                  on_done=done, on_error=lambda _: self.refresh())
 
-    def take(self) -> None:
+    def take(self, preselect: str | None = None) -> None:
+        """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
         p = self.selected()
         if not p or not p.mine:
             return
@@ -494,7 +497,8 @@ class MainWindow(QMainWindow):
             f"Převzít soubory k úpravě – {p.name}",
             "Vyberte volné soubory, které chcete upravovat. Zamknou se pro vás a stáhne se jejich "
             "aktuální verze ze serveru. Soubory, které držíte vy („já“) nebo jiní, vybrat nelze.",
-            entries, "Převzít", self, allow_empty=False, root=self.pm.local_dir(p.name))
+            entries, "Převzít", self, allow_empty=False, root=self.pm.local_dir(p.name),
+            preselect=preselect)
         accepted = self._exec_dialog(dlg, "select_files")
         paths = dlg.selected_paths()
         dlg.deleteLater()
@@ -533,21 +537,22 @@ class MainWindow(QMainWindow):
         elif self.act_activate.isEnabled():
             self.activate()
 
-    def submit(self) -> None:
-        self._start_upload(end_session=False)
+    def submit(self, preselect: str | None = None) -> None:
+        """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
+        self._start_upload(end_session=False, preselect=preselect)
 
     def deactivate(self) -> None:
         self._start_upload(end_session=True)
 
-    def _start_upload(self, end_session: bool) -> None:
+    def _start_upload(self, end_session: bool, preselect: str | None = None) -> None:
         p = self.selected()
         if not p or not p.mine:
             return
         run_task(self, "Porovnávání souborů", self.pm.plan_upload, p.name,
-                 on_done=lambda plan: self._confirm_upload(plan, end_session))
+                 on_done=lambda plan: self._confirm_upload(plan, end_session, preselect))
 
-    def _confirm_upload(self, plan: UploadPlan, end_session: bool) -> None:
-        dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name))
+    def _confirm_upload(self, plan: UploadPlan, end_session: bool, preselect: str | None = None) -> None:
+        dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name), preselect=preselect)
         accepted = self._exec_dialog(dlg, "upload")
         assignments, comment, selected = dlg.assignments(), dlg.comment_text(), dlg.selected_keys()
         dlg.deleteLater()

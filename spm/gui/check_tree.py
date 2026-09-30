@@ -18,6 +18,13 @@ KEY_ROLE = Qt.ItemDataRole.UserRole
 PATH_ROLE = Qt.ItemDataRole.UserRole + 1
 
 
+def in_scope(path: str, scope: str | None) -> bool:
+    """Patří soubor do předvýběru? scope = cesta souboru, nebo složky zakončená '/'."""
+    if not scope:
+        return False
+    return path.startswith(scope) if scope.endswith("/") else path == scope
+
+
 @dataclass
 class TreeEntry:
     path: str                               # relativní cesta s '/'
@@ -25,7 +32,9 @@ class TreeEntry:
     columns: list[str] = field(default_factory=list)  # text dalších sloupců
     enabled: bool = True                    # False = nelze vybrat (např. drží jiný uživatel)
     color: QColor | None = None             # barva textu dalších sloupců
+    color_name: bool = False                # obarvit barvou i název souboru
     file_path: str | None = None            # skutečný soubor na disku – pro jeho vlastní ikonu
+    tooltip: str = ""
 
 
 class CheckTree(QTreeWidget):
@@ -84,6 +93,8 @@ class CheckTree(QTreeWidget):
             item = QTreeWidgetItem([name] + (e.columns + [""] * extra)[:extra])
             item.setData(0, KEY_ROLE, e.key)
             item.setData(0, PATH_ROLE, e.path)
+            if e.tooltip:
+                item.setToolTip(0, e.tooltip)
             icon = None
             if e.file_path and self._shell_icons and icons.has_per_file_icon(name):
                 icon = icons.loader().cached(e.file_path)
@@ -92,7 +103,7 @@ class CheckTree(QTreeWidget):
                     to_load.append(e.file_path)
             item.setIcon(0, icon or icons.extension_icon(name))
             if e.color is not None:
-                for c in range(1, extra + 1):
+                for c in range(0 if e.color_name else 1, extra + 1):
                     item.setForeground(c, e.color)
             if not e.enabled:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsUserCheckable)

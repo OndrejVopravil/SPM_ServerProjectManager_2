@@ -198,7 +198,8 @@ class ProjectManager:
         for name in self.local_only_projects(server_names):
             result.append(ProjectStatus(name=name, users=[], local_exists=True, mine=False,
                                         local_only=True))
-        result.sort(key=lambda p: p.name.lower())
+        # projekty, které mám aktivované já, vždy nahoře; jinak abecedně
+        result.sort(key=lambda p: (not p.mine, p.name.lower()))
         return result
 
     def _server_status(self, name: str) -> ProjectStatus:

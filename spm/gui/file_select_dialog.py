@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from ..scanner import to_abs
 from ..sync import FileEntry
-from .check_tree import CheckTree, TreeEntry
+from .check_tree import CheckTree, TreeEntry, in_scope
 
 COLOR_TAKEN = QColor("#c0392b")
 COLOR_MINE = QColor("#2e8b57")
@@ -30,14 +30,17 @@ COLOR_MINE = QColor("#2e8b57")
 
 class FileSelectDialog(QDialog):
     def __init__(self, title: str, intro: str, entries: list[FileEntry], ok_text: str,
-                 parent: QWidget | None = None, allow_empty: bool = True, root: Path | None = None):
-        """root: složka, kde soubory skutečně leží (pro jejich ikony)."""
+                 parent: QWidget | None = None, allow_empty: bool = True, root: Path | None = None,
+                 preselect: str | None = None):
+        """root: složka, kde soubory skutečně leží (pro jejich ikony).
+        preselect: soubor nebo složka (zakončená '/'), jejíž volné soubory budou předem zaškrtnuté."""
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(760, 600)
         self.allow_empty = allow_empty
 
         self.tree = CheckTree(["Soubor", "Drží"])
+        checked = {e.path for e in entries if e.free and in_scope(e.path, preselect)}
         self.tree.set_entries([
             TreeEntry(e.path, e.path,
                       ["" if e.free else ("já" if e.mine else e.owner.label)],
@@ -45,7 +48,7 @@ class FileSelectDialog(QDialog):
                       color=None if e.free else (COLOR_MINE if e.mine else COLOR_TAKEN),
                       file_path=str(to_abs(root, e.path)) if root else None)
             for e in entries
-        ])
+        ], checked)
         self.tree.toggled.connect(self._update_count)
 
         select_all = QPushButton("Vybrat vše volné")

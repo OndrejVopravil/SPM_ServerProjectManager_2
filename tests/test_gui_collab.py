@@ -217,3 +217,107 @@ def test_f3_toggles_activation(app, pms, tmp_path, monkeypatch):
     assert calls == ["activate", "deactivate"]
     w.panel._thread and w.panel._thread.wait()
     w.close()
+
+
+def test_panel_double_click_opens_only_my_files(app, pms, tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from spm import config
+    from spm.gui import project_panel
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    opened = []
+    monkeypatch.setattr(project_panel.os, "startfile", lambda p: opened.append(Path(p)), raising=False)
+    alice, bob = pms
+    alice.activate("Forma", lock_paths=["sestava/sestava.elt"])
+    bob.activate("Forma", lock_paths=["dily/deska.elt"])
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    w.panel._thread.wait()
+    app.processEvents()
+
+    for path in ("sestava/sestava.elt", "sestava/elektrody/E01.elt", "dily/deska.elt"):
+        w.panel._on_double_click(find(w.panel.tree, path), 0)
+    assert opened == [bob.local_dir("Forma") / "dily" / "deska.elt"]
+    assert "Dvojklikem" in find(w.panel.tree, "dily/deska.elt").toolTip(0)
+    w.close()
+
+
+def test_panel_context_actions_and_preselection(app, pms, tmp_path, monkeypatch):
+    from spm import config
+    from spm.gui.file_select_dialog import FileSelectDialog
+    from spm.gui.main_window import MainWindow
+    from spm.gui.upload_dialog import UploadDialog
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    alice, bob = pms
+    alice.activate("Forma", lock_paths=["sestava/sestava.elt"])
+    bob.activate("Forma", lock_paths=["sestava/elektrody/E01.elt", "sestava/elektrody/E02.elt"])
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    w.panel._thread.wait()
+    app.processEvents()
+
+    ca = w.panel.context_actions
+    assert ca("sestava/elektrody/E01.elt") == {"open": True, "submit": True, "take": False}
+    assert ca("sestava/sestava.elt") == {"open": False, "submit": False, "take": False}  # drží alice
+    assert ca("dily/deska.elt") == {"open": False, "submit": False, "take": True}         # volný
+    assert ca("sestava/") == {"open": False, "submit": True, "take": False}
+
+    # menu panelu -> dialogy hlavního okna s předvýběrem
+    got = []
+    monkeypatch.setattr(w, "submit", lambda scope=None: got.append(("submit", scope)))
+    monkeypatch.setattr(w, "take", lambda scope=None: got.append(("take", scope)))
+    w.panel.submit_requested.disconnect()
+    w.panel.take_requested.disconnect()
+    w.panel.submit_requested.connect(w.submit)
+    w.panel.take_requested.connect(w.take)
+    w.panel.submit_requested.emit("sestava/elektrody/")
+    w.panel.take_requested.emit("dily/")
+    assert got == [("submit", "sestava/elektrody/"), ("take", "dily/")]
+
+    # odevzdání: předvybrána změněná elektroda ve složce, ne soubor mimo ni
+    local = bob.local_dir("Forma")
+    (local / "sestava" / "elektrody" / "E01.elt").write_text("zmena")
+    (local / "sestava" / "elektrody" / "E01_NC.nc").write_text("nc")
+    (local / "jinde.txt").write_text("x")
+    plan = bob.plan_upload("Forma")
+    dlg = UploadDialog(plan, end_session=False, preselect="sestava/elektrody/")
+    e01 = next(bf.file_id for bf, _ in plan.modified)
+    e02 = next(bf.file_id for bf in plan.locked_unchanged)
+    assert dlg.selected_keys() == {e01, e02, new_key("sestava/elektrody/E01_NC.nc")}
+
+    # převzetí: předvybrány jen volné soubory ve složce
+    sel = FileSelectDialog("t", "", bob.file_entries("Forma"), "OK", preselect="sestava/")
+    assert sel.selected_paths() == []            # ve složce sestava nic volného není
+    sel = FileSelectDialog("t", "", bob.file_entries("Forma"), "OK", preselect="dily/deska.elt")
+    assert sel.selected_paths() == ["dily/deska.elt"]
+    w.close()
+
+
+def test_panel_colors_file_names_by_owner(app, pms, tmp_path, monkeypatch):
+    from spm import config
+    from spm.gui.main_window import MainWindow
+    from spm.gui.project_panel import COLOR_MINE, COLOR_OTHER
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    alice, bob = pms
+    alice.activate("Forma", lock_paths=["sestava/sestava.elt"])
+    bob.activate("Forma", lock_paths=["dily/deska.elt"])
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    w.panel._thread.wait()
+    app.processEvents()
+    tree = w.panel.tree
+    assert find(tree, "dily/deska.elt").foreground(0).color() == COLOR_MINE
+    assert find(tree, "sestava/sestava.elt").foreground(0).color() == COLOR_OTHER
+    free = find(tree, "sestava/elektrody/E01.elt").foreground(0)
+    assert free.color() not in (COLOR_MINE, COLOR_OTHER)
+    w.close()
