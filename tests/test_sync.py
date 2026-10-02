@@ -9,6 +9,7 @@ from spm import db as dbm
 from spm.config import Settings
 from spm.db import ProjectDB
 from spm.lock import active_users
+from spm.scanner import file_hash
 from spm.sync import ProjectManager, SyncError, new_key
 
 
@@ -451,3 +452,126 @@ def test_cannot_delete_foreign_files(electrodes, fake_recycle):
         bob.delete_local("ProjektA", ["sestava/sestava.elt"])
     assert fake_recycle == []
     assert (bob.local_dir("ProjektA") / "sestava" / "sestava.elt").exists()
+
+
+# --- souběh: jiný uživatel pracuje, zatímco se aktivace kopíruje -------------------
+
+def _during_copy(monkeypatch, when_path, action):
+    """Spustí `action` hned po zkopírování souboru `when_path` při aktivaci."""
+    import spm.sync as sync
+    real = sync.copy_with_hash
+    done = []
+
+    def wrapper(src, dst):
+        sha = real(src, dst)
+        if not done and src.as_posix().endswith(when_path):
+            done.append(True)
+            action()
+        return sha
+    monkeypatch.setattr(sync, "copy_with_hash", wrapper)
+    return done
+
+
+def test_locks_are_taken_before_copying(env, monkeypatch):
+    alice, bob, proj, local = env
+    bob.activate("ProjektA", lock_paths=[])
+    monkeypatch.undo()
+    seen = {}
+
+    def bob_tries():
+        assert [u.user for u in active_users(proj)] == ["alice", "bob"]   # alice už je vidět
+        with pytest.raises(SyncError, match="alice"):
+            bob.take("ProjektA", ["zprava.docx"])                        # už zamčeno
+        seen["ok"] = True
+    _during_copy(monkeypatch, "foto.jpg", bob_tries)
+    alice.activate("ProjektA", lock_paths=["zprava.docx"])
+    assert seen == {"ok": True}
+
+
+def test_file_submitted_by_other_during_copy_is_downloaded_again(env, monkeypatch):
+    alice, bob, proj, local = env
+    bob.activate("ProjektA", lock_paths=[])
+
+    def bob_changes_foto():
+        bob.take("ProjektA", ["foto.jpg"])
+        write(bob.local_dir("ProjektA") / "foto.jpg", "foto od boba")
+        plan = bob.plan_upload("ProjektA")
+        fid = next(bf.file_id for bf, _ in plan.modified)
+        bob.upload(plan, plan.default_assignments(), "nova fotka", selected={fid})
+    done = _during_copy(monkeypatch, "foto.jpg", bob_changes_foto)
+    alice.activate("ProjektA", lock_paths=["zprava.docx"])
+    assert done
+
+    # alice má aktuální verzi a databáze nebyla přepsána starým obsahem
+    assert (local / "foto.jpg").read_text(encoding="utf-8") == "foto od boba"
+    with ProjectDB.for_project(proj) as db:
+        kinds = [c["change_type"] for c in db.all_changes()]
+        assert dbm.EXTERNAL_MODIFIED not in kinds                     # Bobova změna nebyla přepsána
+        foto = db.active_files()["foto.jpg"]
+    assert foto.sha256 == file_hash(proj / "foto.jpg")                # databáze = skutečnost
+    plan = alice.plan_upload("ProjektA")
+    assert not plan.conflicts and not plan.modified
+    assert alice.refresh("ProjektA").total == 0                        # nic dalšího ke stažení
+
+
+def test_failed_copy_releases_locks(env, monkeypatch):
+    alice, bob, proj, local = env
+
+    def boom():
+        raise OSError("sit spadla")
+    _during_copy(monkeypatch, "foto.jpg", boom)
+    with pytest.raises(OSError):
+        alice.activate("ProjektA", lock_paths=["zprava.docx"])
+    assert active_users(proj) == []
+    with ProjectDB.for_project(proj) as db:
+        assert db.lock_owners() == {} and db.active_sessions() == []
+    assert not local.exists()
+
+
+# --- „Nestahovat neaktivované soubory“ ----------------------------------------------
+
+def test_activate_only_locked_files(env):
+    alice, bob, proj, local = env
+    alice.activate("ProjektA", lock_paths=["zprava.docx"], only_locked=True)
+    assert sorted(p.name for p in local.rglob("*") if p.is_file() and ".spm" not in p.parts) == ["zprava.docx"]
+    assert not readonly(local / "zprava.docx")
+
+    # nic nestaženého se nehlásí jako smazané ani konfliktní
+    plan = alice.plan_upload("ProjektA")
+    assert not plan.missing and not plan.conflicts and not plan.new
+
+    # Aktualizovat: nové / nestažené soubory nestahuje, stažené aktualizuje
+    bob.activate("ProjektA", lock_paths=["foto.jpg"])
+    write(bob.local_dir("ProjektA") / "foto.jpg", "nova foto")
+    write(bob.local_dir("ProjektA") / "nove.txt", "novy od boba")
+    plan_b = bob.plan_upload("ProjektA")
+    bob.deactivate(plan_b, plan_b.default_assignments(), "bob")
+    assert alice.refresh("ProjektA").total == 0
+    assert not (local / "foto.jpg").exists() and not (local / "nove.txt").exists()
+
+    # Převzít soubor stáhne
+    r = alice.take("ProjektA", ["foto.jpg"])
+    assert r.downloaded == ["foto.jpg"]
+    assert (local / "foto.jpg").read_text(encoding="utf-8") == "nova foto"
+
+    # odevzdání a deaktivace fungují normálně
+    write(local / "zprava.docx", "zprava nova")
+    plan = alice.plan_upload("ProjektA")
+    assert [lf.path for _, lf in plan.modified] == ["zprava.docx"]
+    alice.deactivate(plan, plan.default_assignments(), "jen cast")
+    assert (proj / "zprava.docx").read_text(encoding="utf-8") == "zprava nova"
+    assert (proj / "vykresy" / "pudorys.dwg").exists()       # nestažené soubory na serveru zůstaly
+
+
+def test_activate_only_locked_first_activation(env):
+    """První aktivace (projekt ještě bez databáze): nestažené soubory se do evidence zapíší
+    až aktivací, která je stáhne; do té doby je seznam souborů bere ze serveru jako volné."""
+    alice, bob, proj, local = env
+    alice.activate("ProjektA", lock_paths=["foto.jpg"], only_locked=True)
+    entries = {e.path: e for e in bob.file_entries("ProjektA")}
+    assert entries["foto.jpg"].owner.user == "alice"
+    assert entries["zprava.docx"].free and entries["vykresy/pudorys.dwg"].free
+    bob.activate("ProjektA", lock_paths=["zprava.docx"])
+    assert (bob.local_dir("ProjektA") / "vykresy" / "pudorys.dwg").exists()
+    with ProjectDB.for_project(proj) as db:
+        assert set(db.active_files()) == {"vykresy/pudorys.dwg", "zprava.docx", "foto.jpg"}

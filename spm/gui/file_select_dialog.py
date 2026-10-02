@@ -11,6 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -31,9 +32,11 @@ COLOR_MINE = QColor("#2e8b57")
 class FileSelectDialog(QDialog):
     def __init__(self, title: str, intro: str, entries: list[FileEntry], ok_text: str,
                  parent: QWidget | None = None, allow_empty: bool = True, root: Path | None = None,
-                 preselect: str | None = None):
+                 preselect: str | None = None, skip_option: bool | None = None):
         """root: složka, kde soubory skutečně leží (pro jejich ikony).
-        preselect: soubor nebo složka (zakončená '/'), jejíž volné soubory budou předem zaškrtnuté."""
+        preselect: soubor nebo složka (zakončená '/'), jejíž volné soubory budou předem zaškrtnuté.
+        skip_option: zobrazit volbu „Nestahovat neaktivované soubory“ s tímto výchozím stavem
+                     (None = nezobrazovat; jen při aktivaci)."""
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(760, 600)
@@ -60,6 +63,15 @@ class FileSelectDialog(QDialog):
         row.addWidget(select_none)
         row.addStretch()
 
+        self.skip = QCheckBox("Nestahovat neaktivované soubory (stáhnou se jen zamčené soubory)")
+        self.skip.setToolTip(
+            "Rychlejší u velkých projektů. Místní kopie bude obsahovat jen soubory, které zamknete;\n"
+            "Aktualizovat pak stahuje jen soubory, které už máte (další získáte Převzetím).\n"
+            "Pozor: sestava odkazující na nestažené díly se nemusí otevřít celá.")
+        self.skip.setChecked(bool(skip_option))
+        self.skip.setVisible(skip_option is not None)
+        self.skip.toggled.connect(self._update_count)
+
         self.count = QLabel()
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(ok_text)
@@ -73,6 +85,7 @@ class FileSelectDialog(QDialog):
         layout.addWidget(intro_label)
         layout.addLayout(row)
         layout.addWidget(self.tree)
+        layout.addWidget(self.skip)
         layout.addWidget(self.count)
         layout.addWidget(self.buttons)
         self._update_count()
@@ -83,7 +96,15 @@ class FileSelectDialog(QDialog):
     def selected_paths(self) -> list[str]:
         return self.tree.checked_keys()
 
+    def skip_unlocked(self) -> bool:
+        """Zaškrtnuto „Nestahovat neaktivované soubory“?"""
+        return not self.skip.isHidden() and self.skip.isChecked()
+
     def _update_count(self, *_) -> None:
         n = len(self.selected_paths())
-        self.count.setText(f"Vybráno k úpravě: <b>{n}</b> souborů")
+        text = f"Vybráno k úpravě: <b>{n}</b> souborů"
+        if not self.skip.isHidden():
+            text += (f" – stáhne se jen těchto {n} souborů" if self.skip.isChecked()
+                     else " – stáhne se celý projekt")
+        self.count.setText(text)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(self.allow_empty or n > 0)

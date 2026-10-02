@@ -49,6 +49,10 @@ class EntriesThread(QThread):
                 on_server = {e.path.lower() for e in entries}
                 entries += [FileEntry(p, None, False, local_new=True)
                             for p in self.pm.local_new_files(self.name) if p.lower() not in on_server]
+            local = self.pm.local_dir(self.name)
+            if local.is_dir():  # co je v místní kopii, lze otevřít (cizí / volné jen pro čtení)
+                for e in entries:
+                    e.in_local = to_abs(local, e.path).is_file()
             self.done.emit(self.name, entries, "")
         except Exception as e:  # noqa: BLE001 – zobrazí se v panelu
             self.done.emit(self.name, [], str(e) or type(e).__name__)
@@ -146,12 +150,17 @@ class ProjectPanel(QWidget):
                                  color_name=True, file_path=str(to_abs(local, e.path)),
                                  tooltip="Nový soubor ve vaší místní kopii, zatím neodevzdaný.\n"
                                          "Dvojklikem otevřete.")
+            if not e.in_local:
+                tip = ""
+            elif e.mine:
+                tip = "Dvojklikem otevřete z místní kopie"
+            else:
+                tip = "Dvojklikem otevřete z místní kopie (jen pro čtení – soubor nemáte zamčený)"
             return TreeEntry(e.path, e.path,
                              ["" if e.free else ("já" if e.mine else e.owner.label)],
                              color=None if e.free else (COLOR_MINE if e.mine else COLOR_OTHER),
                              color_name=True,  # zelená = drží ho já, červená = drží ho jiný
-                             file_path=str(to_abs(root, e.path)),
-                             tooltip="Dvojklikem otevřete z místní kopie" if e.mine else "")
+                             file_path=str(to_abs(root, e.path)), tooltip=tip)
 
         shown = [e for e in self.entries
                  if e.owner or e.local_new or not self.only_locked.isChecked()]
@@ -173,8 +182,8 @@ class ProjectPanel(QWidget):
         inside = [e for e in self.entries if in_scope(e.path, scope)]
         own = any(e.mine or e.local_new for e in inside)  # zamčené mnou nebo moje nové
         return {
-            "open": not scope.endswith("/") and any((e.mine or e.local_new) and not e.local_deleted
-                                                    for e in inside),
+            # otevřít jde jakýkoliv soubor, který je v místní kopii (cizí a volné jen pro čtení)
+            "open": not scope.endswith("/") and any(e.in_local for e in inside),
             # u složky vždy – dialog odevzdání ukáže, co v ní skutečně je
             "submit": mine_project and (scope.endswith("/") or own),
             "take": mine_project and any(e.free for e in inside),
@@ -238,12 +247,11 @@ class ProjectPanel(QWidget):
             self._delete(scope)
 
     def _on_double_click(self, item: QTreeWidgetItem, _column: int) -> None:
-        """Dvojklik na soubor, který mám zamčený já (nebo můj nový neodevzdaný), ho otevře
-        z místní kopie (výchozí aplikací Windows, jako dvojklik v Průzkumníku)."""
+        """Dvojklik na soubor, který je v místní kopii, ho otevře výchozí aplikací Windows
+        (jako dvojklik v Průzkumníku). Soubory, které nemám zamčené, jsou jen pro čtení."""
         path = item.data(0, KEY_ROLE)
         entry = next((e for e in self.entries if e.path == path), None)
-        if self.project is None or entry is None or not (entry.mine or entry.local_new) \
-                or entry.local_deleted:
+        if self.project is None or entry is None or not entry.in_local:
             return
         local = to_abs(self.pm.local_dir(self.project.name), path)
         if not local.exists():

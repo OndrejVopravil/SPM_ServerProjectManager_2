@@ -59,6 +59,8 @@ class Settings:
     delete_local_after_deactivate: bool = True
     # Kontrola nepovolených znaků (diakritika, mezera, ( ) & , . ; = ^) v názvech souborů a složek
     check_forbidden_chars: bool = True
+    # Výchozí stav volby „Nestahovat neaktivované soubory“ v dialogu aktivace
+    skip_unlocked_download: bool = False
     # Automatické obnovení seznamu projektů v sekundách; -1 = vypnuto, jinak nejméně 60
     auto_refresh_seconds: int = -1
     # Minimální skóre (0–1), od kterého se nabízí přiřazení přejmenovaného souboru

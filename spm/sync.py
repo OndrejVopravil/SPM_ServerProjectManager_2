@@ -103,6 +103,7 @@ class FileEntry:
     mine: bool
     local_new: bool = False      # nový soubor jen v mé místní kopii (ještě neodevzdaný)
     local_deleted: bool = False  # můj zamčený soubor, v místní kopii smazaný (do Koše), neodevzdaný
+    in_local: bool = False       # soubor je v mé místní kopii (lze ho otevřít)
 
     @property
     def free(self) -> bool:
@@ -379,11 +380,13 @@ class ProjectManager:
     # --- aktivace ----------------------------------------------------------
 
     def activate(self, name: str, lock_paths: Iterable[str] | None = None,
-                 progress: Progress | None = None) -> Path | None:
+                 progress: Progress | None = None, only_locked: bool = False) -> Path | None:
         """Stáhne projekt do místního úložiště a zamkne vybrané soubory.
 
-        lock_paths: soubory, které chce uživatel upravovat (None = všechny volné).
-        Ostatní soubory budou v místní kopii jen pro čtení.
+        lock_paths:  soubory, které chce uživatel upravovat (None = všechny volné).
+                     Ostatní soubory budou v místní kopii jen pro čtení.
+        only_locked: „Nestahovat neaktivované soubory“ – stáhnou se jen zamčené soubory
+                     (rychlejší u velkých projektů; místní kopie pak obsahuje jen část projektu).
         Vrací cestu, kam byla přesunuta původní místní složka (pokud existovala).
         """
         server = self.server_dir(name)
@@ -400,54 +403,86 @@ class ProjectManager:
         moved_to: Path | None = None
         sid: int | None = None
         try:
+            # 1) Nejdřív zámky – ještě před kopírováním. Od této chvíle mi nikdo vybrané soubory
+            #    nezamkne a ostatní vidí, že projekt aktivuji.
+            if progress:
+                progress(0, 0, "Zamykání souborů…")
+            server_paths = [to_rel(server, p) for p in list_files(server, self.settings.ignore_patterns)]
+            with self._write(server, create=True) as db:
+                if db.active_session(self.user, self.pc):
+                    raise SyncError(f"Projekt {name} už máte aktivovaný.")
+                sid = db.start_session(self.user, self.pc)
+                all_files = db.active_files(include_pending=True)
+                owners = db.lock_owners()
+                on_server = set(server_paths)
+                want: list[str] = []
+                want_paths: set[str] = set()
+                for p in (server_paths if lock_paths is None else list(lock_paths)):
+                    f = all_files.get(p)
+                    if f is None:
+                        if p in on_server:
+                            # soubor zatím není v evidenci (první aktivace / přidán mimo aplikaci):
+                            # rezervace, údaje doplní srovnání evidence po zkopírování
+                            want.append(db.add_file(p, None, None, None, pending=True))
+                            want_paths.add(p)
+                    elif not (lock_paths is None and f.file_id in owners):  # None = jen volné
+                        want.append(f.file_id)
+                        want_paths.add(p)
+                taken = db.lock(sid, want)
+                if taken:
+                    by_id = {f.file_id: f for f in all_files.values()}
+                    raise SyncError("Některé soubory mezitím zamkl jiný uživatel:\n" + "\n".join(
+                        f"{by_id[f].path} – {owners[f].label}" for f in taken[:15]))
+            add_marker(server, LockInfo(self.user, self.pc, now_iso(), sid))
+
+            # 2) Kopírování
             if local.is_dir() and not any(local.iterdir()):
                 local.rmdir()
             if local.exists():
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 moved_to = local.with_name(f"{name}_puvodni_{stamp}")
                 local.rename(moved_to)
-
-            files = list_files(server, self.settings.ignore_patterns)
-            copied: list[FileInfo] = []
-            for i, src in enumerate(files):
-                rel = to_rel(server, src)
+            copied: dict[str, FileInfo] = {}
+            to_copy = [p for p in server_paths if p in want_paths] if only_locked else server_paths
+            for i, rel in enumerate(to_copy):
                 if progress:
-                    progress(i, len(files), rel)
-                st = src.stat()
-                sha = copy_with_hash(src, to_abs(local, rel))
-                copied.append(FileInfo(rel, st.st_size, st.st_mtime, sha))
+                    progress(i, len(to_copy), rel)
+                src = to_abs(server, rel)
+                try:
+                    st = src.stat()
+                    sha = copy_with_hash(src, to_abs(local, rel))
+                except FileNotFoundError:
+                    continue  # mezitím smazán / přejmenován jiným uživatelem
+                copied[rel] = FileInfo(rel, st.st_size, st.st_mtime, sha)
             local.mkdir(parents=True, exist_ok=True)
             if progress:
-                progress(len(files), len(files), "Zamykání souborů…")
+                progress(len(to_copy), len(to_copy), "Zápis do databáze…")
 
-            with self._write(server, create=True) as db:
-                if db.active_session(self.user, self.pc):
-                    raise SyncError(f"Projekt {name} už máte aktivovaný.")
-                sid = db.start_session(self.user, self.pc)
-                self._sync_baseline(db, sid, copied)
-                all_files = db.active_files(include_pending=True)
-                owners = db.lock_owners()
-                if lock_paths is None:
-                    want = [f.file_id for f in all_files.values() if f.file_id not in owners]
-                else:
-                    want = [all_files[p].file_id for p in lock_paths if p in all_files]
-                taken = db.lock(sid, want)
-                if taken:
-                    by_id = {f.file_id: f for f in all_files.values()}
-                    raise SyncError("Některé soubory mezitím zamkl jiný uživatel:\n" + "\n".join(
-                        f"{by_id[f].path} – {owners[f].label}" for f in taken[:15]))
+            # 3) Srovnání evidence se zkopírovaným stavem
+            with self._write(server) as db:
+                self._my_session(db, sid)
+                stale, gone = self._sync_baseline(db, server, sid, list(copied.values()))
+                db.discard_pending_new(sid)  # rezervace souborů, které mezitím zmizely
+                final = db.active_files()
                 locked = db.locked_by(sid)
 
-            manifest = Manifest(name, sid)
-            for fi in copied:
-                f = all_files.get(fi.path)
+            # 4) Soubory, které během kopírování odevzdal jiný uživatel: stáhnout aktuální verzi
+            for rel in stale:
+                copied[rel].sha256 = copy_with_hash(to_abs(server, rel), to_abs(local, rel))
+            for rel in gone:
+                to_abs(local, rel).unlink(missing_ok=True)
+                remove_empty_parents(local, rel)
+                copied.pop(rel, None)
+
+            manifest = Manifest(name, sid, partial=only_locked)
+            for rel, fi in copied.items():
+                f = final.get(rel)
                 if f is None:
                     continue
-                manifest.files[fi.path] = Entry(f.file_id, fi.sha256)
+                manifest.files[rel] = Entry(f.file_id, fi.sha256)
                 if f.file_id not in locked:
-                    set_readonly(to_abs(local, fi.path), True)
+                    set_readonly(to_abs(local, rel), True)
             manifest.save(local)
-            add_marker(server, LockInfo(self.user, self.pc, now_iso(), sid))
         except BaseException:
             if sid is not None:
                 try:
@@ -455,6 +490,7 @@ class ProjectManager:
                         db.end_session(sid, "cancelled")
                 except Exception:  # noqa: BLE001 – původní chyba je důležitější
                     pass
+                remove_marker(server, self.user, self.pc)
             rmtree(local)
             if moved_to is not None:
                 moved_to.rename(local)
@@ -462,15 +498,33 @@ class ProjectManager:
             raise
         return moved_to
 
-    def _sync_baseline(self, db: ProjectDB, session_id: int, server_files: list[FileInfo]) -> None:
-        """Srovná evidenci v databázi se skutečným stavem serveru v okamžiku aktivace.
+    def _sync_baseline(self, db: ProjectDB, server: Path, session_id: int,
+                       server_files: list[FileInfo]) -> tuple[list[str], list[str]]:
+        """Srovná evidenci v databázi se zkopírovaným stavem serveru (při aktivaci).
 
-        Soubory, které drží jiní uživatelé nebo se právě nahrávají, se nemění – jejich stav
-        v databázi je platný. Změny se zapíší jako odevzdání „Změny mimo aplikaci“."""
+        - Soubory, které drží jiní uživatelé nebo se právě nahrávají: stav v databázi platí.
+        - Moje rezervace (soubory dosud mimo evidenci): doplní se údaje ze zkopírovaného souboru.
+        - Volný soubor s jiným obsahem: pokud server pořád odpovídá databázi, změnil ho během
+          kopírování jiný uživatel (odevzdal) – kopie je zastaralá -> vrací se v `stale`
+          ke stažení znovu. Jinak jde o změnu mimo aplikaci a zapíše se.
+        - Soubor zkopírovaný, ale už neexistující na serveru -> vrací se v `gone`.
+        Změny mimo aplikaci se zapíší jako odevzdání „Změny mimo aplikaci“."""
         baseline = db.active_files(include_pending=True)
-        protected = set(db.lock_owners()) | {f.file_id for f in baseline.values() if f.pending}
+        owners = db.lock_owners()
+        mine = {f for f, o in owners.items() if o.session_id == session_id}
+        protected = ({f for f in owners if f not in mine}
+                     | {f.file_id for f in baseline.values() if f.pending and f.file_id not in mine})
         on_server = {fi.path for fi in server_files}
+        stale: list[str] = []
+        gone: list[str] = []
         commit_id: int | None = None
+
+        def server_matches_db(bf: DbFile) -> bool:
+            try:
+                st = to_abs(server, bf.path).stat()
+            except FileNotFoundError:
+                return False
+            return bf.size is not None and same_stat(st.st_size, st.st_mtime, bf.size, bf.mtime)
 
         def commit() -> int:
             nonlocal commit_id
@@ -481,10 +535,13 @@ class ProjectManager:
 
         # Soubory, které z evidence zmizely – mohly být přejmenovány ručně přímo na serveru.
         # Stejný obsah (hash) = stejný soubor, historie se zachová pod novým názvem.
+        # Jen soubory, které na serveru opravdu nejsou (ne ty, které jen přibyly po výpisu).
+        missing = {path: bf for path, bf in baseline.items()
+                   if path not in on_server and bf.file_id not in protected and bf.sha256 is not None
+                   and not to_abs(server, path).exists()}
         missing_by_hash: dict[str, list[DbFile]] = {}
-        for path, bf in baseline.items():
-            if path not in on_server and bf.file_id not in protected:
-                missing_by_hash.setdefault(bf.sha256, []).append(bf)
+        for bf in missing.values():
+            missing_by_hash.setdefault(bf.sha256, []).append(bf)
 
         renamed: set[str] = set()
         for fi in server_files:
@@ -492,10 +549,34 @@ class ProjectManager:
             if bf is not None:
                 if bf.file_id in protected:
                     continue
+                if bf.sha256 is None:  # moje rezervace -> poprvé do evidence
+                    candidates = missing_by_hash.get(fi.sha256)
+                    if candidates:
+                        # ve skutečnosti ruční přejmenování na serveru: rezervaci nahradí
+                        # původní soubor (historie pokračuje), zámek přejde na něj
+                        old = max(candidates, key=lambda c: similarity(c, fi)[0])
+                        candidates.remove(old)
+                        renamed.add(old.path)
+                        db.drop_placeholder(bf.file_id)
+                        db.update_file(old.file_id, fi.path, fi.size, fi.mtime, fi.sha256)
+                        db.lock(session_id, [old.file_id])
+                        db.add_change(commit(), old.file_id, dbm.EXTERNAL_RENAMED, old.path, fi.path,
+                                      fi.size, fi.mtime, fi.sha256)
+                        continue
+                    db.update_file(bf.file_id, fi.path, fi.size, fi.mtime, fi.sha256)
+                    db.add_change(commit(), bf.file_id, dbm.IMPORTED, None, fi.path,
+                                  fi.size, fi.mtime, fi.sha256)
+                    continue
+                if bf.sha256 != fi.sha256 and bf.file_id not in mine and server_matches_db(bf):
+                    stale.append(fi.path)  # odevzdal ho jiný uživatel během kopírování
+                    continue
                 db.update_file(bf.file_id, fi.path, fi.size, fi.mtime, fi.sha256)
                 if bf.sha256 != fi.sha256:
                     db.add_change(commit(), bf.file_id, dbm.EXTERNAL_MODIFIED, fi.path, fi.path,
                                   fi.size, fi.mtime, fi.sha256)
+                continue
+            if not to_abs(server, fi.path).exists():
+                gone.append(fi.path)  # během kopírování smazán / přejmenován jiným uživatelem
                 continue
             candidates = missing_by_hash.get(fi.sha256)
             if candidates:
@@ -509,10 +590,11 @@ class ProjectManager:
             else:
                 fid = db.add_file(fi.path, fi.size, fi.mtime, fi.sha256)
                 db.add_change(commit(), fid, dbm.IMPORTED, None, fi.path, fi.size, fi.mtime, fi.sha256)
-        for path, bf in baseline.items():
-            if path not in on_server and path not in renamed and bf.file_id not in protected:
+        for path, bf in missing.items():
+            if path not in renamed:
                 db.mark_deleted(bf.file_id)
                 db.add_change(commit(), bf.file_id, dbm.EXTERNAL_DELETED, path, None)
+        return stale, gone
 
     # --- aktualizace ze serveru a převzetí ------------------------------------
 
@@ -535,7 +617,9 @@ class ProjectManager:
             if progress:
                 progress(i, len(todo), f.path)
             lpath = local_by_id.get(f.file_id)
-            if lpath is None:  # nový soubor na serveru
+            if lpath is None:  # nový soubor na serveru (nebo nestažený – viz partial)
+                if manifest.partial:
+                    continue  # částečná kopie: stahovat jen soubory, které v ní už jsou
                 dst = to_abs(local, f.path)
                 if dst.exists() or f.path in manifest.files:
                     result.conflicts.append(f"{f.path} – v místní kopii je jiný soubor se stejným názvem")

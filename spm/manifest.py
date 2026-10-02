@@ -25,6 +25,9 @@ class Manifest:
     project: str
     session_id: int
     files: dict[str, Entry] = field(default_factory=dict)  # relativní cesta -> položka
+    # aktivováno s volbou „Nestahovat neaktivované soubory“: místní kopie obsahuje jen část
+    # projektu a aktualizace ze serveru nestahuje soubory, které v ní nejsou
+    partial: bool = False
 
     @staticmethod
     def path(local: Path) -> Path:
@@ -37,12 +40,12 @@ class Manifest:
         except (OSError, ValueError):
             return None
         files = {p: Entry(**e) for p, e in data.get("files", {}).items()}
-        return cls(data["project"], data["session_id"], files)
+        return cls(data["project"], data["session_id"], files, bool(data.get("partial", False)))
 
     def save(self, local: Path) -> None:
         path = self.path(local)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = {"project": self.project, "session_id": self.session_id,
+        data = {"project": self.project, "session_id": self.session_id, "partial": self.partial,
                 "files": {p: {"file_id": e.file_id, "sha256": e.sha256} for p, e in self.files.items()}}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")

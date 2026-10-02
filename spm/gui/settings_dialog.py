@@ -60,6 +60,12 @@ class SettingsDialog(QDialog):
                                     "Název projektu se kontroluje vždy.")
         self.check_chars.setChecked(settings.check_forbidden_chars)
 
+        self.skip_unlocked = QCheckBox("Při aktivaci nestahovat neaktivované soubory (výchozí stav volby)")
+        self.skip_unlocked.setToolTip(
+            "Výchozí stav zaškrtávátka „Nestahovat neaktivované soubory“ v dialogu aktivace;\n"
+            "při každé aktivaci ho lze změnit. Zapnuto = stáhnou se jen zamčené soubory.")
+        self.skip_unlocked.setChecked(settings.skip_unlocked_download)
+
         auto_on = settings.auto_refresh_seconds > 0
         self.auto_refresh = QCheckBox("Automaticky obnovovat seznam projektů")
         self.auto_refresh.setToolTip("Vypnuto: seznam se obnoví při spuštění, tlačítkem Obnovit (F5) "
@@ -86,6 +92,7 @@ class SettingsDialog(QDialog):
         form.addRow("Min. shoda pro návrh přejmenování:", self.threshold)
         form.addRow("Ignorované soubory:", self.ignore)
         form.addRow(self.check_chars)
+        form.addRow(self.skip_unlocked)
         form.addRow(self.auto_refresh)
         refresh_row = QWidget()
         refresh_lay = QHBoxLayout(refresh_row)
@@ -139,6 +146,7 @@ class SettingsDialog(QDialog):
         s.rename_threshold = self.threshold.value() / 100
         s.ignore_patterns = [p.strip() for p in self.ignore.text().split(";") if p.strip()]
         s.check_forbidden_chars = self.check_chars.isChecked()
+        s.skip_unlocked_download = self.skip_unlocked.isChecked()
         s.auto_refresh_seconds = (self.refresh_seconds.value() if self.auto_refresh.isChecked()
                                   else AUTO_REFRESH_OFF)
         s.save()

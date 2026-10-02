@@ -241,6 +241,12 @@ class ProjectDB:
         self.conn.execute("UPDATE files SET deleted = 1, pending = 0 WHERE file_id = ?", (file_id,))
         self.conn.execute("DELETE FROM file_locks WHERE file_id = ?", (file_id,))
 
+    def drop_placeholder(self, file_id: str) -> None:
+        """Smaže rezervaci nového souboru (bez obsahu a historie)."""
+        self.conn.execute("DELETE FROM file_locks WHERE file_id = ?", (file_id,))
+        self.conn.execute("DELETE FROM files WHERE file_id = ? AND sha256 IS NULL AND NOT EXISTS "
+                          "(SELECT 1 FROM changes WHERE file_id = ?)", (file_id, file_id))
+
     def discard_pending_new(self, session_id: int) -> None:
         """Smaže rezervace nových souborů sezení, které se nikdy nedokončily (bez obsahu)."""
         ids = [r[0] for r in self.conn.execute(

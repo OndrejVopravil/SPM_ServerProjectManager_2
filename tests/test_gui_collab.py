@@ -220,7 +220,7 @@ def test_f3_toggles_activation(app, pms, tmp_path, monkeypatch):
     w.close()
 
 
-def test_panel_double_click_opens_only_my_files(app, pms, tmp_path, monkeypatch):
+def test_panel_double_click_opens_files_in_local_copy(app, pms, tmp_path, monkeypatch):
     from pathlib import Path
 
     from spm import config
@@ -242,8 +242,11 @@ def test_panel_double_click_opens_only_my_files(app, pms, tmp_path, monkeypatch)
 
     for path in ("sestava/sestava.elt", "sestava/elektrody/E01.elt", "dily/deska.elt"):
         w.panel._on_double_click(find(w.panel.tree, path), 0)
-    assert opened == [bob.local_dir("Forma") / "dily" / "deska.elt"]
+    # otevřít jde vše, co je v místní kopii – i cizí (sestava) a volné (E01), jen pro čtení
+    assert opened == [bob.local_dir("Forma") / p for p in
+                      ("sestava/sestava.elt", "sestava/elektrody/E01.elt", "dily/deska.elt")]
     assert "Dvojklikem" in find(w.panel.tree, "dily/deska.elt").toolTip(0)
+    assert "jen pro čtení" in find(w.panel.tree, "sestava/sestava.elt").toolTip(0)
     w.close()
 
 
@@ -266,8 +269,8 @@ def test_panel_context_actions_and_preselection(app, pms, tmp_path, monkeypatch)
 
     ca = w.panel.context_actions
     assert ca("sestava/elektrody/E01.elt") == {"open": True, "submit": True, "take": False, "delete": True}
-    assert ca("sestava/sestava.elt") == {"open": False, "submit": False, "take": False, "delete": False}  # drží alice
-    assert ca("dily/deska.elt") == {"open": False, "submit": False, "take": True, "delete": False}  # volný
+    assert ca("sestava/sestava.elt") == {"open": True, "submit": False, "take": False, "delete": False}  # drží alice, jen pro čtení
+    assert ca("dily/deska.elt") == {"open": True, "submit": False, "take": True, "delete": False}  # volný, jen pro čtení
     assert ca("sestava/") == {"open": False, "submit": True, "take": False, "delete": True}
 
     # menu panelu -> dialogy hlavního okna s předvýběrem
@@ -423,4 +426,39 @@ def test_panel_delete_to_recycle_bin(app, pms, tmp_path, monkeypatch):
     assert not any(e.path.endswith("E09.elt") for e in w.panel.entries)   # nový smazán úplně
     assert w.panel.context_actions("sestava/elektrody/E01.elt")["open"] is False
     assert w.panel.context_actions("sestava/elektrody/E01.elt")["delete"] is False
+    w.close()
+
+
+def test_activation_dialog_skip_option(app, pms):
+    from spm.gui.file_select_dialog import FileSelectDialog
+
+    alice, _ = pms
+    entries = alice.file_entries("Forma")
+    plain = FileSelectDialog("t", "", entries, "OK")                       # převzetí: bez volby
+    assert plain.skip.isHidden() and not plain.skip_unlocked()
+    off = FileSelectDialog("t", "", entries, "OK", skip_option=False)
+    assert not off.skip.isHidden() and not off.skip_unlocked()
+    assert "celý projekt" in off.count.text()
+    on = FileSelectDialog("t", "", entries, "OK", skip_option=True)        # výchozí z nastavení
+    assert on.skip_unlocked() and "stáhne se jen" in on.count.text()
+    on.skip.setChecked(False)                                               # lze změnit v dialogu
+    assert not on.skip_unlocked()
+
+
+def test_panel_open_unavailable_for_files_not_in_local_copy(app, pms, tmp_path, monkeypatch):
+    from spm import config
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    _, bob = pms
+    bob.activate("Forma", lock_paths=["dily/deska.elt"], only_locked=True)   # jen deska.elt
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    w.panel._thread.wait()
+    app.processEvents()
+    assert w.panel.context_actions("dily/deska.elt")["open"] is True
+    assert w.panel.context_actions("sestava/sestava.elt")["open"] is False   # nestaženo
+    assert find(w.panel.tree, "sestava/sestava.elt").toolTip(0) == ""
     w.close()

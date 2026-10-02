@@ -471,23 +471,26 @@ class MainWindow(QMainWindow):
         if others:
             intro += f"\n\nNa projektu právě pracuje: {others}. Jejich soubory vybrat nelze."
         dlg = FileSelectDialog(f"Aktivovat projekt {p.name}", intro, entries, "Aktivovat", self,
-                               root=self.pm.server_dir(p.name))
+                               root=self.pm.server_dir(p.name),
+                               skip_option=self.settings.skip_unlocked_download)
         accepted = self._exec_dialog(dlg, "select_files")
-        paths = dlg.selected_paths()
+        paths, only_locked = dlg.selected_paths(), dlg.skip_unlocked()
         dlg.deleteLater()
         if not accepted:
             return
 
         def done(moved: Path | None) -> None:
             msg = (f"Projekt {p.name} byl aktivován a zkopírován do:\n{self.pm.local_dir(p.name)}\n\n"
-                   f"Zamčeno k úpravě: {len(paths)} souborů, ostatní jsou jen pro čtení.")
+                   + (f"Staženo a zamčeno k úpravě: {len(paths)} souborů. Ostatní soubory se "
+                      "nestahovaly (získáte je Převzetím)." if only_locked else
+                      f"Zamčeno k úpravě: {len(paths)} souborů, ostatní jsou jen pro čtení."))
             if moved:
                 msg += f"\n\nPůvodní místní složka byla přesunuta do:\n{moved}"
             self.refresh()
             QMessageBox.information(self, "Aktivace", msg)
 
         run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
-                 on_done=done, on_error=lambda _: self.refresh())
+                 only_locked=only_locked, on_done=done, on_error=lambda _: self.refresh())
 
     def take(self, preselect: str | None = None) -> None:
         """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
