@@ -25,6 +25,7 @@ from .. import __version__
 from ..config import Settings
 from ..db import ProjectDB
 from ..names import format_invalid
+from ..restore import RestoreCatalog, RestoreResult
 from ..sync import (
     ProjectManager,
     ProjectStatus,
@@ -36,6 +37,7 @@ from ..sync import (
 from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
 from .project_panel import ProjectPanel
+from .restore_dialog import RestoreDialog
 from .search import normalize
 from .settings_dialog import SettingsDialog
 from .ui_state import restore_geometry, restore_header, save_geometry, save_header
@@ -158,6 +160,9 @@ class MainWindow(QMainWindow):
         self.table.addAction(self.act_rename)
         self.act_invalid = QAction("Zobrazit nepovolené názvy…", self)
         self.act_invalid.triggered.connect(lambda: self.show_invalid_names())
+        self.act_restore = QAction("Obnovit ze zálohy…", self)
+        self.act_restore.setToolTip("Obnoví projekt k dřívějšímu stavu do nové místní složky")
+        self.act_restore.triggered.connect(lambda: self.restore_project())
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
 
@@ -423,6 +428,7 @@ class MainWindow(QMainWindow):
             "Otevře místní složku vybraného projektu" if p and p.local_exists
             else "Otevře místní složku pro projekty")
         self.act_history.setEnabled(bool(p and not p.local_only))
+        self.act_restore.setEnabled(bool(p and not p.local_only))
         self.act_rename.setEnabled(bool(p and not p.active and not p.local_only))
         self.act_unlock.setEnabled(bool(p and p.others))
 
@@ -434,7 +440,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
                    self.act_deactivate, self.act_publish, None, self.act_open, self.act_history,
-                   None, self.act_rename, None, self.act_cancel, self.act_unlock,
+                   self.act_restore, None, self.act_rename, None, self.act_cancel, self.act_unlock,
                    None, self.act_refresh]
         if self.act_invalid.isEnabled():
             actions[:0] = [self.act_invalid, None]
@@ -668,6 +674,42 @@ class MainWindow(QMainWindow):
                 os.startfile(self.pm.local_root)
             except OSError as e:
                 QMessageBox.critical(self, "Otevřít místní složku", str(e))
+
+    def restore_project(self) -> None:
+        """Obnovení ze zálohy: spočítat obnovitelné stavy, vybrat, obnovit do místní složky."""
+        p = self.selected()
+        if not p or p.local_only:
+            return
+
+        def chosen(catalog: RestoreCatalog) -> None:
+            dlg = RestoreDialog(catalog, f"{p.name}_obnova_<datum stavu> v {self.settings.local_root}", self)
+            accepted = self._exec_dialog(dlg, "restore")
+            point = dlg.selected_point()
+            dlg.deleteLater()
+            if not accepted or point is None:
+                return
+            run_task(self, f"Obnovení projektu {p.name}", self.pm.restore, catalog, point,
+                     on_done=done)
+
+        def done(res: RestoreResult) -> None:
+            if res.failed:
+                box = QMessageBox(QMessageBox.Icon.Warning, "Obnovit ze zálohy",
+                                  f"Obnoveno {res.restored} souborů do:\n{res.folder}\n\n"
+                                  f"{len(res.failed)} souborů se obnovit nepodařilo (záloha chybí "
+                                  "nebo neodpovídá historii):\n" + "\n".join(res.failed[:15]), parent=self)
+                box.setDetailedText("\n".join(res.failed))
+            else:
+                box = QMessageBox(QMessageBox.Icon.Information, "Obnovit ze zálohy",
+                                  f"Projekt byl obnoven ({res.restored} souborů, všechny ověřené) do:\n"
+                                  f"{res.folder}", parent=self)
+            open_btn = box.addButton("Otevřít složku", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Ok)
+            box.exec()
+            if box.clickedButton() is open_btn:
+                os.startfile(res.folder)
+
+        run_task(self, f"Výpočet obnovitelných stavů – {p.name}", self.pm.restore_points, p.name,
+                 on_done=chosen)
 
     def history(self) -> None:
         p = self.selected()

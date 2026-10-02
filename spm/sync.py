@@ -28,6 +28,8 @@ from .lock import LockInfo, WriteLock, active_users, add_marker, now_iso, remove
 from .manifest import Entry, Manifest
 from .matcher import RenameSuggestion, similarity, suggest_renames
 from .names import describe_chars, find_invalid_names, forbidden_in, format_invalid, invalid_rel_paths
+from . import restore
+from .restore import RESTORE_DIR_RE, RestoreCatalog, RestorePoint, RestoreResult
 from .scanner import (
     FileInfo,
     Progress,
@@ -76,8 +78,9 @@ def validate_project_name(name: str) -> str | None:
         return "Název nesmí začínat tečkou."
     if name.split(".")[0].lower() in RESERVED_NAMES:
         return f"„{name}“ je ve Windows rezervovaný název."
-    if ORIGINAL_COPY_RE.search(name):
-        return "Název nesmí končit příponou _puvodni_<datum> (používá ji aplikace pro zálohy)."
+    if ORIGINAL_COPY_RE.search(name) or RESTORE_DIR_RE.search(name):
+        return ("Název nesmí končit příponou _puvodni_<datum> ani _obnova_<datum> "
+                "(používá je aplikace pro své složky).")
     return None
 
 
@@ -254,6 +257,16 @@ class ProjectManager:
             return ProjectStatus(name=name, users=[], local_exists=True, mine=False, local_only=True)
         return None
 
+    def restore_points(self, name: str, progress: Progress | None = None) -> RestoreCatalog:
+        """Ke kterým odevzdáním lze projekt obnovit ze záloh (viz restore.py)."""
+        return restore.restore_points(self.server_dir(name), name, progress)
+
+    def restore(self, catalog: RestoreCatalog, point: RestorePoint,
+                progress: Progress | None = None) -> RestoreResult:
+        """Obnoví projekt ke stavu `point` do nové místní složky <projekt>_obnova_<datum>."""
+        self.local_root.mkdir(parents=True, exist_ok=True)
+        return restore.restore(self.server_dir(catalog.name), self.local_root, catalog, point, progress)
+
     def local_only_projects(self, server_names: set[str]) -> list[str]:
         """Složky v místním úložišti, které na serveru nemají projekt (porovnání bez ohledu
         na velikost písmen, jako ve Windows)."""
@@ -263,7 +276,6 @@ class ProjectManager:
             e.name for e in self.local_root.iterdir()
             if e.is_dir() and not e.name.startswith(".")
             and e.name.lower() not in server_names
-            and not ORIGINAL_COPY_RE.search(e.name)
         ]
 
     def file_entries(self, name: str) -> list[FileEntry]:

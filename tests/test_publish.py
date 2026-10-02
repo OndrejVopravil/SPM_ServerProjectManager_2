@@ -32,7 +32,7 @@ def test_local_only_projects_listed(pm):
     st = statuses(pm)
     assert st["Novy projekt"].local_only
     assert not st["Existujici"].local_only
-    assert "Existujici_puvodni_20260101_120000" not in st
+    assert st["Existujici_puvodni_20260101_120000"].local_only   # i odložená kopie je „Jen místně“
 
 
 def test_publish_moves_project_to_server(pm):
