@@ -268,10 +268,10 @@ def test_panel_context_actions_and_preselection(app, pms, tmp_path, monkeypatch)
     app.processEvents()
 
     ca = w.panel.context_actions
-    assert ca("sestava/elektrody/E01.elt") == {"open": True, "submit": True, "take": False, "delete": True}
-    assert ca("sestava/sestava.elt") == {"open": True, "submit": False, "take": False, "delete": False}  # drží alice, jen pro čtení
-    assert ca("dily/deska.elt") == {"open": True, "submit": False, "take": True, "delete": False}  # volný, jen pro čtení
-    assert ca("sestava/") == {"open": False, "submit": True, "take": False, "delete": True}
+    assert ca("sestava/elektrody/E01.elt") == {"open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True}
+    assert ca("sestava/sestava.elt") == {"open": True, "submit": False, "take": False, "publish": False, "delete": False, "rename": False}  # drží alice, jen pro čtení
+    assert ca("dily/deska.elt") == {"open": True, "submit": False, "take": True, "publish": False, "delete": False, "rename": False}  # volný, jen pro čtení
+    assert ca("sestava/") == {"open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False}
 
     # menu panelu -> dialogy hlavního okna s předvýběrem
     got = []
@@ -358,8 +358,8 @@ def test_panel_shows_new_local_files(app, pms, tmp_path, monkeypatch):
     item = find(w.panel.tree, "sestava/elektrody/E03.elt")
     assert item.text(1) == "nový – neodevzdaný"
     assert item.foreground(0).color() == w.panel.palette().color(QPalette.ColorRole.PlaceholderText)
-    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"open": True, "submit": True, "take": False, "delete": True}
-    assert w.panel.context_actions("nc/") == {"open": False, "submit": True, "take": False, "delete": True}
+    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True}
+    assert w.panel.context_actions("nc/") == {"open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False}
     assert "nové neodevzdané: <b>2</b>" in w.panel.summary.text()
 
     w.panel._on_double_click(item, 0)
@@ -461,4 +461,111 @@ def test_panel_open_unavailable_for_files_not_in_local_copy(app, pms, tmp_path, 
     assert w.panel.context_actions("dily/deska.elt")["open"] is True
     assert w.panel.context_actions("sestava/sestava.elt")["open"] is False   # nestaženo
     assert find(w.panel.tree, "sestava/sestava.elt").toolTip(0) == ""
+    w.close()
+
+
+def test_panel_for_local_only_folder(app, pms, tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from spm import config
+    from spm.gui import project_panel
+    from spm.gui.main_window import MainWindow
+    from spm.gui.publish_dialog import PublishDialog
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    opened = []
+    monkeypatch.setattr(project_panel.os, "startfile", lambda p: opened.append(Path(p)), raising=False)
+    _, bob = pms
+    novy = bob.local_dir("NovaForma")
+    (novy / "dily").mkdir(parents=True)
+    (novy / "dily" / "deska.elt").write_text("d")
+    (novy / "dily" / "kolik.elt").write_text("k")
+    (novy / "poznamky.txt").write_text("p")
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("NovaForma"))
+    assert not w.panel.isHidden() and "jen místně" in w.panel.title.text()
+    w.panel._thread.wait()
+    app.processEvents()
+    assert sorted(e.path for e in w.panel.entries) == ["dily/deska.elt", "dily/kolik.elt", "poznamky.txt"]
+    assert w.panel.context_actions("dily/") == {"open": False, "submit": False, "take": False,
+                                                "publish": True, "delete": True, "rename": False}
+    assert w.panel.context_actions("poznamky.txt")["open"] is True
+    w.panel._on_double_click(find(w.panel.tree, "poznamky.txt"), 0)
+    assert opened == [novy / "poznamky.txt"]
+
+    # Publikovat… nad složkou -> dialog s předvybranou složkou
+    files = bob.local_files("NovaForma")
+    dlg = PublishDialog("NovaForma", bob.server_dir("NovaForma"), novy, files, set(), preselect="dily/")
+    assert sorted(dlg.selected_paths()) == ["dily/deska.elt", "dily/kolik.elt"]
+    assert not dlg.buttons.buttons()[0].isEnabled()          # chybí komentář
+    dlg.comment.setPlainText("dily")
+    assert dlg.buttons.buttons()[0].isEnabled()
+    bad = PublishDialog("NovaForma", bob.server_dir("NovaForma"), novy, files, {"poznamky.txt"})
+    assert "poznamky.txt" not in bad.selected_paths()          # vadný název nejde vybrat
+    w.close()
+
+
+def test_refresh_when_app_becomes_active(app, pms, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+
+    from spm import config
+    from spm.gui import main_window
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    alice, bob = pms
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    calls = []
+    real = w.refresh
+    monkeypatch.setattr(w, "refresh", lambda **kw: (calls.append(kw), real(**kw)))
+
+    active = Qt.ApplicationState.ApplicationActive
+    w._on_app_state(active)
+    assert calls == []                                   # před chvílí obnoveno – nic
+    w._last_refresh -= main_window.FOCUS_REFRESH_MIN_GAP + 1
+    alice.activate("Forma", lock_paths=[])               # mezitím v jiné aplikaci / jinde
+    w._on_app_state(Qt.ApplicationState.ApplicationInactive)
+    assert calls == []                                   # odchod z aplikace – nic
+    w._on_app_state(active)
+    assert calls == [{"silent": True, "check_names": False}]
+    assert w.table.item([p.name for p in w.projects].index("Forma"), 2).text() == "alice"
+    w._on_app_state(active)
+    assert len(calls) == 1                               # hned znovu – nic
+    w.panel._thread and w.panel._thread.wait()
+    w.close()
+
+
+def test_panel_rename_with_f2(app, pms, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+
+    from spm import config
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    _, bob = pms
+    bob.activate("Forma", lock_paths=["dily/deska.elt"])
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    w.panel._thread.wait()
+    app.processEvents()
+    assert w.panel.context_actions("dily/deska.elt")["rename"] is True
+    assert w.panel.context_actions("sestava/sestava.elt")["rename"] is False   # volný – nejdřív převzít
+
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("deska_pevna.elt", True))
+    w.panel.tree.setCurrentItem(find(w.panel.tree, "dily/deska.elt"))
+    w.panel.rename_selected()                                                  # = F2
+    w.panel._thread.wait()
+    app.processEvents()
+    assert (bob.local_dir("Forma") / "dily" / "deska_pevna.elt").exists()
+    item = find(w.panel.tree, "dily/deska_pevna.elt")
+    assert item.text(1) == "přejmenován z dily/deska.elt – neodevzdaný"
+    assert not any(e.path == "dily/deska.elt" for e in w.panel.entries)        # ne „smazán“
+    keys = {a.shortcut().toString() for a in w.panel.tree.actions()}
+    assert "F2" in keys
     w.close()

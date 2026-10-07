@@ -575,3 +575,44 @@ def test_activate_only_locked_first_activation(env):
     assert (bob.local_dir("ProjektA") / "vykresy" / "pudorys.dwg").exists()
     with ProjectDB.for_project(proj) as db:
         assert set(db.active_files()) == {"vykresy/pudorys.dwg", "zprava.docx", "foto.jpg"}
+
+
+# --- přejmenování souboru v místní kopii (panel, F2) ---------------------------------
+
+def test_rename_own_file_and_submit(electrodes):
+    alice, bob, proj = electrodes
+    local = alice.local_dir("ProjektA")
+    with ProjectDB.for_project(proj) as db:
+        fid = db.active_files()["sestava/sestava.elt"].file_id
+    assert alice.rename_local("ProjektA", "sestava/sestava.elt", "sestava_hlavni.elt") == "sestava/sestava_hlavni.elt"
+    assert (local / "sestava" / "sestava_hlavni.elt").exists()
+    assert (proj / "sestava" / "sestava.elt").exists()                  # server až při odevzdání
+    assert alice.local_renames("ProjektA") == {"sestava/sestava.elt": "sestava/sestava_hlavni.elt"}
+
+    plan = alice.plan_upload("ProjektA")
+    [s] = plan.suggestions
+    assert (s.old_path, s.new_path, s.same_content) == ("sestava/sestava.elt", "sestava/sestava_hlavni.elt", True)
+    alice.upload(plan, plan.default_assignments(), "prejmenovani", selected={fid})
+    assert (proj / "sestava" / "sestava_hlavni.elt").exists() and not (proj / "sestava" / "sestava.elt").exists()
+    with ProjectDB.for_project(proj) as db:
+        assert db.file_history(fid)[0]["change_type"] == dbm.RENAMED
+
+
+def test_rename_rules(electrodes):
+    alice, bob, proj = electrodes
+    bob.activate("ProjektA", lock_paths=[])
+    with pytest.raises(SyncError, match="nemáte zamčený"):
+        bob.rename_local("ProjektA", "sestava/sestava.elt", "jiny.elt")    # cizí soubor
+    with pytest.raises(SyncError, match="nepovolené"):
+        alice.rename_local("ProjektA", "zprava.docx", "zpráva.docx")       # diakritika
+    with pytest.raises(SyncError, match="Windows"):
+        alice.rename_local("ProjektA", "zprava.docx", "a:b.docx")
+    with pytest.raises(SyncError, match="už ve složce"):
+        alice.rename_local("ProjektA", "zprava.docx", "foto.jpg")          # obsazeno lokálně
+    write(bob.local_dir("ProjektA") / "nc.txt", "nc")
+    plan = bob.plan_upload("ProjektA")
+    bob.upload(plan, plan.default_assignments(), "nc")
+    with pytest.raises(SyncError, match="Na serveru už je"):
+        alice.rename_local("ProjektA", "zprava.docx", "nc.txt")           # obsazeno na serveru
+    write(alice.local_dir("ProjektA") / "muj_novy.txt", "x")
+    assert alice.rename_local("ProjektA", "muj_novy.txt", "muj_novy_2.txt") == "muj_novy_2.txt"  # nový soubor

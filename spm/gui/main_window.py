@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -27,16 +28,19 @@ from ..db import ProjectDB
 from ..names import format_invalid
 from ..restore import RestoreCatalog, RestoreResult
 from ..sync import (
+    ActivationResult,
     ProjectManager,
     ProjectStatus,
     RefreshResult,
     UploadPlan,
+    PublishResult,
     UploadResult,
     validate_project_name,
 )
 from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
 from .project_panel import ProjectPanel
+from .publish_dialog import PublishDialog
 from .restore_dialog import RestoreDialog
 from .search import normalize
 from .settings_dialog import SettingsDialog
@@ -50,6 +54,7 @@ COLOR_INVALID = QColor("#e67e22")   # nepovolené znaky v názvech – nelze akt
 
 COLUMNS = ["Projekt", "Stav", "Aktivováno", "Od", "Místní kopie"]
 HEADER_KEY = "main.v2"  # změna sloupců -> neobnovovat šířky uložené pro starší rozvržení
+FOCUS_REFRESH_MIN_GAP = 5.0  # s – při rychlém přepínání oken (Alt+Tab) neobnovovat pokaždé
 
 
 class NameCheckThread(QThread):
@@ -77,7 +82,17 @@ def format_refresh(res: RefreshResult) -> str:
             lines.append(f"\n{title}:\n  " + "\n  ".join(items[:15]) + ("\n  …" if len(items) > 15 else ""))
     if res.conflicts:
         lines.append("\nNepřevzato kvůli místním změnám:\n  " + "\n  ".join(res.conflicts[:15]))
+    if res.external:
+        lines.append("\n" + format_external(res.external))
     return "\n".join(lines)
+
+
+def format_external(items: list[str]) -> str:
+    """Upozornění na soubory změněné přímo na síti mimo aplikaci (zjištěno podle hashe)."""
+    return ("POZOR – soubory na serveru byly změněny mimo aplikaci (jejich obsah neodpovídá "
+            "poslednímu odevzdání):\n  " + "\n  ".join(items[:20])
+            + ("\n  …" if len(items) > 20 else "")
+            + "\n\nZměna je zapsaná v historii projektu jako „Změněn mimo aplikaci“.")
 
 
 class MainWindow(QMainWindow):
@@ -91,6 +106,9 @@ class MainWindow(QMainWindow):
         self._name_check_again = False
         self._rendering = False
         self._closing = False
+        self._last_refresh = 0.0  # time.monotonic() posledního obnovení seznamu
+        # návrat do aplikace z jiné (klepnutí, Alt+Tab, hlavní panel) -> obnovit seznam
+        QGuiApplication.instance().applicationStateChanged.connect(self._on_app_state)
         self.setWindowTitle(f"SPM – Server Project Manager {__version__}")
         self.resize(1000, 560)
         restore_geometry(settings, "main", self)
@@ -176,6 +194,7 @@ class MainWindow(QMainWindow):
         self.panel = ProjectPanel(self.pm)
         self.panel.hide()
         self.panel.submit_requested.connect(self.submit)
+        self.panel.publish_requested.connect(self.publish)
         self.panel.take_requested.connect(self.take)
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.addWidget(self.table)
@@ -243,11 +262,21 @@ class MainWindow(QMainWindow):
         else:
             self.timer.stop()
 
+    def _on_app_state(self, state) -> None:
+        """Aplikace se stala aktivní (přišla z jiné aplikace): lehké obnovení seznamu – bez
+        kontroly nepovolených znaků (ta prochází celé stromy projektů na serveru)."""
+        if (state != Qt.ApplicationState.ApplicationActive or self._closing
+                or QApplication.activeModalWidget() is not None          # otevřený dialog
+                or time.monotonic() - self._last_refresh < FOCUS_REFRESH_MIN_GAP):
+            return
+        self.refresh(silent=True, check_names=False)
+
     def refresh(self, silent: bool = False, check_names: bool = True) -> None:
         """Obnoví seznam projektů. Kontrola nepovolených znaků (prochází celé stromy projektů
         na serveru) běží jen při spuštění a při ručním obnovení, ne při automatickém."""
         if not self.settings.is_complete() or getattr(self, "_running_task", None):
             return
+        self._last_refresh = time.monotonic()
         current = self.selected().name if self.selected() else self.settings.ui.get("last_project")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -421,7 +450,8 @@ class MainWindow(QMainWindow):
         self.act_activate.setEnabled(bool(p and not p.mine and not p.local_only and not issues))
         for act in (self.act_submit, self.act_update, self.act_take, self.act_deactivate, self.act_cancel):
             act.setEnabled(mine)
-        self.act_publish.setEnabled(bool(p and p.local_only and not issues))
+        # i se soubory s nepovolenými znaky – dialog je nedovolí vybrat, zbytek publikovat lze
+        self.act_publish.setEnabled(bool(p and p.local_only))
         self.act_invalid.setEnabled(issues)
         self.act_open.setEnabled(bool(self.settings.local_root))
         self.act_open.setToolTip(
@@ -485,15 +515,18 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
 
-        def done(moved: Path | None) -> None:
+        def done(res: ActivationResult) -> None:
             msg = (f"Projekt {p.name} byl aktivován a zkopírován do:\n{self.pm.local_dir(p.name)}\n\n"
                    + (f"Staženo a zamčeno k úpravě: {len(paths)} souborů. Ostatní soubory se "
                       "nestahovaly (získáte je Převzetím)." if only_locked else
                       f"Zamčeno k úpravě: {len(paths)} souborů, ostatní jsou jen pro čtení."))
-            if moved:
-                msg += f"\n\nPůvodní místní složka byla přesunuta do:\n{moved}"
+            if res.moved_to:
+                msg += f"\n\nPůvodní místní složka byla přesunuta do:\n{res.moved_to}"
             self.refresh()
-            QMessageBox.information(self, "Aktivace", msg)
+            if res.external:
+                QMessageBox.warning(self, "Aktivace", msg + "\n\n" + format_external(res.external))
+            else:
+                QMessageBox.information(self, "Aktivace", msg)
 
         run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
                  only_locked=only_locked, on_done=done, on_error=lambda _: self.refresh())
@@ -523,7 +556,10 @@ class MainWindow(QMainWindow):
             msg = f"Převzato k úpravě: {len(paths)} souborů."
             if res.conflicts:
                 msg += "\n\n" + "\n".join(res.conflicts)
-            QMessageBox.information(self, "Převzít", msg)
+            if res.external:
+                QMessageBox.warning(self, "Převzít", msg + "\n\n" + format_external(res.external))
+            else:
+                QMessageBox.information(self, "Převzít", msg)
 
         run_task(self, f"Převzetí souborů – {p.name}", self.pm.take, p.name, paths,
                  on_done=done, on_error=lambda _: self.refresh())
@@ -535,8 +571,10 @@ class MainWindow(QMainWindow):
 
         def done(res: RefreshResult) -> None:
             self.refresh()
-            if res.total == 0 and not res.conflicts:
+            if res.total == 0 and not res.conflicts and not res.external:
                 QMessageBox.information(self, "Aktualizovat", "Místní kopie je aktuální.")
+            elif res.external:
+                QMessageBox.warning(self, "Aktualizovat", format_refresh(res))
             else:
                 QMessageBox.information(self, "Aktualizovat", format_refresh(res))
 
@@ -631,35 +669,40 @@ class MainWindow(QMainWindow):
                     "Nyní se zobrazuje jako „Jen místně“ – pokud ji nepotřebujete, smažte ji.")
         QMessageBox.information(self, "Přejmenovat projekt", msg)
 
-    def publish(self) -> None:
+    def publish(self, preselect: str | None = None) -> None:
+        """preselect: soubor / složka ('/' na konci) předvybraná (z panelu stavu projektu)."""
         p = self.selected()
         if not p or not p.local_only:
             return
-        comment = ""
-        while True:
-            comment, ok = QInputDialog.getMultiLineText(
-                self, f"Publikovat projekt {p.name}",
-                f"Projekt se přesune na server:\n{self.pm.server_dir(p.name)}\n\n"
-                "Po úspěšném nahrání a ověření se místní složka smaže. "
-                "Chcete-li na projektu dál pracovat, aktivujte ho.\n\n"
-                "Komentář (povinný):",
-                comment,
-            )
-            if not ok:
-                return
-            if comment.strip():
-                break
-            QMessageBox.warning(self, "Publikovat", "Bez komentáře nelze projekt publikovat.")
+        files = self.pm.local_files(p.name)
+        if not files:
+            QMessageBox.information(self, "Publikovat", f"Složka {p.name} neobsahuje žádné soubory.")
+            return
+        dlg = PublishDialog(p.name, self.pm.server_dir(p.name), self.pm.local_dir(p.name), files,
+                            set(self.pm.invalid_file_paths(files)), self, preselect=preselect)
+        accepted = self._exec_dialog(dlg, "publish")
+        paths, comment = dlg.selected_paths(), dlg.comment_text()
+        dlg.deleteLater()
+        if not accepted:
+            return
 
-        def done(local_deleted: bool) -> None:
+        def done(res: PublishResult) -> None:
+            if res.leftover is not None:
+                self.settings.ui["last_project"] = p.name
             self.refresh()
-            msg = f"Projekt {p.name} byl publikován na server."
-            if not local_deleted:
+            msg = f"Projekt {p.name} byl publikován na server ({res.published} souborů)."
+            if res.leftover is not None and res.leftover != self.pm.local_dir(p.name):
+                msg += f"\n\nNepublikované soubory zůstaly v místní složce:\n{res.leftover}"
+            elif res.leftover is not None:
+                msg += ("\n\nNepublikované soubory zůstaly v místní složce, ale tu se nepodařilo "
+                        "přejmenovat (některý soubor je otevřen). Při aktivaci projektu se odloží.")
+            elif not res.local_deleted:
                 msg += ("\n\nMístní složku se nepodařilo celou smazat (některý soubor je otevřen). "
                         "Data na serveru jsou kompletní, zbytek místní složky smažte ručně.")
             QMessageBox.information(self, "Publikovat", msg)
 
         run_task(self, f"Publikování projektu {p.name}", self.pm.publish, p.name, comment,
+                 None if len(paths) == len(files) else paths,
                  on_done=done, on_error=lambda _: self.refresh())
 
     def open_local(self, root_fallback: bool = True) -> None:
@@ -692,6 +735,7 @@ class MainWindow(QMainWindow):
                      on_done=done)
 
         def done(res: RestoreResult) -> None:
+            self.refresh()  # jako F5 – nová složka …_obnova_… se objeví v seznamu
             if res.failed:
                 box = QMessageBox(QMessageBox.Icon.Warning, "Obnovit ze zálohy",
                                   f"Obnoveno {res.restored} souborů do:\n{res.folder}\n\n"

@@ -17,7 +17,15 @@ from . import SPM_DIR
 @dataclass
 class Entry:
     file_id: str
-    sha256: str
+    sha256: str                 # obsah souboru v místní kopii (tak, jak se stáhl / nahrál)
+    # hash v databázi v okamžiku stažení, pokud se liší od obsahu (soubor změněný mimo
+    # aplikaci, který drží jiný uživatel – databáze se nemění). Aktualizace stahuje znovu,
+    # až když se změní databáze, ne při každém porovnání.
+    db_sha: str | None = None
+
+    @property
+    def known_db_sha(self) -> str:
+        return self.db_sha or self.sha256
 
 
 @dataclass
@@ -46,7 +54,9 @@ class Manifest:
         path = self.path(local)
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {"project": self.project, "session_id": self.session_id, "partial": self.partial,
-                "files": {p: {"file_id": e.file_id, "sha256": e.sha256} for p, e in self.files.items()}}
+                "files": {p: {"file_id": e.file_id, "sha256": e.sha256,
+                              **({"db_sha": e.db_sha} if e.db_sha else {})}
+                          for p, e in self.files.items()}}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(path)

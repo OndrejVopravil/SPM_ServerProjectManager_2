@@ -12,11 +12,13 @@ import os
 from collections import Counter
 
 from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMenu,
     QMessageBox,
     QTreeWidgetItem,
@@ -25,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..scanner import to_abs
-from ..sync import FileEntry, ProjectManager, ProjectStatus
+from ..sync import FileEntry, ProjectManager, ProjectStatus, validate_file_name
 from .check_tree import KEY_ROLE, PATH_ROLE, CheckTree, TreeEntry, in_scope
 
 COLOR_MINE = QColor("#2e8b57")
@@ -35,12 +37,16 @@ COLOR_OTHER = QColor("#c0392b")
 class EntriesThread(QThread):
     done = Signal(str, list, str)  # projekt, položky, chyba
 
-    def __init__(self, pm: ProjectManager, name: str, mine: bool):
+    def __init__(self, pm: ProjectManager, name: str, mine: bool, local_only: bool = False):
         super().__init__()
-        self.pm, self.name, self.mine = pm, name, mine
+        self.pm, self.name, self.mine, self.local_only = pm, name, mine, local_only
 
     def run(self) -> None:
         try:
+            if self.local_only:  # složka jen v místním úložišti – jen její soubory
+                self.done.emit(self.name, [FileEntry(p, None, False, local_new=True, in_local=True)
+                                           for p in self.pm.local_files(self.name)], "")
+                return
             entries = self.pm.file_entries(self.name)
             if self.mine:  # u mého projektu i nové a smazané soubory z místní kopie
                 deleted = set(self.pm.local_deleted_files(self.name))
@@ -49,6 +55,14 @@ class EntriesThread(QThread):
                 on_server = {e.path.lower() for e in entries}
                 entries += [FileEntry(p, None, False, local_new=True)
                             for p in self.pm.local_new_files(self.name) if p.lower() not in on_server]
+                # přejmenované (stejný obsah): místo „smazán“ + „nový“ jedna položka
+                renames = self.pm.local_renames(self.name)
+                if renames:
+                    old_of = {new: old for old, new in renames.items()}
+                    entries = [e for e in entries if not (e.local_deleted and e.path in renames)]
+                    for e in entries:
+                        if e.local_new and e.path in old_of:
+                            e.renamed_from = old_of[e.path]
             local = self.pm.local_dir(self.name)
             if local.is_dir():  # co je v místní kopii, lze otevřít (cizí / volné jen pro čtení)
                 for e in entries:
@@ -62,6 +76,7 @@ class ProjectPanel(QWidget):
     # pravé tlačítko ve stromu: soubor nebo složka (zakončená '/'), která se má předvybrat
     submit_requested = Signal(str)
     take_requested = Signal(str)
+    publish_requested = Signal(str)   # složka „Jen místně“
 
     def __init__(self, pm: ProjectManager, parent: QWidget | None = None):
         super().__init__(parent)
@@ -86,6 +101,11 @@ class ProjectPanel(QWidget):
         self.tree.itemDoubleClicked.connect(self._on_double_click)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._context_menu)
+        rename = QAction(self.tree)  # F2 jen ve stromu (v seznamu projektů F2 = přejmenovat projekt)
+        rename.setShortcut(QKeySequence(Qt.Key.Key_F2))
+        rename.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        rename.triggered.connect(lambda: self.rename_selected())
+        self.tree.addAction(rename)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.addLayout(head)
@@ -93,14 +113,18 @@ class ProjectPanel(QWidget):
         layout.addWidget(self.tree)
 
     def show_project(self, project: ProjectStatus | None) -> None:
-        """Zobrazí stav projektu; pro projekt, který nikdo nemá aktivovaný, se panel skryje."""
-        if project is None or not project.active or project.local_only:
+        """Zobrazí stav projektu (aktivovaného, nebo složky „Jen místně“); jinak se panel skryje."""
+        if project is None or not (project.active or project.local_only):
             self.project = None
             self.hide()
             return
-        same = self.project is not None and self.project.name == project.name
+        same = (self.project is not None and self.project.name == project.name
+                and self.project.local_only == project.local_only)
         self.project = project
-        self.title.setText(f"<b>Stav projektu {project.name}</b>")
+        self.title.setText(f"<b>Místní složka {project.name}</b> (jen místně)" if project.local_only
+                           else f"<b>Stav projektu {project.name}</b>")
+        self.only_locked.setVisible(not project.local_only)
+        self.tree.setColumnHidden(1, project.local_only)  # „Drží“ u místní složky nedává smysl
         if not same:
             self.entries = []
             self.tree.set_entries([])
@@ -115,7 +139,7 @@ class ProjectPanel(QWidget):
             self._again = True
             return
         self._again = False
-        self._thread = EntriesThread(self.pm, self.project.name, self.project.mine)
+        self._thread = EntriesThread(self.pm, self.project.name, self.project.mine, self.project.local_only)
         self._thread.done.connect(self._on_loaded)
         self._thread.start()
 
@@ -139,12 +163,27 @@ class ProjectPanel(QWidget):
         local = self.pm.local_dir(self.project.name)
         color_new = self.palette().color(QPalette.ColorRole.PlaceholderText)
 
+        if self.project.local_only:
+            self.tree.set_entries([TreeEntry(e.path, e.path, [""], file_path=str(to_abs(local, e.path)),
+                                             tooltip="Dvojklikem otevřete")
+                                   for e in self.entries])
+            self.summary.setText(
+                f"Složka je jen v místním úložišti – <b>{len(self.entries)}</b> souborů. "
+                "Pravým tlačítkem můžete soubor otevřít, publikovat celou složku nebo jen její část, "
+                "nebo smazat do Koše.")
+            return
+
         def tree_entry(e: FileEntry) -> TreeEntry:
             if e.local_deleted:  # šedě = můj soubor smazaný v místní kopii, ještě neodevzdaný
                 return TreeEntry(e.path, e.path, ["smazán – neodevzdaný"], color=color_new,
                                  color_name=True, file_path=str(to_abs(root, e.path)),
                                  tooltip="Soubor je v Koši Windows. Na serveru se smaže až při "
                                          "odevzdání (do koše projektu).")
+            if e.renamed_from:  # šedě = můj soubor přejmenovaný v místní kopii, neodevzdaný
+                return TreeEntry(e.path, e.path, [f"přejmenován z {e.renamed_from} – neodevzdaný"],
+                                 color=color_new, color_name=True, file_path=str(to_abs(local, e.path)),
+                                 tooltip="Přejmenováno ve vaší místní kopii; na serveru se přejmenuje "
+                                         "při odevzdání.\nDvojklikem otevřete.")
             if e.local_new:  # šedě = nový soubor jen v mé místní kopii
                 return TreeEntry(e.path, e.path, ["nový – neodevzdaný"], color=color_new,
                                  color_name=True, file_path=str(to_abs(local, e.path)),
@@ -178,6 +217,7 @@ class ProjectPanel(QWidget):
 
     def context_actions(self, scope: str) -> dict[str, bool]:
         """Které akce kontextového menu jsou pro soubor / složku dostupné."""
+        local_only = bool(self.project and self.project.local_only)
         mine_project = bool(self.project and self.project.mine)
         inside = [e for e in self.entries if in_scope(e.path, scope)]
         own = any(e.mine or e.local_new for e in inside)  # zamčené mnou nebo moje nové
@@ -187,11 +227,49 @@ class ProjectPanel(QWidget):
             # u složky vždy – dialog odevzdání ukáže, co v ní skutečně je
             "submit": mine_project and (scope.endswith("/") or own),
             "take": mine_project and any(e.free for e in inside),
-            "delete": mine_project and bool(self.deletable(scope)),
+            "publish": local_only and bool(inside),
+            "delete": (local_only or mine_project) and bool(self.deletable(scope)),
+            # přejmenovat: jen jeden soubor, a to můj (zamčený / nový) a v místní kopii
+            "rename": (not scope.endswith("/") and (local_only or mine_project)
+                       and any((e.mine or e.local_new) and e.in_local and not e.local_deleted
+                               for e in inside)),
         }
 
+    def rename_selected(self) -> None:
+        """F2 – přejmenovat vybraný soubor."""
+        item = self.tree.currentItem()
+        if item is not None:
+            self._rename(item.data(0, PATH_ROLE))
+
+    def _rename(self, path: str) -> None:
+        if self.project is None or not self.context_actions(path)["rename"]:
+            return
+        folder, _, old_name = path.rpartition("/")
+        new_name = old_name
+        while True:
+            new_name, ok = QInputDialog.getText(
+                self, "Přejmenovat soubor",
+                f"Nový název souboru „{old_name}“"
+                + (f"\n(ve složce {folder})" if folder else "") + ":"
+                + ("" if self.project.local_only else
+                   "\n\nPřejmenuje se ve vaší místní kopii, na serveru až při odevzdání."),
+                QLineEdit.EchoMode.Normal, new_name)
+            new_name = new_name.strip()
+            if not ok or new_name == old_name:
+                return
+            error = validate_file_name(new_name, self.pm.settings.check_forbidden_chars)
+            if not error:
+                break
+            QMessageBox.warning(self, "Přejmenovat soubor", error)
+        try:
+            self.pm.rename_local(self.project.name, path, new_name)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Přejmenovat soubor", str(e))
+        self.reload()
+
     def deletable(self, scope: str) -> list[str]:
-        """Soubory v rozsahu, které smím smazat: zamčené mnou nebo moje nové (a ještě nesmazané)."""
+        """Soubory v rozsahu, které smím smazat: zamčené mnou nebo moje nové (a ještě nesmazané);
+        u složky „Jen místně“ všechny."""
         return [e.path for e in self.entries if in_scope(e.path, scope)
                 and (e.mine or e.local_new) and not e.local_deleted]
 
@@ -202,15 +280,21 @@ class ProjectPanel(QWidget):
         if not paths or self.project is None:
             return
         lines = "\n".join(paths[:15]) + ("\n…" if len(paths) > 15 else "")
-        text = (f"Přesunout do Koše {len(paths)} souborů z vaší místní kopie?\n\n{lines}\n\n"
-                "Na serveru se smažou až při odevzdání (a i tam se jen přesunou do koše projektu).")
+        if self.project.local_only:
+            text = f"Přesunout do Koše {len(paths)} souborů z místní složky?\n\n{lines}"
+        else:
+            text = (f"Přesunout do Koše {len(paths)} souborů z vaší místní kopie?\n\n{lines}\n\n"
+                    "Na serveru se smažou až při odevzdání (a i tam se jen přesunou do koše projektu).")
         if others:
             text += (f"\n\n{len(others)} dalších souborů ve složce nemáte zamčených – ty zůstanou.")
         answer = QMessageBox.question(self, "Smazat", text)
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            self.pm.delete_local(self.project.name, paths)
+            if self.project.local_only:
+                self.pm.delete_local_only(self.project.name, paths)
+            else:
+                self.pm.delete_local(self.project.name, paths)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Smazat", str(e))
         self.reload()
@@ -225,20 +309,33 @@ class ProjectPanel(QWidget):
         act_open = menu.addAction("Otevřít")
         act_open.setEnabled(enabled["open"])
         menu.addSeparator()
-        act_submit = menu.addAction("Odevzdat…")
-        act_submit.setEnabled(enabled["submit"])
-        act_take = menu.addAction("Převzít…")
-        act_take.setEnabled(enabled["take"])
+        act_submit = act_take = act_publish = None
+        if self.project.local_only:
+            act_publish = menu.addAction("Publikovat…")
+            act_publish.setEnabled(enabled["publish"])
+        else:
+            act_submit = menu.addAction("Odevzdat…")
+            act_submit.setEnabled(enabled["submit"])
+            act_take = menu.addAction("Převzít…")
+            act_take.setEnabled(enabled["take"])
         menu.addSeparator()
+        act_rename = menu.addAction("Přejmenovat…\tF2")
+        act_rename.setEnabled(enabled["rename"])
         act_delete = menu.addAction("Smazat… (do Koše)")
         act_delete.setEnabled(enabled["delete"])
-        if not self.project.mine:
+        if not self.project.mine and not self.project.local_only:
             menu.addSeparator()
             note = menu.addAction("Pro odevzdání a převzetí projekt nejdřív aktivujte")
             note.setEnabled(False)
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
         if chosen is act_open:
             self._on_double_click(item, 0)
+        elif chosen is act_publish:
+            self.publish_requested.emit(scope)
+        elif chosen is act_rename:
+            self._rename(scope)
         elif chosen is act_submit:
             self.submit_requested.emit(scope)
         elif chosen is act_take:

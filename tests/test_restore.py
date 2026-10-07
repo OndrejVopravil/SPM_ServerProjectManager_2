@@ -136,3 +136,42 @@ def test_restore_dialog(history):
     assert "zprava.txt" in dlg.table.item(last, 0).toolTip()
     dlg.table.selectRow(1)
     assert dlg.selected_point() is cat.points[1]
+
+
+def test_restore_refreshes_project_list(history, monkeypatch, tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from spm import config
+    from spm.gui import main_window
+    from spm.gui.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: 0)          # hlášení nezobrazovat
+    pm, proj = history
+    cat = pm.restore_points("Forma")
+
+    class FakeDialog:                                                  # výběr nejnovějšího stavu
+        def __init__(self, *a, **k): pass
+        def selected_point(self): return cat.points[0]
+        def deleteLater(self): pass
+    monkeypatch.setattr(main_window, "RestoreDialog", FakeDialog)
+
+    def run_now(parent, title, fn, *args, on_done=None, on_error=None, **kwargs):
+        res = fn(*args, progress=None, **kwargs)
+        if on_done:
+            on_done(res)
+    monkeypatch.setattr(main_window, "run_task", run_now)
+
+    w = MainWindow(pm.settings)
+    w.pm = w.panel.pm = pm
+    monkeypatch.setattr(w, "_exec_dialog", lambda dlg, key: True)
+    w.refresh(check_names=False)
+    assert [p.name for p in w.projects] == ["Forma"]
+    w.table.selectRow(0)
+    w.restore_project()
+    names = [p.name for p in w.projects]
+    assert len(names) == 2 and any("_obnova_" in n for n in names)     # seznam se obnovil sám
+    w.panel._thread and w.panel._thread.wait()
+    w.close()

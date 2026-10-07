@@ -50,7 +50,10 @@ def test_valid_project_activatable(window):
     assert window.act_activate.isEnabled() and not window.act_invalid.isEnabled()
 
 
-def test_local_only_with_invalid_names_cannot_be_published(window):
+def test_local_only_with_invalid_names_publish_allowed_without_them(window):
+    """Složku s vadnými názvy lze publikovat jen bez nich – dialog je nedovolí vybrat
+    a jádro publikování je odmítne (viz test_publish)."""
     row = select(window, "NovyLokalni")
     assert window.table.item(row, 1).text() == "Nepovolené znaky"
-    assert not window.act_publish.isEnabled()
+    assert window.act_publish.isEnabled()
+    assert window.pm.invalid_file_paths(window.pm.local_files("NovyLokalni")) == ["moje poznamky.txt"]

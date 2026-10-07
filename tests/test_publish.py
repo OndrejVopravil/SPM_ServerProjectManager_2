@@ -36,7 +36,8 @@ def test_local_only_projects_listed(pm):
 
 
 def test_publish_moves_project_to_server(pm):
-    assert pm.publish("Novy projekt", "zalozeni projektu")
+    res = pm.publish("Novy projekt", "zalozeni projektu")
+    assert res.local_deleted and res.leftover is None and res.published == 2
     server = pm.server_dir("Novy projekt")
     assert (server / "vykresy" / "pudorys.dwg").read_text(encoding="utf-8") == "pudorys"
     assert not (server / "~$zprava.docx").exists()   # ignorované soubory se nenahrávají
@@ -91,3 +92,44 @@ def test_failed_upload_keeps_local_and_cleans_server(pm, monkeypatch):
         pm.publish("Novy projekt", "x")
     assert not pm.server_dir("Novy projekt").exists()
     assert (pm.local_dir("Novy projekt") / "zprava.docx").exists()
+
+
+def test_publish_part_of_folder(pm):
+    local = pm.local_dir("Novy projekt")
+    res = pm.publish("Novy projekt", "jen vykresy", paths=["vykresy/pudorys.dwg"])
+    server = pm.server_dir("Novy projekt")
+    assert res.published == 1 and not res.local_deleted
+    assert (server / "vykresy" / "pudorys.dwg").exists() and not (server / "zprava.docx").exists()
+    # zbytek odložen do …_puvodni_… a je „Jen místně“; původní název patří serverovému projektu
+    assert res.leftover is not None and "_puvodni_" in res.leftover.name
+    assert (res.leftover / "zprava.docx").exists()
+    assert not (res.leftover / "vykresy").exists()          # publikované z místní složky pryč
+    assert not local.exists()
+    st = statuses(pm)
+    assert st[res.leftover.name].local_only and not st["Novy projekt"].local_only
+    with ProjectDB.for_project(server) as db:
+        assert set(db.active_files()) == {"vykresy/pudorys.dwg"}
+
+
+def test_publish_part_skips_invalid_names_check_for_unselected(pm):
+    local = pm.local_dir("Novy projekt")
+    (local / "špatný název.txt").write_text("x")
+    with pytest.raises(SyncError, match="nepovolenými"):
+        pm.publish("Novy projekt", "vse")                   # celé – obsahuje vadný název
+    res = pm.publish("Novy projekt", "bez vadneho", paths=["zprava.docx", "vykresy/pudorys.dwg"])
+    assert res.published == 2 and (res.leftover / "špatný název.txt").exists()
+    assert pm.invalid_file_paths(["a/b.txt", "š/c.txt", "d e.txt"]) == ["š/c.txt", "d e.txt"]
+
+
+def test_delete_in_local_only_folder(pm, monkeypatch, tmp_path):
+    import shutil
+
+    from spm import recycle
+    kos = tmp_path / "kos"
+    kos.mkdir()
+    monkeypatch.setattr(recycle, "to_recycle_bin",
+                        lambda paths: [shutil.move(str(p), str(kos / p.name)) for p in paths])
+    assert pm.delete_local_only("Novy projekt", ["zprava.docx"]) == ["zprava.docx"]
+    assert (kos / "zprava.docx").exists()
+    with pytest.raises(SyncError):
+        pm.delete_local_only("Existujici", ["x"])          # projekt na serveru – jinou cestou
