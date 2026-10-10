@@ -19,6 +19,9 @@ MTIME_TOLERANCE = 2.0
 
 Progress = Callable[[int, int, str], None]  # (hotovo, celkem, text)
 
+# Dočasné soubory SPM při kopírování – ignorují se vždy, bez ohledu na nastavení
+TEMP_SUFFIX = ".spmtmp"
+
 
 @dataclass
 class FileInfo:
@@ -42,7 +45,7 @@ def to_abs(root: Path, rel: str) -> Path:
 
 def is_ignored(name: str, patterns: Iterable[str]) -> bool:
     lname = name.lower()
-    return any(fnmatch.fnmatch(lname, p.lower()) for p in patterns)
+    return lname.endswith(TEMP_SUFFIX) or any(fnmatch.fnmatch(lname, p.lower()) for p in patterns)
 
 
 def list_files(root: Path, ignore: Iterable[str] = ()) -> list[Path]:
@@ -102,7 +105,7 @@ def copy_with_hash(src: Path, dst: Path) -> str:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists():
         set_readonly(dst, False)  # soubor jen pro čtení nejde ve Windows nahradit
-    tmp = dst.with_name(dst.name + ".spmtmp")
+    tmp = dst.with_name(dst.name + TEMP_SUFFIX)
     h = hashlib.sha256()
     try:
         with open(src, "rb") as fin, open(tmp, "wb") as fout:

@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
@@ -27,6 +28,7 @@ from ..config import Settings
 from ..db import ProjectDB
 from ..names import format_invalid
 from ..restore import RestoreCatalog, RestoreResult
+from ..shared_config import ERROR as SHARED_ERROR, SharedConfig
 from ..sync import (
     ActivationResult,
     ProjectManager,
@@ -100,6 +102,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = settings
         self.pm = ProjectManager(settings)
+        self.shared = SharedConfig()  # společná konfigurace na síti (spm_config.json)
         self.projects: list[ProjectStatus] = []
         self.name_issues: dict[str, list[str]] = {}  # projekt -> názvy s nepovolenými znaky
         self._name_check: NameCheckThread | None = None
@@ -236,6 +239,8 @@ class MainWindow(QMainWindow):
         return act
 
     def _startup(self) -> None:
+        if self._closing:  # okno zavřené dřív, než se stihlo spustit
+            return
         if not self.settings.is_complete():
             QMessageBox.information(self, "Vítejte", "Nejdříve nastavte síťovou a místní složku.")
             self.open_settings()
@@ -247,6 +252,28 @@ class MainWindow(QMainWindow):
             f"Uživatel: {self.pm.user} @ {self.pm.pc}    |    Server: {self.settings.server_root or '—'}"
             f"    |    Místní: {self.settings.local_root or '—'}"
         )
+        self._update_config_label()
+
+    def _update_config_label(self) -> None:
+        if not hasattr(self, "config_label"):
+            self.config_label = QLabel()
+            self.statusBar().addPermanentWidget(self.config_label)
+        state = self.shared.state
+        self.config_label.setText(f"Nastavení: {state.describe()}")
+        tip = str(state.path) if state.active else "Společná konfigurace na síti neexistuje."
+        if state.error:
+            tip += f"\n{state.error}"
+        self.config_label.setToolTip(tip)
+        self.config_label.setStyleSheet("color: #c0392b;" if state.status == SHARED_ERROR else "")
+
+    def _sync_shared(self) -> bool:
+        """Načte společnou konfiguraci ze sítě (jen při změně souboru) a převezme ji do nastavení."""
+        try:
+            changed = self.shared.sync(self.settings)
+        except Exception:  # noqa: BLE001 – nedostupná síť apod. nesmí zastavit obnovení
+            changed = False
+        self._update_config_label()
+        return changed
 
     # --- seznam projektů -----------------------------------------------------
 
@@ -280,6 +307,8 @@ class MainWindow(QMainWindow):
         current = self.selected().name if self.selected() else self.settings.ui.get("last_project")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
+            if self._sync_shared() and not check_names:
+                check_names = True  # změnila se kontrola znaků / ignorované soubory
             self.projects = self.pm.list_projects()
         except Exception as e:  # noqa: BLE001
             self.projects = []
@@ -812,7 +841,11 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def open_settings(self) -> None:
-        if SettingsDialog(self.settings, self).exec():
+        self._sync_shared()  # dialog má ukázat aktuální stav souboru na síti
+        dlg = SettingsDialog(self.settings, self.shared.state, self)
+        if dlg.exec():
             self._update_status_bar()
             self._apply_refresh_timer()
+            self.refresh()
+        elif dlg.exported:  # export na síť a pak Zrušit -> převzít, co je na síti
             self.refresh()
