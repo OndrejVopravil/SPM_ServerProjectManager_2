@@ -145,11 +145,15 @@ def test_tabs_switch_projects(window):
 
 def test_tab_shows_count_of_my_activated_projects(window):
     w = window
+    from spm.gui.main_window import COLOR_MINE
+    assert w.tabs.tabTextColor(0) != COLOR_MINE
     w.pm.activate("058768")
     w.refresh(check_names=False)
     assert w.tabs.tabText(0) == "Nástrojárna (1)"
+    assert w.tabs.tabTextColor(0) == COLOR_MINE                      # zeleně = mám tu aktivovaný projekt
     w.tabs.setCurrentIndex(1)
     assert w.tabs.tabText(0) == "Nástrojárna (1)" and w.tabs.tabText(1) == "Výroba"
+    assert w.tabs.tabTextColor(0) == COLOR_MINE and w.tabs.tabTextColor(1) != COLOR_MINE
 
 
 def test_remove_tab_refused_with_activated_projects(window, monkeypatch):

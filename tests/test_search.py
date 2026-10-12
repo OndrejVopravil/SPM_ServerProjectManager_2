@@ -52,3 +52,15 @@ def test_filter_survives_refresh(window):
     window.search.setText("sklad")
     window.refresh()
     assert visible(window) == ["Sklad Ostrava"]
+
+
+def test_wildcard_matcher():
+    from spm.gui.search import wildcard_matcher
+    m = wildcard_matcher("*xyz")
+    assert m("abcdxyz") and m("bcdxyz") and m("xyz.nc") and not m("xy")
+    m = wildcard_matcher("e*01")
+    assert m("deska_E01.elt") and m("E-01.nc") and not m("E10")
+    assert wildcard_matcher("vykres")("Výkres_1.pdf")            # obsahuje, bez diakritiky
+    assert wildcard_matcher("e0?.nc")("E01.nc") and not wildcard_matcher("e0?.nc")("E0.nc")
+    assert wildcard_matcher("a.b")("a.b") and not wildcard_matcher("a.b")("axb")   # tečka = tečka
+    assert wildcard_matcher("") is None and wildcard_matcher(" * ") is None

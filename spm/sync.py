@@ -128,7 +128,9 @@ class FileEntry:
     local_deleted: bool = False  # můj zamčený soubor, v místní kopii smazaný (do Koše), neodevzdaný
     in_local: bool = False       # soubor je v mé místní kopii (lze ho otevřít)
     renamed_from: str | None = None  # můj soubor přejmenovaný v místní kopii (původní cesta)
-    mirror: str | None = None    # soubor spravuje zrcadlo z jiného serveru (zdrojový projekt)
+    mirror: str | None = None    # soubor spravuje zrcadlo z jiného serveru (cesta zdrojového projektu)
+    mirror_server_id: str = ""   # identita zdrojové síťové složky (pro název záložky)
+    mirror_server_name: str = ""
 
     @property
     def free(self) -> bool:
@@ -181,10 +183,14 @@ class UploadPlan:
         return bool(self.modified or self.missing or self.new)
 
 
-def mirror_lock_error(paths: list[str], sources: list[str]) -> str:
+def mirror_lock_error(paths: list[str], sources: list[str], labels: dict) -> str:
+    """labels: zdroj -> MirrorSource (čitelný popis místo identifikátoru projektu)."""
+    def label(source: str) -> str:
+        info = labels.get(source)
+        return info.label if info else source
     return ("Soubory spravuje zrcadlo z jiného serveru – nelze je zamknout ani upravit zde, "
             "změny se dělají ve zdroji:\n" + "\n".join(
-                f"{p} – zrcadlo z {s}" for p, s in list(zip(paths, sources))[:15]))
+                f"{p} – zrcadlo z {label(s)}" for p, s in list(zip(paths, sources))[:15]))
 
 
 def new_key(path: str) -> str:
@@ -358,18 +364,24 @@ class ProjectManager:
         files: dict[str, DbFile] = {}
         owners: dict[str, LockOwner] = {}
         mirrored: dict[str, tuple[str, str]] = {}
+        sources: dict = {}
         if db_path(server).exists():
             with ProjectDB.for_project(server) as db:
                 files = db.active_files(include_pending=True)
                 owners = db.lock_owners()
                 mirrored = db.mirrored()
+                sources = db.mirror_sources() if mirrored else {}
         result = []
         for path in paths:
             f = files.get(path)
             owner = owners.get(f.file_id) if f else None
-            source = mirrored.get(f.file_id) if f else None
-            result.append(FileEntry(path, owner, bool(owner and owner.is_me(self.user, self.pc)),
-                                    mirror=source[0] if source else None))
+            entry = FileEntry(path, owner, bool(owner and owner.is_me(self.user, self.pc)))
+            if f is not None and f.file_id in mirrored:
+                src = sources.get(mirrored[f.file_id][0])
+                entry.mirror = src.label if src else mirrored[f.file_id][0]
+                entry.mirror_server_id = src.server_id if src else ""
+                entry.mirror_server_name = src.server_name if src else ""
+            result.append(entry)
         return result
 
     def local_new_files(self, name: str) -> list[str]:
@@ -577,7 +589,8 @@ class ProjectManager:
                     if f is not None and f.file_id in mirrored:
                         if lock_paths is None:
                             continue  # „všechny volné“ – soubory spravované zrcadlem nejsou volné
-                        raise SyncError(mirror_lock_error([p], [mirrored[f.file_id][0]]))
+                        raise SyncError(mirror_lock_error([p], [mirrored[f.file_id][0]],
+                                                          db.mirror_sources()))
                     if f is None:
                         if p in on_server:
                             # soubor zatím není v evidenci (první aktivace / přidán mimo aplikaci):
@@ -910,7 +923,7 @@ class ProjectManager:
             blocked = [p for p in paths if files[p].file_id in mirrored]
             if blocked:
                 raise SyncError(mirror_lock_error(
-                    blocked, [mirrored[files[p].file_id][0] for p in blocked]))
+                    blocked, [mirrored[files[p].file_id][0] for p in blocked], db.mirror_sources()))
             owners = db.lock_owners()
             taken = db.lock(sid, [files[p].file_id for p in paths])
             if taken:

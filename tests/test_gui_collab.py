@@ -274,10 +274,10 @@ def test_panel_context_actions_and_preselection(app, pms, tmp_path, monkeypatch)
     app.processEvents()
 
     ca = w.panel.context_actions
-    assert ca("sestava/elektrody/E01.elt") == {"open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True}
-    assert ca("sestava/sestava.elt") == {"open": True, "submit": False, "take": False, "publish": False, "delete": False, "rename": False}  # drží alice, jen pro čtení
-    assert ca("dily/deska.elt") == {"open": True, "submit": False, "take": True, "publish": False, "delete": False, "rename": False}  # volný, jen pro čtení
-    assert ca("sestava/") == {"open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False}
+    assert ca("sestava/elektrody/E01.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True}
+    assert ca("sestava/sestava.elt") == {"activate": False, "open": True, "submit": False, "take": False, "publish": False, "delete": False, "rename": False}  # drží alice, jen pro čtení
+    assert ca("dily/deska.elt") == {"activate": False, "open": True, "submit": False, "take": True, "publish": False, "delete": False, "rename": False}  # volný, jen pro čtení
+    assert ca("sestava/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False}
 
     # menu panelu -> dialogy hlavního okna s předvýběrem
     got = []
@@ -364,8 +364,8 @@ def test_panel_shows_new_local_files(app, pms, tmp_path, monkeypatch):
     item = find(w.panel.tree, "sestava/elektrody/E03.elt")
     assert item.text(1) == "nový – neodevzdaný"
     assert item.foreground(0).color() == w.panel.palette().color(QPalette.ColorRole.PlaceholderText)
-    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True}
-    assert w.panel.context_actions("nc/") == {"open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False}
+    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True}
+    assert w.panel.context_actions("nc/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False}
     assert "nové neodevzdané: <b>2</b>" in w.panel.summary.text()
 
     w.panel._on_double_click(item, 0)
@@ -421,7 +421,7 @@ def test_panel_delete_to_recycle_bin(app, pms, tmp_path, monkeypatch):
 
     assert sorted(w.panel.deletable("sestava/")) == ["sestava/elektrody/E01.elt", "sestava/elektrody/E09.elt"]
     w.panel._delete("sestava/")
-    assert "2 dalších souborů ve složce nemáte zamčených" in questions[0]   # sestava.elt + E02
+    assert "2 dalších označených souborů nemáte zamčených" in questions[0]   # sestava.elt + E02
     assert sorted(p.name for p in kos.iterdir()) == ["E01.elt", "E09.elt"]
     settle_panel(w.panel)
     app.processEvents()
@@ -495,7 +495,7 @@ def test_panel_for_local_only_folder(app, pms, tmp_path, monkeypatch):
     settle_panel(w.panel)
     app.processEvents()
     assert sorted(e.path for e in w.panel.entries) == ["dily/deska.elt", "dily/kolik.elt", "poznamky.txt"]
-    assert w.panel.context_actions("dily/") == {"open": False, "submit": False, "take": False,
+    assert w.panel.context_actions("dily/") == {"activate": False, "open": False, "submit": False, "take": False,
                                                 "publish": True, "delete": True, "rename": False}
     assert w.panel.context_actions("poznamky.txt")["open"] is True
     w.panel._on_double_click(find(w.panel.tree, "poznamky.txt"), 0)
@@ -574,4 +574,112 @@ def test_panel_rename_with_f2(app, pms, tmp_path, monkeypatch):
     assert not any(e.path == "dily/deska.elt" for e in w.panel.entries)        # ne „smazán“
     keys = {a.shortcut().toString() for a in w.panel.tree.actions()}
     assert "F2" in keys
+    w.close()
+
+
+def _window(app, pm, tmp_path, monkeypatch):
+    from spm import config
+    from spm.gui.main_window import MainWindow
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    w = MainWindow(pm.settings)
+    w.pm = w.panel.pm = pm
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    settle_panel(w.panel)
+    app.processEvents()
+    return w
+
+
+def select(tree, *paths):
+    from PySide6.QtWidgets import QAbstractItemView
+    assert tree.selectionMode() == QAbstractItemView.SelectionMode.ExtendedSelection
+    tree.clearSelection()
+    for p in paths:
+        find(tree, p).setSelected(True)
+
+
+def test_panel_multi_select_actions(app, pms, tmp_path, monkeypatch):
+    alice, bob = pms
+    bob.activate("Forma", lock_paths=["sestava/elektrody/E01.elt", "dily/deska.elt"])
+    w = _window(app, bob, tmp_path, monkeypatch)
+    select(w.panel.tree, "sestava/elektrody/E01.elt", "dily/deska.elt")
+    scopes = w.panel.selected_scopes()
+    assert sorted(scopes) == ["dily/deska.elt", "sestava/elektrody/E01.elt"]
+    actions = w.panel.context_actions(scopes)
+    assert actions["submit"] and actions["delete"] and actions["open"]
+    assert not actions["rename"]                                  # přejmenovat jen jeden soubor
+    assert not actions["take"]                                    # oba už držím
+    select(w.panel.tree, "sestava/elektrody/E02.elt", "sestava/sestava.elt")
+    assert w.panel.context_actions(w.panel.selected_scopes())["take"]
+    w.close()
+
+
+def test_panel_multi_select_preselects_in_dialogs(app, pms, tmp_path, monkeypatch):
+    from spm.gui import main_window
+    alice, bob = pms
+    bob.activate("Forma", lock_paths=["dily/deska.elt"])
+    w = _window(app, bob, tmp_path, monkeypatch)
+    seen = {}
+
+    class FakeDialog:
+        def __init__(self, title, intro, entries, ok, parent, **kw):
+            from spm.gui.check_tree import in_scope
+            seen["checked"] = sorted(e.path for e in entries if e.free and in_scope(e.path, kw["preselect"]))
+        def selected_paths(self):
+            return []
+        def skip_unlocked(self):
+            return False
+        def deleteLater(self):
+            pass
+    monkeypatch.setattr(main_window, "FileSelectDialog", FakeDialog)
+    monkeypatch.setattr(w, "_exec_dialog", lambda dlg, key: False)
+    w.panel.take_requested.emit(["sestava/elektrody/E02.elt", "sestava/sestava.elt"])
+    assert seen["checked"] == ["sestava/elektrody/E02.elt", "sestava/sestava.elt"]
+    w.close()
+
+
+def test_panel_activate_with_selection_on_inactive_project(app, pms, tmp_path, monkeypatch):
+    from spm.gui import main_window
+    alice, bob = pms
+    w = _window(app, bob, tmp_path, monkeypatch)
+    select(w.panel.tree, "sestava/elektrody/E01.elt", "dily")
+    actions = w.panel.context_actions(w.panel.selected_scopes())
+    assert actions["activate"] and not actions["submit"] and not actions["take"]
+    seen = {}
+
+    class FakeDialog:
+        def __init__(self, title, intro, entries, ok, parent, **kw):
+            seen["preselect"] = kw["preselect"]
+        def selected_paths(self):
+            return []
+        def skip_unlocked(self):
+            return False
+        def deleteLater(self):
+            pass
+    monkeypatch.setattr(main_window, "FileSelectDialog", FakeDialog)
+    monkeypatch.setattr(w, "_exec_dialog", lambda dlg, key: False)
+    w.panel.activate_requested.emit(w.panel.selected_scopes())
+    assert sorted(seen["preselect"]) == ["dily/", "sestava/elektrody/E01.elt"]
+    w.close()
+
+
+def test_panel_delete_key_deletes_selection(app, pms, tmp_path, monkeypatch):
+    import shutil
+
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import QMessageBox
+
+    from spm import recycle
+    kos = tmp_path / "kos"
+    kos.mkdir()
+    monkeypatch.setattr(recycle, "to_recycle_bin",
+                        lambda paths: [shutil.move(str(p), str(kos / p.name)) for p in paths])
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    alice, bob = pms
+    bob.activate("Forma", lock_paths=["sestava/elektrody/E01.elt", "dily/deska.elt"])
+    w = _window(app, bob, tmp_path, monkeypatch)
+    select(w.panel.tree, "sestava/elektrody/E01.elt", "dily/deska.elt", "sestava/sestava.elt")
+    delete = next(a for a in w.panel.tree.actions() if a.shortcut().toString() == "Del")
+    delete.trigger()
+    assert sorted(p.name for p in kos.iterdir()) == ["E01.elt", "deska.elt"]    # cizí/volný zůstal
     w.close()

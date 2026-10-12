@@ -35,7 +35,7 @@ class FileSelectDialog(QDialog):
     def __init__(self, title: str, intro: str, entries: list[FileEntry], ok_text: str,
                  parent: QWidget | None = None, allow_empty: bool = True, root: Path | None = None,
                  preselect: str | None = None, skip_option: bool | None = None,
-                 mirror_label: Callable[[str], str] = lambda source: source):
+                 mirror_label: Callable[[FileEntry], str] = lambda entry: entry.mirror or ""):
         """root: složka, kde soubory skutečně leží (pro jejich ikony).
         preselect: soubor nebo složka (zakončená '/'), jejíž volné soubory budou předem zaškrtnuté.
         skip_option: zobrazit volbu „Nestahovat neaktivované soubory“ s tímto výchozím stavem
@@ -49,7 +49,7 @@ class FileSelectDialog(QDialog):
         checked = {e.path for e in entries if e.free and in_scope(e.path, preselect)}
         self.tree.set_entries([
             TreeEntry(e.path, e.path,
-                      [e.holder, f"← {mirror_label(e.mirror)}" if e.mirror else ""],
+                      [e.holder, f"← {mirror_label(e)}" if e.mirror else ""],
                       enabled=e.free,
                       color=None if e.free else (COLOR_MINE if e.mine else
                                                  COLOR_MIRROR if e.mirror else COLOR_TAKEN),

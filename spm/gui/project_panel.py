@@ -13,8 +13,9 @@ from collections import Counter
 from typing import Callable
 
 from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QHBoxLayout,
     QInputDialog,
@@ -30,10 +31,12 @@ from PySide6.QtWidgets import (
 from ..scanner import to_abs
 from ..sync import FileEntry, ProjectManager, ProjectStatus, validate_file_name
 from .check_tree import KEY_ROLE, PATH_ROLE, CheckTree, TreeEntry, in_scope
+from .search import wildcard_matcher
 
 COLOR_MINE = QColor("#2e8b57")
 COLOR_MIRROR = QColor("#8e44ad")  # spravuje zrcadlo z jiného serveru (jen pro čtení)
 COLOR_OTHER = QColor("#c0392b")
+COLOR_FOUND = QColor("#fff176")  # podbarvení souborů nalezených hledáním
 
 
 class EntriesThread(QThread):
@@ -76,9 +79,11 @@ class EntriesThread(QThread):
 
 class ProjectPanel(QWidget):
     # pravé tlačítko ve stromu: soubor nebo složka (zakončená '/'), která se má předvybrat
-    submit_requested = Signal(str)
-    take_requested = Signal(str)
-    publish_requested = Signal(str)   # složka „Jen místně“
+    # předvýběr: seznam označených souborů a složek (složka zakončená '/')
+    submit_requested = Signal(object)
+    take_requested = Signal(object)
+    activate_requested = Signal(object)  # projekt, který nemám aktivovaný
+    publish_requested = Signal(object)   # složka „Jen místně“
 
     def __init__(self, pm: ProjectManager, parent: QWidget | None = None):
         super().__init__(parent)
@@ -91,16 +96,30 @@ class ProjectPanel(QWidget):
         # pravidla zrcadlení, kde je záložka projektu zdrojem: () -> [(název cíle, shoda(projekt, cesta))]
         self.mirror_matchers: Callable[[], list[tuple[str, Callable[[str, str], bool]]]] | None = None
         # popis zdroje zrcadla (cesta zdrojového projektu -> např. název záložky)
-        self.mirror_source_label: Callable[[str], str] = lambda source: source
+        self.mirror_source_label: Callable[[FileEntry], str] = lambda entry: entry.mirror or ""
+        # lze vybraný projekt aktivovat? (nastaví hlavní okno – např. nepovolené znaky)
+        self.can_activate: Callable[[], bool] = lambda: False
 
         self.title = QLabel()
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.only_locked = QCheckBox("Jen zamčené soubory")
         self.only_locked.toggled.connect(self._fill)
+        # hledání v názvech souborů („obsahuje“, * = cokoliv); nalezené se podbarví žlutě
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Hledat soubor…  (* = cokoliv, Esc zruší)")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMaximumWidth(300)
+        self.search.textChanged.connect(lambda _: self._apply_search(scroll=True))
+        self.found = QLabel()
+        clear = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        clear.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)  # jen v panelu (pole, strom)
+        clear.activated.connect(self.search.clear)
         head = QHBoxLayout()
         head.addWidget(self.title)
         head.addStretch()
+        head.addWidget(self.found)
+        head.addWidget(self.search)
         head.addWidget(self.only_locked)
 
         self.tree = CheckTree(["Soubor", "Drží", "Zrcadlo"], checkable=False)
@@ -112,6 +131,13 @@ class ProjectPanel(QWidget):
         rename.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         rename.triggered.connect(lambda: self.rename_selected())
         self.tree.addAction(rename)
+        # víc souborů najednou: Ctrl = přidat / odebrat položku, Shift = rozsah
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        delete = QAction(self.tree)
+        delete.setShortcut(QKeySequence(Qt.Key.Key_Delete))
+        delete.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        delete.triggered.connect(lambda: self.delete_selected())
+        self.tree.addAction(delete)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.addLayout(head)
@@ -231,6 +257,14 @@ class ProjectPanel(QWidget):
             + f" &nbsp;|&nbsp; na serveru celkem: {len(self.entries) - new}"
             + self._mark_mirror())
 
+    def _apply_search(self, scroll: bool = False) -> None:
+        """Podbarví žlutě soubory, jejichž název obsahuje hledaný text (s * jako „cokoliv“)."""
+        match = wildcard_matcher(self.search.text())
+        found = self.tree.highlight(match, COLOR_FOUND)
+        self.found.setText(f"Nalezeno: {len(found)}" if match else "")
+        if scroll and found:
+            self.tree.scrollToItem(found[0])
+
     def _mark_mirror(self) -> str:
         """Sloupec Zrcadlo (zobrazený vždy):
         - „← zdroj“ u souborů, které sem zrcadlo přináší z jiného serveru (jen pro čtení),
@@ -247,7 +281,7 @@ class ProjectPanel(QWidget):
                 continue
             labels, tips = [], []
             if e.mirror:
-                source = self.mirror_source_label(e.mirror)
+                source = self.mirror_source_label(e)
                 labels.append(f"← {source}")
                 tips.append(f"Soubor spravuje zrcadlo z {e.mirror} – zde ho nelze převzít ani "
                             "upravit, změny se dělají ve zdroji.")
@@ -268,37 +302,54 @@ class ProjectPanel(QWidget):
                              "Počet souborů ve složce: " + ", ".join(
                                  f"{label}: {n}" for label, n in sorted(counter.items())))
         self.tree.set_column_texts(2, texts, COLOR_MIRROR)
+        self._apply_search()  # strom je nově naplněný – znovu podbarvit nalezené
         if not matchers:
             return ""
         targets = sorted({name for name, _ in matchers})
         return (f" &nbsp;|&nbsp; zrcadlí se: <b>{outgoing}</b> → {', '.join(targets)}" if outgoing
                 else f" &nbsp;|&nbsp; nic z projektu neodpovídá pravidlům zrcadlení do {', '.join(targets)}")
 
-    def context_actions(self, scope: str) -> dict[str, bool]:
-        """Které akce kontextového menu jsou pro soubor / složku dostupné."""
+    def selected_scopes(self) -> list[str]:
+        """Označené položky stromu (Ctrl / Shift = víc najednou): soubory a složky ('/' na konci)."""
+        return [item.data(0, PATH_ROLE) for item in self.tree.selectedItems()]
+
+    def context_actions(self, scope: str | list[str]) -> dict[str, bool]:
+        """Které akce kontextového menu jsou pro soubor / složku (nebo víc označených) dostupné."""
+        scopes = [scope] if isinstance(scope, str) else list(scope)
         local_only = bool(self.project and self.project.local_only)
         mine_project = bool(self.project and self.project.mine)
-        inside = [e for e in self.entries if in_scope(e.path, scope)]
+        inside = [e for e in self.entries if in_scope(e.path, scopes)]
         own = any(e.mine or e.local_new for e in inside)  # zamčené mnou nebo moje nové
+        any_folder = any(s.endswith("/") for s in scopes)
+        single_file = len(scopes) == 1 and not any_folder
         return {
+            # projekt, který nemám aktivovaný: aktivace s předvybranými soubory
+            "activate": (not local_only and not mine_project and self.can_activate()
+                         and any(e.free for e in inside)),
             # otevřít jde jakýkoliv soubor, který je v místní kopii (cizí a volné jen pro čtení)
-            "open": not scope.endswith("/") and any(e.in_local for e in inside),
+            "open": not any_folder and any(e.in_local for e in inside),
             # u složky vždy – dialog odevzdání ukáže, co v ní skutečně je
-            "submit": mine_project and (scope.endswith("/") or own),
+            "submit": mine_project and (any_folder or own),
             "take": mine_project and any(e.free for e in inside),
             "publish": local_only and bool(inside),
-            "delete": (local_only or mine_project) and bool(self.deletable(scope)),
+            "delete": (local_only or mine_project) and bool(self.deletable(scopes)),
             # přejmenovat: jen jeden soubor, a to můj (zamčený / nový) a v místní kopii
-            "rename": (not scope.endswith("/") and (local_only or mine_project)
+            "rename": (single_file and (local_only or mine_project)
                        and any((e.mine or e.local_new) and e.in_local and not e.local_deleted
                                for e in inside)),
         }
 
     def rename_selected(self) -> None:
-        """F2 – přejmenovat vybraný soubor."""
-        item = self.tree.currentItem()
-        if item is not None:
-            self._rename(item.data(0, PATH_ROLE))
+        """F2 – přejmenovat vybraný soubor (jen když je označený jediný)."""
+        scopes = self.selected_scopes()
+        if len(scopes) == 1:
+            self._rename(scopes[0])
+
+    def delete_selected(self) -> None:
+        """Delete – smazat označené soubory a složky (do Koše)."""
+        scopes = self.selected_scopes()
+        if scopes and self.context_actions(scopes)["delete"]:
+            self._delete(scopes)
 
     def _rename(self, path: str) -> None:
         if self.project is None or not self.context_actions(path)["rename"]:
@@ -326,13 +377,13 @@ class ProjectPanel(QWidget):
             QMessageBox.critical(self, "Přejmenovat soubor", str(e))
         self.reload()
 
-    def deletable(self, scope: str) -> list[str]:
+    def deletable(self, scope: str | list[str]) -> list[str]:
         """Soubory v rozsahu, které smím smazat: zamčené mnou nebo moje nové (a ještě nesmazané);
         u složky „Jen místně“ všechny."""
         return [e.path for e in self.entries if in_scope(e.path, scope)
                 and (e.mine or e.local_new) and not e.local_deleted]
 
-    def _delete(self, scope: str) -> None:
+    def _delete(self, scope: str | list[str]) -> None:
         paths = self.deletable(scope)
         others = [e.path for e in self.entries if in_scope(e.path, scope)
                   and not (e.mine or e.local_new) and not e.local_deleted]
@@ -345,7 +396,7 @@ class ProjectPanel(QWidget):
             text = (f"Přesunout do Koše {len(paths)} souborů z vaší místní kopie?\n\n{lines}\n\n"
                     "Na serveru se smažou až při odevzdání (a i tam se jen přesunou do koše projektu).")
         if others:
-            text += (f"\n\n{len(others)} dalších souborů ve složce nemáte zamčených – ty zůstanou.")
+            text += (f"\n\n{len(others)} dalších označených souborů nemáte zamčených – ty zůstanou.")
         answer = QMessageBox.question(self, "Smazat", text)
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -362,62 +413,90 @@ class ProjectPanel(QWidget):
         item = self.tree.itemAt(pos)
         if item is None or self.project is None:
             return
-        scope = item.data(0, PATH_ROLE)
-        enabled = self.context_actions(scope)
+        # akce platí pro všechny označené položky (Ctrl / Shift); klepnutí mimo výběr = jen tato
+        scopes = self.selected_scopes() if item.isSelected() else [item.data(0, PATH_ROLE)]
+        enabled = self.context_actions(scopes)
+        many = f" ({len(scopes)} označených)" if len(scopes) > 1 else ""
         menu = QMenu(self)
-        act_open = menu.addAction("Otevřít")
+        act_open = menu.addAction("Otevřít" + many)
         act_open.setEnabled(enabled["open"])
         menu.addSeparator()
-        act_submit = act_take = act_publish = None
+        act_activate = act_submit = act_take = act_publish = None
         if self.project.local_only:
-            act_publish = menu.addAction("Publikovat…")
+            act_publish = menu.addAction("Publikovat…" + many)
             act_publish.setEnabled(enabled["publish"])
+        elif not self.project.mine:
+            act_activate = menu.addAction("Aktivovat…" + many)
+            act_activate.setEnabled(enabled["activate"])
         else:
-            act_submit = menu.addAction("Odevzdat…")
+            act_submit = menu.addAction("Odevzdat…" + many)
             act_submit.setEnabled(enabled["submit"])
-            act_take = menu.addAction("Převzít…")
+            act_take = menu.addAction("Převzít…" + many)
             act_take.setEnabled(enabled["take"])
         menu.addSeparator()
         act_rename = menu.addAction("Přejmenovat…\tF2")
         act_rename.setEnabled(enabled["rename"])
-        act_delete = menu.addAction("Smazat… (do Koše)")
+        act_delete = menu.addAction("Smazat… (do Koše)" + many + "\tDel")
         act_delete.setEnabled(enabled["delete"])
         if not self.project.mine and not self.project.local_only:
             menu.addSeparator()
-            note = menu.addAction("Pro odevzdání a převzetí projekt nejdřív aktivujte")
+            note = menu.addAction("Odevzdat a převzít lze až u aktivovaného projektu")
             note.setEnabled(False)
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
         if chosen is act_open:
-            self._on_double_click(item, 0)
+            self._open([s for s in scopes if not s.endswith("/")])
+        elif chosen is act_activate:
+            self.activate_requested.emit(scopes)
         elif chosen is act_publish:
-            self.publish_requested.emit(scope)
+            self.publish_requested.emit(scopes)
         elif chosen is act_rename:
-            self._rename(scope)
+            self._rename(scopes[0])
         elif chosen is act_submit:
-            self.submit_requested.emit(scope)
+            self.submit_requested.emit(scopes)
         elif chosen is act_take:
-            self.take_requested.emit(scope)
+            self.take_requested.emit(scopes)
         elif chosen is act_delete:
-            self._delete(scope)
+            self._delete(scopes)
+
+    OPEN_CONFIRM_OVER = 10  # při otevírání víc souborů najednou se nejdřív zeptat
+
+    def _open(self, paths: list[str]) -> None:
+        """Otevře soubory z místní kopie (ty, které v ní jsou)."""
+        entries = [e for e in self.entries if e.path in paths and e.in_local]
+        if len(entries) > self.OPEN_CONFIRM_OVER:
+            answer = QMessageBox.question(self, "Otevřít soubory",
+                                          f"Otevřít najednou {len(entries)} souborů?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        for e in entries:
+            if not self._open_file(e.path):
+                break
 
     def _on_double_click(self, item: QTreeWidgetItem, _column: int) -> None:
         """Dvojklik na soubor, který je v místní kopii, ho otevře výchozí aplikací Windows
         (jako dvojklik v Průzkumníku). Soubory, které nemám zamčené, jsou jen pro čtení."""
         path = item.data(0, KEY_ROLE)
+        if path:
+            self._open_file(path)
+
+    def _open_file(self, path: str) -> bool:
+        """Otevře jeden soubor z místní kopie; False = nepodařilo se (chyba už ohlášena)."""
         entry = next((e for e in self.entries if e.path == path), None)
         if self.project is None or entry is None or not entry.in_local:
-            return
+            return True
         local = to_abs(self.pm.local_dir(self.project.name), path)
         if not local.exists():
             QMessageBox.warning(self, "Otevřít soubor",
                                 f"Soubor v místní kopii neexistuje (byl přejmenován nebo smazán?):\n{local}")
-            return
+            return False
         try:
             os.startfile(local)
         except OSError as e:
             QMessageBox.critical(self, "Otevřít soubor", f"Soubor nelze otevřít:\n{local}\n\n{e}")
+            return False
+        return True
 
     def stop(self) -> None:
         """Volá se při zavírání okna: počká na načítání a další výsledky zahodí."""

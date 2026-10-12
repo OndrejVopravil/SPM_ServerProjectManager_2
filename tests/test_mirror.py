@@ -173,8 +173,15 @@ def test_file_held_on_target_is_conflict(env):
     res = Mirror(alice_o, alice_w, [rule(files="*.nc")]).sync_project("058768")
     assert any("E01.nc" in c and "bob" in c for c in res.conflicts)
     assert (w / "058768" / "dily/nc_codes/E01.nc").read_text(encoding="utf-8") == "verze z W"
+    with ProjectDB.for_project(o / "058768") as db:
+        source = db.project_id()
     with ProjectDB.for_project(w / "058768") as db:
-        assert db.mirror_synced(str(o / "058768")) is None      # s konfliktem se příště zkusí znovu
+        assert db.mirror_synced(source) is None                 # s konfliktem se příště zkusí znovu
+    # po uvolnění zámku proběhne celé a stav se zapíše
+    bob_w.cancel_activation("058768")
+    assert Mirror(alice_o, alice_w, [rule(files="*.nc", exclude="stare")]).sync_project("058768").ok
+    with ProjectDB.for_project(w / "058768") as db:
+        assert db.mirror_synced(source) is not None
 
 
 def test_forbidden_name_on_target_not_mirrored(env):

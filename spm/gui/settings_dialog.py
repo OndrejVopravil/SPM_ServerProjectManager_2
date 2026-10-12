@@ -78,6 +78,16 @@ class SettingsDialog(QDialog):
             "při každé aktivaci ho lze změnit. Zapnuto = stáhnou se jen zamčené soubory.")
         self.skip_unlocked.setChecked(settings.skip_unlocked_download)
 
+        self.warn_exit = QCheckBox("Při ukončení upozornit na aktivované projekty")
+        self.warn_exit.setChecked(settings.warn_active_on_exit)
+
+        self.mirror_enabled = QCheckBox("Zrcadlit z tohoto počítače (pravidla v okně Zrcadlení)")
+        self.mirror_enabled.setToolTip(
+            "Po odevzdání se soubory zrcadlí podle pravidel do jiných síťových složek.\n"
+            "Vypněte, pokud do cílové složky nemáte právo zapisovat (sdílená pravidla platí\n"
+            "pro všechny, kdo mají zdroj i cíl jako záložky).")
+        self.mirror_enabled.setChecked(settings.mirror_enabled)
+
         auto_on = settings.auto_refresh_seconds > 0
         self.auto_refresh = QCheckBox("Automaticky obnovovat seznam projektů")
         self.auto_refresh.setToolTip("Vypnuto: seznam se obnoví při spuštění, tlačítkem Obnovit (F5) "
@@ -130,6 +140,8 @@ class SettingsDialog(QDialog):
         form.addRow(self.delete_local)
         form.addRow("Min. shoda pro návrh přejmenování:", self.threshold)
         form.addRow(self.skip_unlocked)
+        form.addRow(self.warn_exit)
+        form.addRow(self.mirror_enabled)
         form.addRow(self.auto_refresh)
         refresh_row = QWidget()
         refresh_lay = QHBoxLayout(refresh_row)
@@ -179,10 +191,18 @@ class SettingsDialog(QDialog):
 
     def _update_shared_ui(self) -> None:
         s = self.shared
-        locked = s.active and not self.editing_shared
-        for w in self._shared_widgets():
-            w.setEnabled(not locked)
-        self.backup_count.setEnabled(not locked and self.backup_enabled.isChecked())
+
+        def locked(key: str) -> bool:
+            """Zamčené je jen nastavení, které síťový soubor opravdu obsahuje (chybějící je místní)."""
+            if self.editing_shared or not s.active:
+                return False
+            return s.status == sc.ERROR or key in s.values
+
+        widgets = {"backup_enabled": self.backup_enabled, "backup_count": self.backup_count,
+                   "ignore_patterns": self.ignore, "check_forbidden_chars": self.check_chars}
+        for key, w in widgets.items():
+            w.setEnabled(not locked(key))
+        self.backup_count.setEnabled(not locked("backup_count") and self.backup_enabled.isChecked())
         path = html.escape(str(s.path)) if s.path else ""
         if self.editing_shared:
             text = f"Úpravy se po stisknutí OK uloží do <b>{path}</b> a budou platit pro všechny uživatele."
@@ -299,6 +319,8 @@ class SettingsDialog(QDialog):
         s.delete_local_after_deactivate = self.delete_local.isChecked()
         s.rename_threshold = self.threshold.value() / 100
         s.skip_unlocked_download = self.skip_unlocked.isChecked()
+        s.warn_active_on_exit = self.warn_exit.isChecked()
+        s.mirror_enabled = self.mirror_enabled.isChecked()
         s.auto_refresh_seconds = (self.refresh_seconds.value() if self.auto_refresh.isChecked()
                                   else AUTO_REFRESH_OFF)
         s.save()

@@ -53,6 +53,10 @@ class MirrorError(Exception):
     pass
 
 
+class MirrorPermissionError(MirrorError):
+    """Do cílové síťové složky nemám právo zapisovat."""
+
+
 def split_patterns(text: str) -> list[str]:
     return [p.strip().lower() for p in (text or "").split(";") if p.strip()]
 
@@ -64,23 +68,47 @@ def _any_match(name: str, patterns: list[str]) -> bool:
 
 @dataclass
 class MirrorRule:
+    """Místní pravidlo má zdroj i cíl jako id záložek. Sdílené (ze spm_config.json zdroje) má
+    zdrojem záložku, ze které se načetlo, a cíl jako identitu síťové složky (target_server) –
+    uplatní ho jen uživatel, který má tuto složku jako záložku."""
     source: str                 # id záložky – zdroj
-    target: str                 # id záložky – cíl
+    target: str                 # id záložky – cíl (u sdíleného pravidla "" – viz target_server)
     files: str = ""
     folders: str = ""
     exclude: str = ""
     projects: str = ""
     enabled: bool = True
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    target_server: str = ""     # identita cílové síťové složky (spm_config.json)
+    target_name: str = ""       # název cílové složky (pro zobrazení, když ji uživatel nemá)
+    shared: bool = False        # pravidlo ze spm_config.json zdroje (platí pro všechny)
+
+    FIELDS = ("source", "target", "files", "folders", "exclude", "projects", "enabled", "id",
+              "target_server", "target_name")
+    SHARED_FIELDS = ("id", "target_server", "target_name", "files", "folders", "exclude",
+                     "projects", "enabled")
 
     @classmethod
     def from_dict(cls, data: dict) -> "MirrorRule":
-        known = {k: data[k] for k in ("source", "target", "files", "folders", "exclude", "projects",
-                                      "enabled", "id") if k in data}
+        known = {k: data[k] for k in cls.FIELDS if k in data}
+        known.setdefault("source", "")
+        known.setdefault("target", "")
         return cls(**known)
 
+    @classmethod
+    def from_shared(cls, data: dict, source_ws: str) -> "MirrorRule":
+        rule = cls.from_dict({k: data[k] for k in cls.SHARED_FIELDS if k in data})
+        rule.source, rule.shared = source_ws, True
+        return rule
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        data.pop("shared")
+        return data
+
+    def to_shared(self) -> dict:
+        """Zápis do spm_config.json zdroje (zdroj je dán souborem, cíl identitou složky)."""
+        return {k: getattr(self, k) for k in self.SHARED_FIELDS}
 
     def matches_project(self, name: str) -> bool:
         patterns = split_patterns(self.projects)
@@ -108,7 +136,7 @@ class MirrorRule:
         return ", ".join(parts)
 
     def validate(self) -> str | None:
-        if not self.source or not self.target:
+        if not self.source or not (self.target or self.target_server):
             return "Vyberte zdrojovou i cílovou záložku."
         if self.source == self.target:
             return "Zdroj a cíl musí být různé záložky."
@@ -149,6 +177,7 @@ class _Source:
     files: dict[str, DbFile]       # source file_id -> soubor (jen odpovídající pravidlům)
     all_ids: set[str]              # všechny aktivní soubory zdroje (i neodpovídající)
     last_commit: int | None
+    project_id: str                # trvalá identita zdrojového projektu (klíč zdroje v cíli)
 
 
 class Mirror:
@@ -157,6 +186,9 @@ class Mirror:
     def __init__(self, source_pm, target_pm, rules: list[MirrorRule]):
         self.source_pm, self.target_pm = source_pm, target_pm
         self.rules = [r for r in rules if r.enabled]
+        # dočasné kopie v cíli mají v názvu tento kód – souběžné zrcadlení jiného uživatele
+        # (nebo jiného okna) používá jiné názvy a nesrazí se s tímto
+        self._stage_token = uuid.uuid4().hex[:8]
 
     # --- výběr ---------------------------------------------------------------
 
@@ -180,8 +212,12 @@ class Mirror:
         with ProjectDB.for_project(server) as db:
             active = db.active_files()  # bez souborů, které se právě nahrávají
             last = db.last_commit_id()
+            project_id = db.project_id()
+        if project_id is None:  # starší databáze – identita se jednou založí
+            with self.source_pm._write(server) as db:
+                project_id = db.ensure_project_id()
         files = {f.file_id: f for f in active.values() if f.sha256 and self.matches(name, f.path)}
-        return _Source(files, {f.file_id for f in active.values()}, last)
+        return _Source(files, {f.file_id for f in active.values()}, last, project_id)
 
     def preview(self, progress: Progress | None = None) -> dict[str, list[str]]:
         """Projekt -> zachycené soubory (podle evidence zdroje). Projekty bez evidence mají
@@ -213,6 +249,14 @@ class Mirror:
         return results
 
     def sync_project(self, name: str, progress: Progress | None = None) -> MirrorResult:
+        try:
+            return self._sync_project(name, progress)
+        except PermissionError as e:
+            raise MirrorPermissionError(
+                "Nemáte oprávnění zapisovat do cílové síťové složky:\n"
+                f"{self.target_pm.server_root}\n\n({e})") from None
+
+    def _sync_project(self, name: str, progress: Progress | None) -> MirrorResult:
         res = MirrorResult(name)
         if not self.applies_to(name):
             return res
@@ -222,7 +266,7 @@ class Mirror:
                         "aktivaci.")
             return res
         source_dir = self.source_pm.server_dir(name)
-        source_key = str(source_dir)
+        source_key = src.project_id
         target = self.target_pm.server_dir(name)
         if not self.target_pm.server_root.is_dir():
             raise MirrorError(f"Cílová síťová složka není dostupná:\n{self.target_pm.server_root}")
@@ -236,7 +280,7 @@ class Mirror:
         state = self._target_state(target)
         staged: dict[str, Path] = {}  # source file_id -> dočasná kopie v cíli
         try:
-            todo = [f for f in src.files.values() if self._needs_copy(f, state, target)]
+            todo = [f for f in src.files.values() if self._needs_copy(f, state, target, source_key)]
             for i, f in enumerate(todo):
                 if progress:
                     progress(i, len(todo), f.path)
@@ -245,7 +289,7 @@ class Mirror:
                     res.conflicts.append(f"{f.path} – {problem}")
                     continue
                 dst = to_abs(target, f.path)
-                stage = dst.with_name(dst.name + STAGE_SUFFIX)
+                stage = dst.with_name(f"{dst.name}.{self._stage_token}{STAGE_SUFFIX}")
                 try:
                     sha = copy_with_hash(to_abs(source_dir, f.path), stage)
                 except FileNotFoundError:
@@ -276,16 +320,18 @@ class Mirror:
         by_id = {f.file_id: f for f in files.values()}
         return {"files": files, "by_id": by_id, "mirrored": mirrored, "owners": owners}
 
-    @staticmethod
-    def _mirror_of(state: dict, source_key: str, source_fid: str) -> DbFile | None:
+    def _source_keys(self, name: str, source_key: str) -> set[str]:
+        """Klíč zdroje a dřívější klíč (cesta ke zdrojovému projektu) – převede se při zápisu."""
+        return {source_key, str(self.source_pm.server_dir(name))}
+
+    def _mirror_of(self, state: dict, keys: set[str], source_fid: str) -> DbFile | None:
         for fid, (src, sfid) in state["mirrored"].items():
-            if src == source_key and sfid == source_fid and fid in state["by_id"]:
+            if src in keys and sfid == source_fid and fid in state["by_id"]:
                 return state["by_id"][fid]
         return None
 
-    def _needs_copy(self, f: DbFile, state: dict, target: Path) -> bool:
-        source_key = str(self.source_pm.server_dir(target.name))
-        current = self._mirror_of(state, source_key, f.file_id)
+    def _needs_copy(self, f: DbFile, state: dict, target: Path, source_key: str) -> bool:
+        current = self._mirror_of(state, self._source_keys(target.name, source_key), f.file_id)
         if current is None:
             existing = state["files"].get(f.path)
             if existing is not None and existing.sha256 == f.sha256 and to_abs(target, f.path).exists():
@@ -310,6 +356,11 @@ class Mirror:
             with ProjectDB.for_project(target, create=True) as db:
                 db.ensure_mirror_tables()
                 with db.conn:
+                    source_dir = self.source_pm.server_dir(name)
+                    db.rekey_mirror_source(str(source_dir), source_key)  # dřívější klíč = cesta
+                    db.set_mirror_source(source_key, str(source_dir),
+                                         self.source_pm.settings.server_id,
+                                         self.source_pm.settings.server_name)
                     files = db.active_files(include_pending=True)
                     by_id = {f.file_id: f for f in files.values()}
                     owners = db.lock_owners()
@@ -424,14 +475,42 @@ class Mirror:
         return backup
 
 
+def effective_rules(app_settings) -> list[MirrorRule]:
+    """Platná pravidla všech záložek: má-li zdrojová složka pravidla ve svém spm_config.json,
+    platí ta (sdílená); jinak místní pravidla uživatele s touto záložkou jako zdrojem."""
+    local = rules_from_settings(app_settings.base.mirror_rules)
+    result: list[MirrorRule] = []
+    for ws in app_settings.workspaces:
+        shared = app_settings.view(ws["id"]).shared_mirror_rules
+        if shared is not None:
+            result += [MirrorRule.from_shared(d, ws["id"]) for d in shared]
+        else:
+            result += [r for r in local if r.source == ws["id"]]
+    return result
+
+
+def resolve_target(app_settings, rule: MirrorRule) -> str | None:
+    """Záložka cíle pravidla – u sdíleného podle identity síťové složky. None = uživatel
+    cílovou složku jako záložku nemá (pravidlo se ho netýká)."""
+    ids = [w["id"] for w in app_settings.workspaces]
+    if rule.target in ids:
+        return rule.target
+    if rule.target_server:
+        for ws_id in ids:
+            if app_settings.view(ws_id).server_id == rule.target_server:
+                return ws_id
+    return None
+
+
 def mirrors_for(app_settings, source_ws: str | None = None) -> list[tuple[str, str, list[MirrorRule]]]:
-    """Zapnutá pravidla seskupená podle (zdroj, cíl); jen pravidla, jejichž záložky existují."""
-    ids = {w["id"] for w in app_settings.workspaces}
+    """Zapnutá pravidla seskupená podle (zdrojová záložka, cílová záložka); jen pravidla,
+    jejichž zdroj i cíl má uživatel jako záložky."""
     groups: dict[tuple[str, str], list[MirrorRule]] = {}
-    for rule in rules_from_settings(app_settings.base.mirror_rules):
-        if not rule.enabled or rule.source not in ids or rule.target not in ids:
+    for rule in effective_rules(app_settings):
+        if not rule.enabled or (source_ws is not None and rule.source != source_ws):
             continue
-        if source_ws is not None and rule.source != source_ws:
+        target = resolve_target(app_settings, rule)
+        if target is None or target == rule.source:
             continue
-        groups.setdefault((rule.source, rule.target), []).append(rule)
+        groups.setdefault((rule.source, target), []).append(rule)
     return [(s, t, rules) for (s, t), rules in groups.items()]

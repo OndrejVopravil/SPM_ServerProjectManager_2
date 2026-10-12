@@ -5,10 +5,11 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeySequence, QPalette, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -31,7 +32,7 @@ from ..config import AppSettings, Settings, _same_dir
 from ..db import ProjectDB
 from ..names import format_invalid
 from ..restore import RestoreCatalog, RestoreResult
-from ..shared_config import ERROR as SHARED_ERROR, SharedConfig
+from ..shared_config import ERROR as SHARED_ERROR, NONE as SHARED_NONE, SharedConfig
 from ..sync import (
     ActivationResult,
     ProjectManager,
@@ -42,7 +43,7 @@ from ..sync import (
     UploadResult,
     validate_project_name,
 )
-from ..mirror import Mirror, mirrors_for
+from ..mirror import Mirror, MirrorPermissionError, MirrorRule, mirrors_for, resolve_target
 from .comment_dialog import CommentDialog
 from .mirror_dialog import MirrorDialog, format_mirror_counts, format_mirror_problems
 from .file_select_dialog import FileSelectDialog
@@ -216,6 +217,8 @@ class MainWindow(QMainWindow):
         self.panel.submit_requested.connect(self.submit)
         self.panel.publish_requested.connect(self.publish)
         self.panel.take_requested.connect(self.take)
+        self.panel.activate_requested.connect(self.activate)
+        self.panel.can_activate = lambda: self.act_activate.isEnabled()
         self.panel.mirror_matchers = self._mirror_matchers  # označení zrcadlených souborů ve stromu
         self.panel.mirror_source_label = self.mirror_source_label
         self.splitter = QSplitter(Qt.Orientation.Vertical)
@@ -231,12 +234,19 @@ class MainWindow(QMainWindow):
         self.tabs = QTabBar()
         self.tabs.setExpanding(False)
         self.tabs.setDocumentMode(True)
+        # bez posouvacích šipek – jinak si lišta i s jedinou záložkou rezervuje místo navíc
+        self.tabs.setUsesScrollButtons(False)
+        tab_font = QFont(self.tabs.font())
+        if tab_font.pointSizeF() > 0:  # záložky o něco větší než ostatní text
+            tab_font.setPointSizeF(tab_font.pointSizeF() * 1.2)
+        self.tabs.setFont(tab_font)
         self.tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabs.customContextMenuRequested.connect(self._tab_menu)
         self.btn_add_tab = QToolButton()
         self.btn_add_tab.setText("+")
         self.btn_add_tab.setToolTip("Přidat záložku s další síťovou složkou projektů")
         self.btn_add_tab.setAutoRaise(True)
+        self.btn_add_tab.setFont(tab_font)
         self.btn_add_tab.clicked.connect(lambda: self.add_workspace())
         self._fill_tabs()
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -258,6 +268,8 @@ class MainWindow(QMainWindow):
         focus.triggered.connect(lambda: (self.search.setFocus(), self.search.selectAll()))
         self.addAction(focus)
         clear = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.search)
+        # jen v poli hledání projektů – Esc v panelu stromu ruší hledání souborů
+        clear.setContext(Qt.ShortcutContext.WidgetShortcut)
         clear.activated.connect(self.search.clear)
 
         self.timer = QTimer(self)
@@ -306,13 +318,41 @@ class MainWindow(QMainWindow):
         self.config_label.setStyleSheet("color: #c0392b;" if state.status == SHARED_ERROR else "")
 
     def _sync_shared(self) -> bool:
-        """Načte společnou konfiguraci ze sítě (jen při změně souboru) a převezme ji do nastavení."""
-        try:
-            changed = self.shared.sync(self.settings)
-        except Exception:  # noqa: BLE001 – nedostupná síť apod. nesmí zastavit obnovení
-            changed = False
+        """Načte společnou konfiguraci ze sítě (jen při změně souboru) a převezme ji do nastavení.
+        Kvůli zrcadlení (identita složek, sdílená pravidla) i u ostatních záložek.
+        Vrací, zda se změnilo nastavení aktuální záložky."""
+        changed = False
+        for ws in self.app_settings.workspaces:
+            view = self.app_settings.view(ws["id"])
+            if not view.server_root:
+                continue
+            shared = self._shared.setdefault(ws["id"], SharedConfig())
+            try:
+                ws_changed = shared.sync(view)
+            except Exception:  # noqa: BLE001 – nedostupná síť apod. nesmí zastavit obnovení
+                ws_changed = False
+            if shared.state.status == SHARED_NONE and view.shared_mirror_rules is not None:
+                self._adopt_shared_rules(view)  # soubor zmizel – pravidla zůstanou jako místní
+            if view is self.settings:
+                changed = ws_changed
         self._update_config_label()
         return changed
+
+    def _adopt_shared_rules(self, view: Settings) -> None:
+        """Ze sítě zmizel spm_config.json se sdílenými pravidly: naposledy převzatá pravidla
+        zůstanou jako místní (stejně jako ostatní převzaté hodnoty) a dají se měnit místně."""
+        adopted = []
+        for data in view.shared_mirror_rules or []:
+            rule = MirrorRule.from_shared(data, view.workspace_id)
+            rule.shared = False
+            rule.target = resolve_target(self.app_settings, rule) or ""
+            adopted.append(rule.to_dict())
+        view.shared_mirror_rules = None
+        view.mirror_rules = list(view.mirror_rules) + adopted
+        try:
+            view.save()
+        except OSError:
+            pass
 
     # --- záložky (pracovní prostory) --------------------------------------------
 
@@ -320,10 +360,19 @@ class MainWindow(QMainWindow):
         """Klíč stavu rozhraní, který si pamatuje každá záložka zvlášť (např. poslední projekt)."""
         return f"{key}.{self.settings.workspace_id}"
 
+    def _activated_count(self, ws_id: str) -> int:
+        """Počet mých aktivovaných projektů v záložce (z jejího posledního obnovení)."""
+        return int(self.settings.ui.get(f"activated.{ws_id}") or 0)
+
     def _tab_label(self, ws: dict) -> str:
-        """Název záložky; s počtem mých aktivovaných projektů (z posledního obnovení záložky)."""
-        count = int(self.settings.ui.get(f"activated.{ws['id']}") or 0)
+        """Název záložky; s počtem mých aktivovaných projektů."""
+        count = self._activated_count(ws["id"])
         return f"{ws['name']} ({count})" if count else ws["name"]
+
+    def _style_tab(self, i: int, ws: dict) -> None:
+        """Text záložky; zeleně, pokud v ní mám aktivovaný alespoň jeden projekt."""
+        self.tabs.setTabText(i, self._tab_label(ws))
+        self.tabs.setTabTextColor(i, COLOR_MINE if self._activated_count(ws["id"]) else QColor())
 
     def _fill_tabs(self) -> None:
         self.tabs.blockSignals(True)
@@ -331,7 +380,8 @@ class MainWindow(QMainWindow):
             while self.tabs.count():
                 self.tabs.removeTab(0)
             for ws in self.app_settings.workspaces:
-                i = self.tabs.addTab(self._tab_label(ws))
+                i = self.tabs.addTab("")
+                self._style_tab(i, ws)
                 self.tabs.setTabData(i, ws["id"])
                 self.tabs.setTabToolTip(i, f"Síť: {ws.get('server_root') or '—'}\n"
                                            f"Místní: {ws.get('local_root') or '—'}")
@@ -342,10 +392,12 @@ class MainWindow(QMainWindow):
 
     def _update_tab_label(self) -> None:
         """Po obnovení seznamu: počet mých aktivovaných projektů na aktuální záložce."""
-        self.settings.ui[self._ui_key("activated")] = str(sum(1 for p in self.projects if p.mine))
+        mine = sorted(p.name for p in self.projects if p.mine)
+        self.settings.ui[self._ui_key("activated")] = str(len(mine))
+        self.settings.ui[self._ui_key("activated_names")] = "\n".join(mine)  # pro upozornění při ukončení
         i = self.tabs.currentIndex()
         if i >= 0:
-            self.tabs.setTabText(i, self._tab_label(self.app_settings.workspace(self.settings.workspace_id)))
+            self._style_tab(i, self.app_settings.workspace(self.settings.workspace_id))
 
     def _on_tab_changed(self, index: int) -> None:
         ws_id = self.tabs.tabData(index)
@@ -653,7 +705,49 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self.panel.show_project(p)
 
+    def activated_projects(self) -> dict[str, list[str]]:
+        """Název záložky -> mé aktivované projekty (aktuální záložka podle seznamu, ostatní
+        podle jejich posledního obnovení – bez přístupu k síti)."""
+        result = {}
+        for ws in self.app_settings.workspaces:
+            if ws["id"] == self.settings.workspace_id:
+                names = sorted(p.name for p in self.projects if p.mine)
+            else:
+                names = [n for n in (self.settings.ui.get(f"activated_names.{ws['id']}") or "").split("\n") if n]
+            if names:
+                result[ws["name"]] = names
+        return result
+
+    def _confirm_exit(self) -> bool:
+        """Upozornění na aktivované projekty při ukončení; False = uživatel chce zůstat."""
+        if not self.settings.warn_active_on_exit:
+            return True
+        active = self.activated_projects()
+        if not active:
+            return True
+        lines = "\n".join(f"{ws}: {', '.join(names)}" for ws, names in active.items())
+        box = QMessageBox(QMessageBox.Icon.Warning, "Ukončit SPM",
+                          f"Máte stále aktivované projekty:\n\n{lines}\n\n"
+                          "Aktivace zůstane i po ukončení aplikace: soubory, které držíte, nemohou "
+                          "ostatní upravovat, a neodevzdané změny jsou jen ve vaší místní kopii.\n\n"
+                          "Opravdu ukončit?", parent=self)
+        quit_button = box.addButton("Ukončit", QMessageBox.ButtonRole.AcceptRole)
+        back = box.addButton("Zpět", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(back)
+        dont_ask = QCheckBox("Příště neupozorňovat (lze znovu zapnout v Nastavení)")
+        box.setCheckBox(dont_ask)
+        box.exec()
+        if box.clickedButton() is not quit_button:
+            return False
+        if dont_ask.isChecked():
+            self.settings.warn_active_on_exit = False
+        return True
+
     def closeEvent(self, event) -> None:
+        # jen u zobrazeného okna (zavření skrytého okna – např. v testech – se neptá)
+        if not self._closing and self.isVisible() and not self._confirm_exit():
+            event.ignore()
+            return
         self.timer.stop()
         self._closing = True  # výsledky vláken na pozadí už nezobrazovat
         if self._name_check:
@@ -727,9 +821,10 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def activate(self) -> None:
+    def activate(self, preselect: str | list[str] | None = None) -> None:
+        """preselect: soubory / složky ('/' na konci) předem zaškrtnuté (označené v panelu stromu)."""
         p = self.selected()
-        if not p:
+        if not p or not self.act_activate.isEnabled():
             return
         entries = self._entries(p)
         if entries is None:
@@ -743,7 +838,7 @@ class MainWindow(QMainWindow):
         dlg = FileSelectDialog(f"Aktivovat projekt {p.name}", intro, entries, "Aktivovat", self,
                                root=self.pm.server_dir(p.name),
                                skip_option=self.settings.skip_unlocked_download,
-                               mirror_label=self.mirror_source_label)
+                               mirror_label=self.mirror_source_label, preselect=preselect)
         accepted = self._exec_dialog(dlg, "select_files")
         paths, only_locked = dlg.selected_paths(), dlg.skip_unlocked()
         dlg.deleteLater()
@@ -766,7 +861,7 @@ class MainWindow(QMainWindow):
         run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
                  only_locked=only_locked, on_done=done, on_error=lambda _: self.refresh())
 
-    def take(self, preselect: str | None = None) -> None:
+    def take(self, preselect: str | list[str] | None = None) -> None:
         """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
         p = self.selected()
         if not p or not p.mine:
@@ -823,21 +918,22 @@ class MainWindow(QMainWindow):
         elif self.act_activate.isEnabled():
             self.activate()
 
-    def submit(self, preselect: str | None = None) -> None:
+    def submit(self, preselect: str | list[str] | None = None) -> None:
         """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
         self._start_upload(end_session=False, preselect=preselect)
 
     def deactivate(self) -> None:
         self._start_upload(end_session=True)
 
-    def _start_upload(self, end_session: bool, preselect: str | None = None) -> None:
+    def _start_upload(self, end_session: bool, preselect: str | list[str] | None = None) -> None:
         p = self.selected()
         if not p or not p.mine:
             return
         run_task(self, "Porovnávání souborů", self.pm.plan_upload, p.name,
                  on_done=lambda plan: self._confirm_upload(plan, end_session, preselect))
 
-    def _confirm_upload(self, plan: UploadPlan, end_session: bool, preselect: str | None = None) -> None:
+    def _confirm_upload(self, plan: UploadPlan, end_session: bool,
+                        preselect: str | list[str] | None = None) -> None:
         dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name), preselect=preselect)
         accepted = self._exec_dialog(dlg, "upload")
         assignments, comment, selected = dlg.assignments(), dlg.comment_text(), dlg.selected_keys()
@@ -905,7 +1001,7 @@ class MainWindow(QMainWindow):
                     "Nyní se zobrazuje jako „Jen místně“ – pokud ji nepotřebujete, smažte ji.")
         QMessageBox.information(self, "Přejmenovat projekt", msg)
 
-    def publish(self, preselect: str | None = None) -> None:
+    def publish(self, preselect: str | list[str] | None = None) -> None:
         """preselect: soubor / složka ('/' na konci) předvybraná (z panelu stavu projektu)."""
         p = self.selected()
         if not p or not p.local_only:
@@ -960,6 +1056,8 @@ class MainWindow(QMainWindow):
 
     def _mirror_after(self, name: str) -> None:
         """Po odevzdání / publikování: zrcadlit projekt podle pravidel s touto záložkou jako zdrojem."""
+        if not self.settings.mirror_enabled:  # zrcadlení z tohoto počítače vypnuté
+            return
         groups = [(t, m) for t, m in self.mirrors(self.settings.workspace_id) if m.applies_to(name)]
         if not groups:
             return
@@ -972,6 +1070,8 @@ class MainWindow(QMainWindow):
                     continue
                 try:
                     out.append((t, m.sync_project(name, progress)))
+                except MirrorPermissionError as e:
+                    out.append((t, e))
                 except Exception as e:  # noqa: BLE001 – zrcadlení nesmí shodit odevzdání
                     out.append((t, str(e) or type(e).__name__))
             return out
@@ -981,8 +1081,12 @@ class MainWindow(QMainWindow):
     def _mirror_done(self, results: list) -> None:
         problems = []
         summary = []
+        denied = False
         for ws_id, res in results:
             target = self._ws_name(ws_id)
+            if isinstance(res, MirrorPermissionError):
+                denied = True
+                res = str(res)
             if isinstance(res, str):
                 problems.append(f"→ {target}: {res}")
                 continue
@@ -990,7 +1094,16 @@ class MainWindow(QMainWindow):
             if not res.ok:
                 problems.append(f"→ {target}:\n" + format_mirror_problems(res))
         self._set_mirror_label(summary, bool(problems))
-        if problems:
+        if denied:
+            answer = QMessageBox.question(
+                self, "Zrcadlení",
+                "\n\n".join(problems) + "\n\nPravidla zrcadlení platí pro všechny, kdo mají zdroj i cíl "
+                "jako záložky. Pokud do cíle zapisovat nemáte, můžete zrcadlení z tohoto počítače "
+                "vypnout (znovu ho zapnete v Nastavení).\n\nVypnout zrcadlení z tohoto počítače?")
+            if answer == QMessageBox.StandardButton.Yes:
+                self.settings.mirror_enabled = False
+                self._save_settings()
+        elif problems:
             QMessageBox.warning(self, "Zrcadlení",
                                 "Zrcadlení neproběhlo celé – zbytek se zkusí při příštím zrcadlení.\n\n"
                                 + "\n\n".join(problems))
@@ -1010,14 +1123,17 @@ class MainWindow(QMainWindow):
         return [(self._ws_name(t), Mirror(None, None, rules).matches)
                 for _s, t, rules in mirrors_for(self.app_settings, self.settings.workspace_id)]
 
-    def mirror_source_label(self, source: str) -> str:
-        """Zdroj zrcadla (cesta ke zdrojovému projektu) jako název záložky, pokud ji uživatel má;
-        jinak cesta."""
-        parent = str(Path(source).parent)
+    def mirror_source_label(self, entry) -> str:
+        """Odkud zrcadlo soubor přináší: název záložky (podle identity síťové složky nebo cesty),
+        pokud ji uživatel má; jinak název zdrojové složky ze spm_config.json, nebo cesta."""
+        for ws in self.app_settings.workspaces:
+            if entry.mirror_server_id and self.app_settings.view(ws["id"]).server_id == entry.mirror_server_id:
+                return ws["name"]
+        parent = str(Path(entry.mirror).parent)
         for ws in self.app_settings.workspaces:
             if ws.get("server_root") and _same_dir(ws["server_root"], parent):
                 return ws["name"]
-        return source
+        return entry.mirror_server_name or entry.mirror
 
     def open_mirrors(self) -> None:
         dlg = MirrorDialog(self, self)

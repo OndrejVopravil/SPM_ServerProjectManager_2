@@ -87,7 +87,7 @@ CREATE INDEX IF NOT EXISTS ix_changes_file ON changes(file_id);
 MIRROR_SCHEMA = """
 CREATE TABLE IF NOT EXISTS mirror_files (
     file_id        TEXT PRIMARY KEY REFERENCES files(file_id),
-    source         TEXT NOT NULL,       -- zdrojový projekt (cesta ke složce na serveru)
+    source         TEXT NOT NULL,       -- zdrojový projekt (jeho project_id)
     source_file_id TEXT NOT NULL        -- file_id souboru v databázi zdrojového projektu
 );
 CREATE INDEX IF NOT EXISTS ix_mirror_source ON mirror_files(source, source_file_id);
@@ -95,9 +95,22 @@ CREATE INDEX IF NOT EXISTS ix_mirror_source ON mirror_files(source, source_file_
 CREATE TABLE IF NOT EXISTS mirror_sources (
     source        TEXT PRIMARY KEY,
     synced_commit INTEGER,              -- poslední záznam historie zdroje, ke kterému je zrcadlo aktuální
-    synced_at     TEXT
+    synced_at     TEXT,
+    label         TEXT,                 -- cesta ke zdrojovému projektu (pro zobrazení)
+    server_id     TEXT,                 -- identita zdrojové síťové složky (spm_config.json)
+    server_name   TEXT
 );
 """
+# sloupce mirror_sources přidané později (tabulka mohla vzniknout dřív bez nich)
+MIRROR_SOURCE_COLUMNS = ("label", "server_id", "server_name")
+
+
+@dataclass
+class MirrorSource:
+    """Odkud zrcadlo soubory přináší – pro zobrazení."""
+    label: str           # cesta ke zdrojovému projektu, jak ji viděl ten, kdo zrcadlil
+    server_id: str = ""
+    server_name: str = ""
 
 # Typy změn souborů
 ADDED = "added"
@@ -201,6 +214,8 @@ class ProjectDB:
                     "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
+                self.conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('project_id', ?)",
+                                  (uuid.uuid4().hex,))
 
     def _check_version(self) -> None:
         try:
@@ -366,6 +381,52 @@ class ProjectDB:
 
     def ensure_mirror_tables(self) -> None:
         self.conn.executescript(MIRROR_SCHEMA)
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(mirror_sources)")}
+        for column in MIRROR_SOURCE_COLUMNS:
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE mirror_sources ADD COLUMN {column} TEXT")
+        self.conn.commit()
+
+    def mirror_sources(self) -> dict[str, MirrorSource]:
+        """source -> popis zdroje (cesta, identita a název síťové složky)."""
+        try:
+            rows = self.conn.execute("SELECT * FROM mirror_sources").fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        result = {}
+        for r in rows:
+            keys = r.keys()
+            result[r["source"]] = MirrorSource(
+                (r["label"] if "label" in keys else None) or r["source"],
+                (r["server_id"] if "server_id" in keys else None) or "",
+                (r["server_name"] if "server_name" in keys else None) or "")
+        return result
+
+    def set_mirror_source(self, source: str, label: str, server_id: str, server_name: str) -> None:
+        self.conn.execute(
+            "INSERT INTO mirror_sources(source, label, server_id, server_name) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(source) DO UPDATE SET label = excluded.label, server_id = excluded.server_id, "
+            "server_name = excluded.server_name", (source, label, server_id, server_name))
+
+    def rekey_mirror_source(self, old: str, new: str) -> None:
+        """Dřívější klíč zdroje (cesta) -> nový (project_id)."""
+        self.conn.execute("UPDATE mirror_files SET source = ? WHERE source = ?", (new, old))
+        self.conn.execute("DELETE FROM mirror_sources WHERE source = ?", (old,))
+
+    # --- identita projektu -----------------------------------------------
+
+    def project_id(self) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key = 'project_id'").fetchone()
+        return row[0] if row else None
+
+    def ensure_project_id(self) -> str:
+        """Trvalá identita projektu (přežije přejmenování i jiné připojení disku)."""
+        existing = self.project_id()
+        if existing:
+            return existing
+        new = uuid.uuid4().hex
+        self.conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('project_id', ?)", (new,))
+        return self.project_id() or new
 
     def mirrored(self) -> dict[str, tuple[str, str]]:
         """file_id -> (zdroj, file_id ve zdroji) u souborů spravovaných zrcadlem."""
@@ -393,8 +454,10 @@ class ProjectDB:
         return row[0] if row else None
 
     def set_mirror_synced(self, source: str, commit_id: int | None) -> None:
-        self.conn.execute("INSERT OR REPLACE INTO mirror_sources(source, synced_commit, synced_at) "
-                          "VALUES (?, ?, ?)", (source, commit_id, now_iso()))
+        self.conn.execute(
+            "INSERT INTO mirror_sources(source, synced_commit, synced_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(source) DO UPDATE SET synced_commit = excluded.synced_commit, "
+            "synced_at = excluded.synced_at", (source, commit_id, now_iso()))
 
     def last_commit_id(self) -> int | None:
         return self.conn.execute("SELECT MAX(commit_id) FROM commits").fetchone()[0]

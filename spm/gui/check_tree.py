@@ -9,19 +9,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPixmap
+from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QImage, QPixmap
 from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QWidget
 
 from . import icons
 
 KEY_ROLE = Qt.ItemDataRole.UserRole
 PATH_ROLE = Qt.ItemDataRole.UserRole + 1
+SAVED_FOREGROUND_ROLE = Qt.ItemDataRole.UserRole + 2  # barvy textu před podbarvením hledáním
 
 
-def in_scope(path: str, scope: str | None) -> bool:
-    """Patří soubor do předvýběru? scope = cesta souboru, nebo složky zakončená '/'."""
+def in_scope(path: str, scope: str | list[str] | tuple[str, ...] | None) -> bool:
+    """Patří soubor do předvýběru? scope = cesta souboru, nebo složky zakončená '/',
+    případně seznam takových (víc označených položek ve stromu)."""
     if not scope:
         return False
+    if not isinstance(scope, str):
+        return any(in_scope(path, s) for s in scope)
     return path.startswith(scope) if scope.endswith("/") else path == scope
 
 
@@ -132,6 +136,35 @@ class CheckTree(QTreeWidget):
                 item.setForeground(column, color)
             it += 1
         self.blockSignals(False)
+
+    def highlight(self, match, color: QColor) -> list[QTreeWidgetItem]:
+        """Podbarví soubory, jejichž název odpovídá match(název) (None = zrušit podbarvení).
+        Text podbarvených je černý (čitelný na světlém pozadí i v tmavém motivu); po zrušení
+        se vrátí původní barva textu. Vrací podbarvené položky."""
+        found = []
+        empty = QBrush()
+        black = QBrush(QColor("black"))
+        columns = range(self.columnCount())
+        self.blockSignals(True)
+        for item in self.leaf_items():
+            hit = match is not None and match(item.text(0))
+            saved = item.data(0, SAVED_FOREGROUND_ROLE)
+            if hit:
+                if saved is None:  # původní barvy textu – jen poprvé
+                    item.setData(0, SAVED_FOREGROUND_ROLE, [item.foreground(c) for c in columns])
+                for c in columns:
+                    item.setBackground(c, QBrush(color))
+                    item.setForeground(c, black)
+                found.append(item)
+            else:
+                for c in columns:
+                    item.setBackground(c, empty)
+                if saved is not None:
+                    for c, brush in zip(columns, saved):
+                        item.setForeground(c, brush)
+                    item.setData(0, SAVED_FOREGROUND_ROLE, None)
+        self.blockSignals(False)
+        return found
 
     def _on_icon(self, path: str, image: QImage) -> None:
         """Doručena skutečná ikona souboru z vlákna na pozadí."""
