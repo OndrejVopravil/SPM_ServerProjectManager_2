@@ -9,6 +9,7 @@ from PySide6.QtGui import QAction, QColor, QGuiApplication, QKeySequence, QPalet
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -16,15 +17,17 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSplitter,
+    QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import __version__
-from ..config import Settings
+from ..config import AppSettings, Settings
 from ..db import ProjectDB
 from ..names import format_invalid
 from ..restore import RestoreCatalog, RestoreResult
@@ -39,6 +42,7 @@ from ..sync import (
     UploadResult,
     validate_project_name,
 )
+from .comment_dialog import CommentDialog
 from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
 from .project_panel import ProjectPanel
@@ -54,8 +58,10 @@ COLOR_MINE = QColor("#2e8b57")      # aktivováno mnou
 COLOR_OTHER = QColor("#2f6fb5")     # pracují na něm jiní (lze se přidat)
 COLOR_INVALID = QColor("#e67e22")   # nepovolené znaky v názvech – nelze aktivovat
 
-COLUMNS = ["Projekt", "Stav", "Aktivováno", "Od", "Místní kopie"]
-HEADER_KEY = "main.v2"  # změna sloupců -> neobnovovat šířky uložené pro starší rozvržení
+COLUMNS = ["Projekt", "Komentář", "Stav", "Aktivováno", "Od", "Místní kopie"]
+COL_NAME, COL_COMMENT, COL_STATE, COL_USERS, COL_SINCE, COL_LOCAL = range(len(COLUMNS))
+HEADER_KEY = "main.v3"  # změna sloupců -> neobnovovat šířky uložené pro starší rozvržení
+COMMENT_COLUMN_MAX = 300  # výchozí šířka sloupce Komentář nejvýše (zbytek je v tooltipu)
 FOCUS_REFRESH_MIN_GAP = 5.0  # s – při rychlém přepínání oken (Alt+Tab) neobnovovat pokaždé
 
 
@@ -98,11 +104,15 @@ def format_external(items: list[str]) -> str:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings | AppSettings):
         super().__init__()
-        self.settings = settings
+        # celé nastavení se záložkami; samotné Settings (testy) = jedna záložka
+        self.app_settings = settings if isinstance(settings, AppSettings) else AppSettings.from_settings(settings)
+        settings = self.settings = self.app_settings.view(self.app_settings.active)
         self.pm = ProjectManager(settings)
-        self.shared = SharedConfig()  # společná konfigurace na síti (spm_config.json)
+        # společná konfigurace na síti (spm_config.json) – každá záložka má svou
+        self._shared: dict[str, SharedConfig] = {}
+        self.shared = self._shared.setdefault(settings.workspace_id, SharedConfig())
         self.projects: list[ProjectStatus] = []
         self.name_issues: dict[str, list[str]] = {}  # projekt -> názvy s nepovolenými znaky
         self._name_check: NameCheckThread | None = None
@@ -127,8 +137,8 @@ class MainWindow(QMainWindow):
         # šířky sloupců: uložené od minula, jinak se jednou nastaví podle obsahu
         self._columns_sized = restore_header(settings, HEADER_KEY, self.table.horizontalHeader())
         self.table.itemSelectionChanged.connect(self._on_selection)
-        # dvojklik otevírá jen složku projektu, ne celé místní úložiště
-        self.table.doubleClicked.connect(lambda _: self.open_local(root_fallback=False))
+        # dvojklik: název = aktivovat / deaktivovat, komentář = upravit, jinak místní složka projektu
+        self.table.doubleClicked.connect(self._on_double_click)
 
         tb = QToolBar("Akce")
         tb.setMovable(False)
@@ -179,6 +189,9 @@ class MainWindow(QMainWindow):
         self.act_rename.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         self.act_rename.triggered.connect(lambda: self.rename_project())
         self.table.addAction(self.act_rename)
+        self.act_comment = QAction("Upravit komentář…", self)
+        self.act_comment.setToolTip("Komentář projektu vidí všichni; změny se zapisují do historie")
+        self.act_comment.triggered.connect(lambda: self.edit_comment())
         self.act_invalid = QAction("Zobrazit nepovolené názvy…", self)
         self.act_invalid.triggered.connect(lambda: self.show_invalid_names())
         self.act_restore = QAction("Obnovit ze zálohy…", self)
@@ -208,9 +221,29 @@ class MainWindow(QMainWindow):
         state = settings.ui.get("main.splitter")
         if state:
             self.splitter.restoreState(QByteArray.fromBase64(state.encode("ascii")))
+        # záložky = pracovní prostory (každá má vlastní síťovou a místní složku)
+        self.tabs = QTabBar()
+        self.tabs.setExpanding(False)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tabs.customContextMenuRequested.connect(self._tab_menu)
+        self.btn_add_tab = QToolButton()
+        self.btn_add_tab.setText("+")
+        self.btn_add_tab.setToolTip("Přidat záložku s další síťovou složkou projektů")
+        self.btn_add_tab.setAutoRaise(True)
+        self.btn_add_tab.clicked.connect(lambda: self.add_workspace())
+        self._fill_tabs()
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        tabs_row = QHBoxLayout()
+        tabs_row.setSpacing(2)
+        tabs_row.addWidget(self.tabs)
+        tabs_row.addWidget(self.btn_add_tab)
+        tabs_row.addStretch()
+
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.setContentsMargins(6, 6, 6, 0)
+        layout.addLayout(tabs_row)
         layout.addWidget(self.search)
         layout.addWidget(self.splitter)
         self.setCentralWidget(central)
@@ -275,6 +308,149 @@ class MainWindow(QMainWindow):
         self._update_config_label()
         return changed
 
+    # --- záložky (pracovní prostory) --------------------------------------------
+
+    def _ui_key(self, key: str) -> str:
+        """Klíč stavu rozhraní, který si pamatuje každá záložka zvlášť (např. poslední projekt)."""
+        return f"{key}.{self.settings.workspace_id}"
+
+    def _tab_label(self, ws: dict) -> str:
+        """Název záložky; s počtem mých aktivovaných projektů (z posledního obnovení záložky)."""
+        count = int(self.settings.ui.get(f"activated.{ws['id']}") or 0)
+        return f"{ws['name']} ({count})" if count else ws["name"]
+
+    def _fill_tabs(self) -> None:
+        self.tabs.blockSignals(True)
+        try:
+            while self.tabs.count():
+                self.tabs.removeTab(0)
+            for ws in self.app_settings.workspaces:
+                i = self.tabs.addTab(self._tab_label(ws))
+                self.tabs.setTabData(i, ws["id"])
+                self.tabs.setTabToolTip(i, f"Síť: {ws.get('server_root') or '—'}\n"
+                                           f"Místní: {ws.get('local_root') or '—'}")
+                if ws["id"] == self.settings.workspace_id:
+                    self.tabs.setCurrentIndex(i)
+        finally:
+            self.tabs.blockSignals(False)
+
+    def _update_tab_label(self) -> None:
+        """Po obnovení seznamu: počet mých aktivovaných projektů na aktuální záložce."""
+        self.settings.ui[self._ui_key("activated")] = str(sum(1 for p in self.projects if p.mine))
+        i = self.tabs.currentIndex()
+        if i >= 0:
+            self.tabs.setTabText(i, self._tab_label(self.app_settings.workspace(self.settings.workspace_id)))
+
+    def _on_tab_changed(self, index: int) -> None:
+        ws_id = self.tabs.tabData(index)
+        if ws_id and ws_id != self.settings.workspace_id:
+            self.switch_workspace(ws_id)
+
+    def switch_workspace(self, ws_id: str) -> None:
+        """Přepne na jinou záložku: jiné nastavení, jiný seznam projektů i strom."""
+        if getattr(self, "_running_task", None):
+            QMessageBox.information(self, "Záložky", "Počkejte na dokončení probíhající akce.")
+            self._fill_tabs()
+            return
+        self.app_settings.active = ws_id
+        self.settings = self.app_settings.view(ws_id)
+        self.pm = ProjectManager(self.settings)
+        self.panel.pm = self.pm
+        self.shared = self._shared.setdefault(ws_id, SharedConfig())
+        self.projects, self.name_issues = [], {}
+        self._name_check_again = False
+        self._render(None)
+        self.panel.show_project(None)
+        self._fill_tabs()
+        self._update_status_bar()
+        if self.settings.is_complete():
+            self.refresh()
+        else:
+            self._update_config_label()
+
+    def add_workspace(self) -> None:
+        name, ok = QInputDialog.getText(self, "Přidat záložku",
+                                        "Název záložky (např. podle síťového disku):")
+        name = name.strip()
+        if not ok or not name:
+            return
+        previous = self.settings.workspace_id
+        previous_local = self.settings.local_root
+        ws_id = self.app_settings.add_workspace(name)
+        if previous_local:  # návrh místní složky vedle té dosavadní: C:\Projekty -> C:\<název>
+            self.app_settings.view(ws_id).local_root = str(Path(previous_local).parent / name)
+        self._fill_tabs()
+        self.switch_workspace(ws_id)
+        if not self.open_settings():  # bez nastavených složek záložku nezakládat
+            self.app_settings.remove_workspace(ws_id)
+            self.switch_workspace(previous)
+            return
+        self._save_settings()
+
+    def _tab_menu(self, pos) -> None:
+        index = self.tabs.tabAt(pos)
+        if index < 0:
+            return
+        ws_id = self.tabs.tabData(index)
+        menu = QMenu(self)
+        act_rename = menu.addAction("Přejmenovat záložku…")
+        act_settings = menu.addAction("Nastavení složek…")
+        menu.addSeparator()
+        act_remove = menu.addAction("Odebrat záložku…")
+        act_remove.setEnabled(len(self.app_settings.workspaces) > 1)
+        menu.addSeparator()
+        menu.addAction("Přidat záložku…").triggered.connect(lambda: self.add_workspace())
+        chosen = menu.exec(self.tabs.mapToGlobal(pos))
+        if chosen is act_rename:
+            self.rename_workspace(ws_id)
+        elif chosen is act_settings:
+            if ws_id != self.settings.workspace_id:
+                self.switch_workspace(ws_id)
+            self.open_settings()
+        elif chosen is act_remove:
+            self.remove_workspace(ws_id)
+
+    def rename_workspace(self, ws_id: str) -> None:
+        ws = self.app_settings.workspace(ws_id)
+        name, ok = QInputDialog.getText(self, "Přejmenovat záložku", "Nový název záložky:",
+                                        QLineEdit.EchoMode.Normal, ws["name"])
+        name = name.strip()
+        if ok and name and name != ws["name"]:
+            self.app_settings.rename_workspace(ws_id, name)
+            self._fill_tabs()
+            self._save_settings()
+
+    def remove_workspace(self, ws_id: str) -> None:
+        ws = self.app_settings.workspace(ws_id)
+        if len(self.app_settings.workspaces) <= 1:
+            return
+        if int(self.settings.ui.get(f"activated.{ws_id}") or 0):
+            QMessageBox.warning(self, "Odebrat záložku",
+                                f"Na záložce „{ws['name']}“ máte aktivované projekty.\n"
+                                "Nejdřív je deaktivujte.")
+            return
+        answer = QMessageBox.question(
+            self, "Odebrat záložku",
+            f"Odebrat záložku „{ws['name']}“?\n\nSíť: {ws.get('server_root') or '—'}\n"
+            f"Místní: {ws.get('local_root') or '—'}\n\n"
+            "Projekty na síti ani soubory v místní složce se nemažou – odebere se jen záložka.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        current = self.settings.workspace_id
+        self.app_settings.remove_workspace(ws_id)
+        self._shared.pop(ws_id, None)
+        if current == ws_id:
+            self.switch_workspace(self.app_settings.active)
+        else:
+            self._fill_tabs()
+        self._save_settings()
+
+    def _save_settings(self) -> None:
+        try:
+            self.settings.save()
+        except OSError as e:
+            QMessageBox.warning(self, "Nastavení", f"Nastavení nelze uložit:\n{e}")
+
     # --- seznam projektů -----------------------------------------------------
 
     def selected(self) -> ProjectStatus | None:
@@ -304,7 +480,7 @@ class MainWindow(QMainWindow):
         if not self.settings.is_complete() or getattr(self, "_running_task", None):
             return
         self._last_refresh = time.monotonic()
-        current = self.selected().name if self.selected() else self.settings.ui.get("last_project")
+        current = self.selected().name if self.selected() else self.settings.ui.get(self._ui_key("last_project"))
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             if self._sync_shared() and not check_names:
@@ -318,6 +494,7 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
         self._render(current)
+        self._update_tab_label()
         if check_names:
             self._start_name_check()
         self.panel.show_project(self.selected())
@@ -338,9 +515,10 @@ class MainWindow(QMainWindow):
     def _on_name_check(self, issues: dict) -> None:
         if self._closing:
             return
-        self.name_issues = issues
-        current = self.selected().name if self.selected() else None
-        self._render(current)
+        if self._name_check is None or self._name_check.pm is self.pm:  # ne výsledek jiné záložky
+            self.name_issues = issues
+            current = self.selected().name if self.selected() else None
+            self._render(current)
         if self._name_check_again:
             self._start_name_check()
 
@@ -360,7 +538,12 @@ class MainWindow(QMainWindow):
             self._rendering = False
         if not self._columns_sized and self.projects:
             self.table.resizeColumnsToContents()
-            self.table.setColumnWidth(0, max(self.table.columnWidth(0), 250))
+            self.table.setColumnWidth(COL_NAME, max(self.table.columnWidth(COL_NAME), 250))
+            # i pro texty, které se objeví až později („Aktivováno mnou“, datum a čas)
+            for col, width in ((COL_STATE, 130), (COL_USERS, 110), (COL_SINCE, 140)):
+                self.table.setColumnWidth(col, max(self.table.columnWidth(col), width))
+            self.table.setColumnWidth(COL_COMMENT, min(max(self.table.columnWidth(COL_COMMENT), 150),
+                                                       COMMENT_COLUMN_MAX))
             self._columns_sized = True
         self._apply_filter()
 
@@ -378,10 +561,17 @@ class MainWindow(QMainWindow):
             state = "Volný"
         names = ["já" if not any(u is o for o in p.others) else u.user for u in p.users]
         since = min((u.since for u in p.users), default="").replace("T", " ")
-        values = [p.name, state, ", ".join(names), since, "ano" if p.local_exists else ""]
+        comment = p.comment.first_line + (" …" if "\n" in p.comment.text else "") if p.comment else ""
+        values = [p.name, comment, state, ", ".join(names), since, "ano" if p.local_exists else ""]
         for c, v in enumerate(values):
             item = QTableWidgetItem(v)
-            if issues:
+            if c == COL_COMMENT:
+                # komentář je popis projektu, ne stav – bez barvy stavu, celý text v tooltipu
+                if p.comment:
+                    item.setToolTip(f"{p.comment.text}\n\n{p.comment.describe_change()}")
+                elif not p.local_only:
+                    item.setToolTip("Bez komentáře – upravíte dvojklikem nebo v nabídce pravého tlačítka.")
+            elif issues:
                 item.setForeground(COLOR_INVALID)
                 item.setToolTip("Projekt obsahuje názvy s nepovolenými znaky – nelze ho "
                                 + ("publikovat" if p.local_only else "aktivovat")
@@ -426,11 +616,12 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def _apply_filter(self) -> None:
-        """Skryje projekty, jejichž název neobsahuje hledaný text (bez ohledu na velikost
-        písmen a diakritiku)."""
+        """Skryje projekty, jejichž název ani komentář neobsahuje hledaný text (bez ohledu
+        na velikost písmen a diakritiku)."""
         needle = normalize(self.search.text().strip())
         for r, p in enumerate(self.projects):
-            self.table.setRowHidden(r, bool(needle) and needle not in normalize(p.name))
+            text = p.name + "\n" + (p.comment.text if p.comment else "")
+            self.table.setRowHidden(r, bool(needle) and needle not in normalize(text))
         rows = self.table.selectionModel().selectedRows()
         if rows and self.table.isRowHidden(rows[0].row()):
             self.table.clearSelection()
@@ -446,7 +637,7 @@ class MainWindow(QMainWindow):
     def _on_selection(self) -> None:
         p = self._refresh_selected_row() if not self._rendering else self.selected()
         if p:
-            self.settings.ui["last_project"] = p.name
+            self.settings.ui[self._ui_key("last_project")] = p.name
         self._update_actions()
         self.panel.show_project(p)
 
@@ -489,6 +680,7 @@ class MainWindow(QMainWindow):
         self.act_history.setEnabled(bool(p and not p.local_only))
         self.act_restore.setEnabled(bool(p and not p.local_only))
         self.act_rename.setEnabled(bool(p and not p.active and not p.local_only))
+        self.act_comment.setEnabled(bool(p and not p.local_only))
         self.act_unlock.setEnabled(bool(p and p.others))
 
     def _context_menu(self, pos) -> None:
@@ -499,7 +691,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
                    self.act_deactivate, self.act_publish, None, self.act_open, self.act_history,
-                   self.act_restore, None, self.act_rename, None, self.act_cancel, self.act_unlock,
+                   self.act_restore, None, self.act_comment, self.act_rename, None,
+                   self.act_cancel, self.act_unlock,
                    None, self.act_refresh]
         if self.act_invalid.isEnabled():
             actions[:0] = [self.act_invalid, None]
@@ -689,7 +882,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Přejmenovat projekt", str(e))
             self.refresh()
             return
-        self.settings.ui["last_project"] = new_name
+        self.settings.ui[self._ui_key("last_project")] = new_name
         self.table.clearSelection()
         self.refresh()
         msg = f"Projekt „{p.name}“ byl přejmenován na „{new_name}“."
@@ -717,7 +910,7 @@ class MainWindow(QMainWindow):
 
         def done(res: PublishResult) -> None:
             if res.leftover is not None:
-                self.settings.ui["last_project"] = p.name
+                self.settings.ui[self._ui_key("last_project")] = p.name
             self.refresh()
             msg = f"Projekt {p.name} byl publikován na server ({res.published} souborů)."
             if res.leftover is not None and res.leftover != self.pm.local_dir(p.name):
@@ -733,6 +926,39 @@ class MainWindow(QMainWindow):
         run_task(self, f"Publikování projektu {p.name}", self.pm.publish, p.name, comment,
                  None if len(paths) == len(files) else paths,
                  on_done=done, on_error=lambda _: self.refresh())
+
+    def _on_double_click(self, index) -> None:
+        """Dvojklik: na názvu aktivace / deaktivace (jako F3), na komentáři jeho úprava,
+        jinde (a u projektu, který nelze aktivovat – např. Jen místně) otevření místní složky."""
+        if index.column() == COL_COMMENT and self.act_comment.isEnabled():
+            self.edit_comment()
+        elif index.column() == COL_NAME and (self.act_activate.isEnabled()
+                                             or self.act_deactivate.isEnabled()):
+            self.toggle_activation()
+        else:
+            self.open_local(root_fallback=False)
+
+    def edit_comment(self) -> None:
+        """Úprava komentáře projektu – kdykoliv, i když projekt má aktivovaný někdo jiný."""
+        p = self._refresh_selected_row()  # aktuální text (mohl ho mezitím změnit někdo jiný)
+        if not p or p.local_only:
+            return
+        dlg = CommentDialog(p.name, p.comment, self)
+        accepted = self._exec_dialog(dlg, "comment")
+        text = dlg.text()
+        dlg.deleteLater()
+        if not accepted:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.pm.set_comment(p.name, text)
+        except Exception as e:  # noqa: BLE001
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Komentář projektu", str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        self._refresh_selected_row()
+        self._apply_filter()
 
     def open_local(self, root_fallback: bool = True) -> None:
         """Otevře místní složku vybraného projektu. Pokud vybraný projekt místní složku
@@ -840,12 +1066,20 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Chyba", str(e))
         self.refresh()
 
-    def open_settings(self) -> None:
+    def open_settings(self) -> bool:
+        """Nastavení aktuální záložky (a osobní nastavení). Vrací True, pokud se uložilo."""
         self._sync_shared()  # dialog má ukázat aktuální stav souboru na síti
-        dlg = SettingsDialog(self.settings, self.shared.state, self)
+        ws_id = self.settings.workspace_id
+        ws = self.app_settings.workspace(ws_id)
+        dlg = SettingsDialog(self.settings, self.shared.state, self, workspace_name=ws["name"],
+                             folder_check=lambda server, local: self.app_settings.folder_conflict(
+                                 ws_id, server, local))
         if dlg.exec():
+            self._fill_tabs()  # tooltip záložky se složkami
             self._update_status_bar()
             self._apply_refresh_timer()
             self.refresh()
-        elif dlg.exported:  # export na síť a pak Zrušit -> převzít, co je na síti
+            return True
+        if dlg.exported:  # export na síť a pak Zrušit -> převzít, co je na síti
             self.refresh()
+        return False

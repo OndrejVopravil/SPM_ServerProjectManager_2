@@ -4,6 +4,7 @@ import os
 import pytest
 
 from spm.config import Settings
+from spm.gui.main_window import COL_STATE, COL_USERS
 from spm.sync import ProjectManager, new_key
 
 
@@ -143,8 +144,12 @@ def test_project_panel_shows_locks_only_for_active_projects(app, pms, tmp_path, 
     w.refresh()
     names = [p.name for p in w.projects]
 
+    # strom se zobrazí i u volného projektu
     w.table.selectRow(names.index("Volny"))
-    assert w.panel.isHidden()
+    assert not w.panel.isHidden() and "Stav projektu Volny" in w.panel.title.text()
+    w.panel._thread.wait()
+    app.processEvents()
+    assert "nikdo (projekt je volný)" in w.panel.summary.text()
 
     w.table.selectRow(names.index("Forma"))
     assert not w.panel.isHidden()
@@ -175,13 +180,13 @@ def test_click_refreshes_row_without_full_refresh(app, pms, tmp_path, monkeypatc
     w.refresh(check_names=False)
     names = [p.name for p in w.projects]
     w.table.selectRow(names.index("Volny"))
-    assert w.table.item(names.index("Forma"), 1).text() == "Volný"
+    assert w.table.item(names.index("Forma"), COL_STATE).text() == "Volný"
 
     alice.activate("Forma", lock_paths=[])   # mezitím, bez obnovení seznamu
     w.table.selectRow(names.index("Forma"))  # klepnutí na projekt
     row = names.index("Forma")
-    assert w.table.item(row, 1).text() == "Pracují jiní"
-    assert w.table.item(row, 2).text() == "alice"
+    assert w.table.item(row, COL_STATE).text() == "Pracují jiní"
+    assert w.table.item(row, COL_USERS).text() == "alice"
     assert not w.panel.isHidden()
     w.panel._thread.wait()
     w.close()
@@ -532,7 +537,7 @@ def test_refresh_when_app_becomes_active(app, pms, tmp_path, monkeypatch):
     assert calls == []                                   # odchod z aplikace – nic
     w._on_app_state(active)
     assert calls == [{"silent": True, "check_names": False}]
-    assert w.table.item([p.name for p in w.projects].index("Forma"), 2).text() == "alice"
+    assert w.table.item([p.name for p in w.projects].index("Forma"), COL_USERS).text() == "alice"
     w._on_app_state(active)
     assert len(calls) == 1                               # hned znovu – nic
     w.panel._thread and w.panel._thread.wait()

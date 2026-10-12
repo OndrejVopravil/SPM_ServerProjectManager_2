@@ -4,6 +4,7 @@ import pytest
 
 from spm import config
 from spm.config import Settings
+from spm.gui.main_window import COL_STATE
 
 
 @pytest.fixture
@@ -39,7 +40,7 @@ def select(w, name):
 
 def test_invalid_project_marked_and_not_activatable(window):
     row = select(window, "Spatny")
-    assert window.table.item(row, 1).text() == "Nepovolené znaky"
+    assert window.table.item(row, COL_STATE).text() == "Nepovolené znaky"
     assert not window.act_activate.isEnabled()
     assert window.act_invalid.isEnabled()
     assert "Výkresy/" in window.table.item(row, 0).toolTip()
@@ -54,6 +55,19 @@ def test_local_only_with_invalid_names_publish_allowed_without_them(window):
     """Složku s vadnými názvy lze publikovat jen bez nich – dialog je nedovolí vybrat
     a jádro publikování je odmítne (viz test_publish)."""
     row = select(window, "NovyLokalni")
-    assert window.table.item(row, 1).text() == "Nepovolené znaky"
+    assert window.table.item(row, COL_STATE).text() == "Nepovolené znaky"
     assert window.act_publish.isEnabled()
     assert window.pm.invalid_file_paths(window.pm.local_files("NovyLokalni")) == ["moje poznamky.txt"]
+
+
+def test_tree_shown_for_any_project(window):
+    """Strom se vykreslí i u volného projektu (i s nepovolenými znaky); bez akcí, které
+    vyžadují aktivaci."""
+    from PySide6.QtWidgets import QApplication
+    select(window, "Spatny")
+    assert not window.panel.isHidden()
+    window.panel._thread.wait()
+    QApplication.processEvents()
+    assert sorted(e.path for e in window.panel.entries) == ["Výkresy/a.dwg", "ok.txt"]
+    actions = window.panel.context_actions("ok.txt")
+    assert not any(actions[k] for k in ("submit", "take", "delete", "rename", "publish"))

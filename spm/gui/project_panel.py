@@ -113,13 +113,15 @@ class ProjectPanel(QWidget):
         layout.addWidget(self.tree)
 
     def show_project(self, project: ProjectStatus | None) -> None:
-        """Zobrazí stav projektu (aktivovaného, nebo složky „Jen místně“); jinak se panel skryje."""
-        if project is None or not (project.active or project.local_only):
+        """Zobrazí strom vybraného projektu (jakéhokoliv – volného, aktivovaného i složky
+        „Jen místně“); bez vybraného projektu se panel skryje."""
+        if project is None:
             self.project = None
             self.hide()
             return
         same = (self.project is not None and self.project.name == project.name
-                and self.project.local_only == project.local_only)
+                and self.project.local_only == project.local_only
+                and self._thread is not None and self._thread.pm is self.pm)  # stejná záložka
         self.project = project
         self.title.setText(f"<b>Místní složka {project.name}</b> (jen místně)" if project.local_only
                            else f"<b>Stav projektu {project.name}</b>")
@@ -139,17 +141,18 @@ class ProjectPanel(QWidget):
             self._again = True
             return
         self._again = False
-        self._thread = EntriesThread(self.pm, self.project.name, self.project.mine, self.project.local_only)
-        self._thread.done.connect(self._on_loaded)
-        self._thread.start()
+        thread = EntriesThread(self.pm, self.project.name, self.project.mine, self.project.local_only)
+        thread.done.connect(lambda name, entries, error: self._on_loaded(name, entries, error, thread.pm))
+        self._thread = thread
+        thread.start()
 
-    def _on_loaded(self, name: str, entries: list, error: str) -> None:
+    def _on_loaded(self, name: str, entries: list, error: str, pm: ProjectManager | None = None) -> None:
         if self._closed:
             return
         if self._again:
             self.reload()
-        if self.project is None or name != self.project.name:
-            return  # mezitím vybrán jiný projekt
+        if self.project is None or name != self.project.name or (pm is not None and pm is not self.pm):
+            return  # mezitím vybrán jiný projekt (nebo jiná záložka – projekt se stejným názvem)
         if error:
             self.summary.setText(f"Stav projektu nelze načíst: {error}")
             return
@@ -208,7 +211,7 @@ class ProjectPanel(QWidget):
         free = sum(1 for e in self.entries if e.free)
         new = sum(1 for e in self.entries if e.local_new)
         parts = [f"{who}: <b>{n}</b>" for who, n in sorted(counts.items())]
-        users = ", ".join(u.label for u in self.project.users)
+        users = ", ".join(u.label for u in self.project.users) or "nikdo (projekt je volný)"
         self.summary.setText(
             f"Aktivováno: {users}<br>Zamčené soubory – " + (", ".join(parts) or "žádné")
             + f" &nbsp;|&nbsp; volné: <b>{free}</b>"
@@ -367,6 +370,6 @@ class ProjectPanel(QWidget):
         if self._thread:
             self._thread.wait(5000)
             try:
-                self._thread.done.disconnect(self._on_loaded)
+                self._thread.done.disconnect()  # všechna připojení (výsledek jde přes lambda)
             except (RuntimeError, TypeError):
                 pass

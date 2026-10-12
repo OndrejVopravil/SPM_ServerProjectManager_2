@@ -94,13 +94,18 @@ class HistoryDialog(QDialog):
         self._texts: list[str] = []
         self.sessions.setRowCount(len(self._session_rows))
         for r, s in enumerate(self._session_rows):
+            comment = s["comment"] or ""
+            tip = comment
+            if s["kind"] == dbm.PROJECT_COMMENT:
+                # komentář záznamu = nový text komentáře projektu (víceřádkový)
+                tip = comment or "(komentář smazán)"
+                comment = comment.replace("\n", " ↵ ") or "(komentář smazán)"
             values = [_fmt(s["created_at"]), s["user"], s["pc"],
-                      dbm.COMMIT_LABELS.get(s["kind"], s["kind"]), str(s["n_changes"]),
-                      s["comment"] or ""]
+                      dbm.COMMIT_LABELS.get(s["kind"], s["kind"]), str(s["n_changes"]), comment]
             self._texts.append(" ".join(values))
             for c, v in enumerate(values):
                 item = QTableWidgetItem(v)
-                item.setToolTip(v)
+                item.setToolTip(tip if c == len(values) - 1 else v)
                 self.sessions.setItem(r, c, item)
         self.sessions.resizeColumnsToContents()
         self.sessions.itemSelectionChanged.connect(self._load_changes)

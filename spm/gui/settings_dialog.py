@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -27,11 +28,14 @@ from ..config import AUTO_REFRESH_MIN, AUTO_REFRESH_OFF, Settings
 
 class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, shared: sc.SharedState | None = None,
-                 parent: QWidget | None = None):
+                 parent: QWidget | None = None, workspace_name: str = "",
+                 folder_check: Callable[[str, str], str | None] | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Nastavení")
+        self.setWindowTitle(f"Nastavení – záložka {workspace_name}" if workspace_name else "Nastavení")
         self.setMinimumWidth(560)
         self.settings = settings
+        # kolize složek s jinými záložkami: (síť, místní) -> popis chyby nebo None
+        self.folder_check = folder_check
         # stav společné konfigurace na síti; při úpravě (tlačítko Upravit) se po OK uloží na síť
         self.shared = shared if shared is not None else sc.probe(settings.server_root)
         self.editing_shared = False
@@ -122,6 +126,7 @@ class SettingsDialog(QDialog):
         shared_form.addRow(shared_buttons)
         form.addRow(shared_box)
 
+        form.addRow(QLabel("<b>Osobní nastavení</b> – platí pro všechny záložky"))
         form.addRow(self.delete_local)
         form.addRow("Min. shoda pro návrh přejmenování:", self.threshold)
         form.addRow(self.skip_unlocked)
@@ -274,6 +279,10 @@ class SettingsDialog(QDialog):
             return
         if Path(local).resolve() == Path(server).resolve():
             QMessageBox.warning(self, "Nastavení", "Síťová a místní složka nesmí být stejné.")
+            return
+        conflict = self.folder_check(server, local) if self.folder_check else None
+        if conflict:
+            QMessageBox.warning(self, "Nastavení", conflict)
             return
         self._server_changed()  # síťová složka změněná bez opuštění pole
         if self.editing_shared:

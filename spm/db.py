@@ -115,6 +115,7 @@ SYNC = "sync"                       # změny provedené mimo aplikaci, zjištěn
 PROJECT_RENAMED = "project-renamed"
 CANCELLED = "cancelled"             # zrušení vlastní aktivace
 FORCE_UNLOCK = "force-unlock"       # odebrání zámků jiného uživatele
+PROJECT_COMMENT = "project-comment"  # změna komentáře projektu (komentář záznamu = nový text)
 
 COMMIT_LABELS = {
     UPLOAD: "Odevzdání",
@@ -123,6 +124,7 @@ COMMIT_LABELS = {
     PROJECT_RENAMED: "Přejmenování projektu",
     CANCELLED: "Zrušení aktivace",
     FORCE_UNLOCK: "Odebrání zámků",
+    PROJECT_COMMENT: "Komentář projektu",
 }
 
 

@@ -3,7 +3,7 @@ import traceback
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from .config import Settings
+from .config import AppSettings
 from .gui.main_window import MainWindow
 from .gui.style import AppStyle
 
@@ -22,7 +22,7 @@ def main() -> int:
     app.setApplicationName("SPM")
     app.setStyle(AppStyle(app.style().name()))
     sys.excepthook = _show_unhandled
-    window = MainWindow(Settings.load())
+    window = MainWindow(AppSettings.load())
     window.show()
     return app.exec()
 

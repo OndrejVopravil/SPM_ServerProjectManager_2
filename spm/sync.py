@@ -21,6 +21,8 @@ from typing import Iterable, Iterator
 
 from . import SPM_DIR, recycle
 from . import db as dbm
+from .comment import MAX_LENGTH as COMMENT_MAX_LENGTH
+from .comment import ProjectComment, normalize_text, read_comment, write_comment
 from .config import Settings
 from .db import DbFile, LockOwner, ProjectDB, db_path
 from .identity import current_pc, current_user
@@ -109,6 +111,7 @@ class ProjectStatus:
     mine: bool                # mám projekt aktivovaný já
     local_only: bool = False  # složka je jen v místním úložišti (lze ji publikovat)
     others: list[LockInfo] = field(default_factory=list)  # aktivní uživatelé kromě mě
+    comment: ProjectComment | None = None  # komentář projektu (jen projekty na serveru)
 
     @property
     def active(self) -> bool:
@@ -276,10 +279,32 @@ class ProjectManager:
         return result
 
     def _server_status(self, name: str) -> ProjectStatus:
-        users = active_users(self.server_dir(name))
+        server = self.server_dir(name)
+        users = active_users(server)
         others = [u for u in users if not u.is_mine(self.user, self.pc)]
         return ProjectStatus(name=name, users=users, local_exists=self.local_dir(name).exists(),
-                             mine=len(others) < len(users), others=others)
+                             mine=len(others) < len(users), others=others,
+                             comment=read_comment(server))
+
+    def set_comment(self, name: str, text: str) -> bool:
+        """Změní komentář projektu (prázdný text = smazat) a zapíše změnu do historie.
+        Lze kdykoliv, i když má projekt aktivovaný někdo jiný. Vrací False, pokud se nic nezměnilo."""
+        text = normalize_text(text)
+        if len(text) > COMMENT_MAX_LENGTH:
+            raise SyncError(f"Komentář je příliš dlouhý ({len(text)} znaků, nejvýše {COMMENT_MAX_LENGTH}).")
+        server = self.server_dir(name)
+        if not server.is_dir():
+            raise SyncError(f"Projekt neexistuje: {server}")
+        with WriteLock(server, self.user, self.pc):
+            current = read_comment(server)
+            if text == (current.text if current else ""):
+                return False
+            # nejdřív historie – když se zápis do databáze nepovede, komentář se nezmění
+            with ProjectDB.for_project(server, create=True) as db:
+                with db.conn:
+                    db.add_commit(None, self.user, self.pc, dbm.PROJECT_COMMENT, text)
+            write_comment(server, ProjectComment(text, self.user, self.pc, now_iso()))
+        return True
 
     def project_status(self, name: str) -> ProjectStatus | None:
         """Aktuální stav jednoho projektu (levné – jen výpis .spm/active), None = už neexistuje."""

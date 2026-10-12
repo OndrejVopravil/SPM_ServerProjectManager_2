@@ -4,7 +4,7 @@ import os
 import pytest
 
 from spm import config
-from spm.config import Settings, legacy_settings_path, settings_path
+from spm.config import AppSettings, Settings, legacy_settings_path, settings_path
 
 
 @pytest.fixture(autouse=True)
@@ -79,20 +79,22 @@ def test_main_window_remembers_state(tmp_path):
     app = QApplication.instance() or QApplication([])
     Settings(server_root=str(tmp_path / "server"), local_root=str(tmp_path / "local")).save()
 
-    w = MainWindow(Settings.load())
+    w = MainWindow(AppSettings.load())   # starý formát -> převod na jednu záložku
     w.refresh()
     w.resize(700, 400)
     w.table.setColumnWidth(1, 222)
     w.table.selectRow(1)
     w.close()
 
-    w2 = MainWindow(Settings.load())
-    w2.refresh()
-    assert w2.size().width() == 700
-    assert w2.table.columnWidth(1) == 222
-    assert w2.selected().name == "Beta"
-    w2.close()
-    app.processEvents()
+    w2 = MainWindow(AppSettings.load())
+    try:
+        w2.refresh()
+        assert w2.size().width() == 700
+        assert w2.table.columnWidth(1) == 222
+        assert w2.selected().name == "Beta"
+    finally:
+        w2.close()
+        app.processEvents()
 
 
 def test_auto_refresh_setting_normalized():
