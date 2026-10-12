@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 
 import pytest
+from conftest import settle_panel
 
 from spm.config import Settings
 from spm.restore import RESTORE_DIR_RE, RestoreError
@@ -173,5 +174,5 @@ def test_restore_refreshes_project_list(history, monkeypatch, tmp_path):
     w.restore_project()
     names = [p.name for p in w.projects]
     assert len(names) == 2 and any("_obnova_" in n for n in names)     # seznam se obnovil sám
-    w.panel._thread and w.panel._thread.wait()
+    w.panel._thread and settle_panel(w.panel)
     w.close()

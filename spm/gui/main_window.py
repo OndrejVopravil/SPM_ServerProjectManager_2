@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
-from ..config import AppSettings, Settings
+from ..config import AppSettings, Settings, _same_dir
 from ..db import ProjectDB
 from ..names import format_invalid
 from ..restore import RestoreCatalog, RestoreResult
@@ -42,7 +42,9 @@ from ..sync import (
     UploadResult,
     validate_project_name,
 )
+from ..mirror import Mirror, mirrors_for
 from .comment_dialog import CommentDialog
+from .mirror_dialog import MirrorDialog, format_mirror_counts, format_mirror_problems
 from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
 from .project_panel import ProjectPanel
@@ -162,6 +164,8 @@ class MainWindow(QMainWindow):
         self.act_open = self._action(tb, "Otevřít místní složku", self.open_local)
         self.act_history = self._action(tb, "Historie", self.history)
         tb.addSeparator()
+        self.act_mirrors = self._action(tb, "Zrcadlení", self.open_mirrors,
+                                        tip="Pravidla zrcadlení souborů mezi záložkami")
         self._action(tb, "Nastavení", self.open_settings)
 
         # Popisky zkratek: v liště „Obnovit (F5)“, v kontextové nabídce zarovnaně vpravo.
@@ -212,6 +216,8 @@ class MainWindow(QMainWindow):
         self.panel.submit_requested.connect(self.submit)
         self.panel.publish_requested.connect(self.publish)
         self.panel.take_requested.connect(self.take)
+        self.panel.mirror_matchers = self._mirror_matchers  # označení zrcadlených souborů ve stromu
+        self.panel.mirror_source_label = self.mirror_source_label
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.addWidget(self.table)
         self.splitter.addWidget(self.panel)
@@ -429,13 +435,19 @@ class MainWindow(QMainWindow):
                                 f"Na záložce „{ws['name']}“ máte aktivované projekty.\n"
                                 "Nejdřív je deaktivujte.")
             return
+        rules = [r for r in self.settings.mirror_rules if ws_id in (r.get("source"), r.get("target"))]
         answer = QMessageBox.question(
             self, "Odebrat záložku",
             f"Odebrat záložku „{ws['name']}“?\n\nSíť: {ws.get('server_root') or '—'}\n"
             f"Místní: {ws.get('local_root') or '—'}\n\n"
-            "Projekty na síti ani soubory v místní složce se nemažou – odebere se jen záložka.")
+            "Projekty na síti ani soubory v místní složce se nemažou – odebere se jen záložka."
+            + (f"\n\nOdeberou se i pravidla zrcadlení, která záložku používají ({len(rules)})."
+               if rules else ""))
         if answer != QMessageBox.StandardButton.Yes:
             return
+        if rules:
+            self.settings.mirror_rules = [r for r in self.settings.mirror_rules if r not in rules]
+            self.app_settings.store(self.settings)
         current = self.settings.workspace_id
         self.app_settings.remove_workspace(ws_id)
         self._shared.pop(ws_id, None)
@@ -730,7 +742,8 @@ class MainWindow(QMainWindow):
             intro += f"\n\nNa projektu právě pracuje: {others}. Jejich soubory vybrat nelze."
         dlg = FileSelectDialog(f"Aktivovat projekt {p.name}", intro, entries, "Aktivovat", self,
                                root=self.pm.server_dir(p.name),
-                               skip_option=self.settings.skip_unlocked_download)
+                               skip_option=self.settings.skip_unlocked_download,
+                               mirror_label=self.mirror_source_label)
         accepted = self._exec_dialog(dlg, "select_files")
         paths, only_locked = dlg.selected_paths(), dlg.skip_unlocked()
         dlg.deleteLater()
@@ -766,7 +779,7 @@ class MainWindow(QMainWindow):
             "Vyberte volné soubory, které chcete upravovat. Zamknou se pro vás a stáhne se jejich "
             "aktuální verze ze serveru. Soubory, které držíte vy („já“) nebo jiní, vybrat nelze.",
             entries, "Převzít", self, allow_empty=False, root=self.pm.local_dir(p.name),
-            preselect=preselect)
+            preselect=preselect, mirror_label=self.mirror_source_label)
         accepted = self._exec_dialog(dlg, "select_files")
         paths = dlg.selected_paths()
         dlg.deleteLater()
@@ -847,6 +860,7 @@ class MainWindow(QMainWindow):
             if ended and self.settings.delete_local_after_deactivate and not res.local_deleted:
                 msg += "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
             QMessageBox.information(self, title, msg)
+            self._mirror_after(plan.name)
 
         run_task(self, f"{title} – nahrávání projektu {plan.name}", self.pm.upload, plan,
                  assignments, comment, selected, end_session, on_done=done,
@@ -922,10 +936,94 @@ class MainWindow(QMainWindow):
                 msg += ("\n\nMístní složku se nepodařilo celou smazat (některý soubor je otevřen). "
                         "Data na serveru jsou kompletní, zbytek místní složky smažte ručně.")
             QMessageBox.information(self, "Publikovat", msg)
+            self._mirror_after(p.name)
 
         run_task(self, f"Publikování projektu {p.name}", self.pm.publish, p.name, comment,
                  None if len(paths) == len(files) else paths,
                  on_done=done, on_error=lambda _: self.refresh())
+
+    # --- zrcadlení ---------------------------------------------------------------
+
+    def pm_for(self, ws_id: str) -> ProjectManager:
+        """ProjectManager jiné záložky (stejný uživatel a počítač)."""
+        if ws_id == self.settings.workspace_id:
+            return self.pm
+        return ProjectManager(self.app_settings.view(ws_id), user=self.pm.user, pc=self.pm.pc)
+
+    def mirrors(self, source_ws: str | None = None) -> list[tuple[str, Mirror]]:
+        """(cílová záložka, Mirror) pro zapnutá pravidla – volitelně jen s daným zdrojem."""
+        return [(t, Mirror(self.pm_for(s), self.pm_for(t), rules))
+                for s, t, rules in mirrors_for(self.app_settings, source_ws)]
+
+    def _ws_name(self, ws_id: str) -> str:
+        return next((w["name"] for w in self.app_settings.workspaces if w["id"] == ws_id), ws_id)
+
+    def _mirror_after(self, name: str) -> None:
+        """Po odevzdání / publikování: zrcadlit projekt podle pravidel s touto záložkou jako zdrojem."""
+        groups = [(t, m) for t, m in self.mirrors(self.settings.workspace_id) if m.applies_to(name)]
+        if not groups:
+            return
+
+        def work(progress=None):
+            out = []
+            for t, m in groups:
+                if not m.target_pm.settings.is_complete():
+                    out.append((t, f"Záložka {self._ws_name(t)} nemá nastavené složky."))
+                    continue
+                try:
+                    out.append((t, m.sync_project(name, progress)))
+                except Exception as e:  # noqa: BLE001 – zrcadlení nesmí shodit odevzdání
+                    out.append((t, str(e) or type(e).__name__))
+            return out
+
+        run_task(self, f"Zrcadlení projektu {name}", work, on_done=self._mirror_done)
+
+    def _mirror_done(self, results: list) -> None:
+        problems = []
+        summary = []
+        for ws_id, res in results:
+            target = self._ws_name(ws_id)
+            if isinstance(res, str):
+                problems.append(f"→ {target}: {res}")
+                continue
+            summary.append(f"{res.project} → {target}: {format_mirror_counts(res)}")
+            if not res.ok:
+                problems.append(f"→ {target}:\n" + format_mirror_problems(res))
+        self._set_mirror_label(summary, bool(problems))
+        if problems:
+            QMessageBox.warning(self, "Zrcadlení",
+                                "Zrcadlení neproběhlo celé – zbytek se zkusí při příštím zrcadlení.\n\n"
+                                + "\n\n".join(problems))
+
+    def _set_mirror_label(self, summary: list[str], problem: bool) -> None:
+        if not hasattr(self, "mirror_label"):
+            self.mirror_label = QLabel()
+            self.statusBar().insertPermanentWidget(0, self.mirror_label)
+        stamp = time.strftime("%H:%M")
+        self.mirror_label.setText(f"Zrcadlení {stamp}: " + ("s problémy" if problem else "v pořádku"))
+        self.mirror_label.setToolTip("\n".join(summary))
+        self.mirror_label.setStyleSheet("color: #c0392b;" if problem else "")
+
+    def _mirror_matchers(self) -> list[tuple[str, object]]:
+        """Pro strom: (název cílové záložky, shoda(projekt, cesta)) pro zapnutá pravidla,
+        jejichž zdrojem je aktuální záložka."""
+        return [(self._ws_name(t), Mirror(None, None, rules).matches)
+                for _s, t, rules in mirrors_for(self.app_settings, self.settings.workspace_id)]
+
+    def mirror_source_label(self, source: str) -> str:
+        """Zdroj zrcadla (cesta ke zdrojovému projektu) jako název záložky, pokud ji uživatel má;
+        jinak cesta."""
+        parent = str(Path(source).parent)
+        for ws in self.app_settings.workspaces:
+            if ws.get("server_root") and _same_dir(ws["server_root"], parent):
+                return ws["name"]
+        return source
+
+    def open_mirrors(self) -> None:
+        dlg = MirrorDialog(self, self)
+        self._exec_dialog(dlg, "mirrors")
+        dlg.deleteLater()
+        self.panel._fill()  # pravidla se mohla změnit – označení ve stromu
 
     def _on_double_click(self, index) -> None:
         """Dvojklik: na názvu aktivace / deaktivace (jako F3), na komentáři jeho úprava,

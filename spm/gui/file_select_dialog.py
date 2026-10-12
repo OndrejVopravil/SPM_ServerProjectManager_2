@@ -7,6 +7,7 @@ podsložku pak lze odškrtnout. Soubory, které drží jiný uživatel, vybrat n
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
@@ -27,12 +28,14 @@ from .check_tree import CheckTree, TreeEntry, in_scope
 
 COLOR_TAKEN = QColor("#c0392b")
 COLOR_MINE = QColor("#2e8b57")
+COLOR_MIRROR = QColor("#8e44ad")  # spravuje zrcadlo z jiného serveru (jen pro čtení)
 
 
 class FileSelectDialog(QDialog):
     def __init__(self, title: str, intro: str, entries: list[FileEntry], ok_text: str,
                  parent: QWidget | None = None, allow_empty: bool = True, root: Path | None = None,
-                 preselect: str | None = None, skip_option: bool | None = None):
+                 preselect: str | None = None, skip_option: bool | None = None,
+                 mirror_label: Callable[[str], str] = lambda source: source):
         """root: složka, kde soubory skutečně leží (pro jejich ikony).
         preselect: soubor nebo složka (zakončená '/'), jejíž volné soubory budou předem zaškrtnuté.
         skip_option: zobrazit volbu „Nestahovat neaktivované soubory“ s tímto výchozím stavem
@@ -42,16 +45,21 @@ class FileSelectDialog(QDialog):
         self.resize(760, 600)
         self.allow_empty = allow_empty
 
-        self.tree = CheckTree(["Soubor", "Drží"])
+        self.tree = CheckTree(["Soubor", "Drží", "Zrcadlo"])
         checked = {e.path for e in entries if e.free and in_scope(e.path, preselect)}
         self.tree.set_entries([
             TreeEntry(e.path, e.path,
-                      ["" if e.free else ("já" if e.mine else e.owner.label)],
+                      [e.holder, f"← {mirror_label(e.mirror)}" if e.mirror else ""],
                       enabled=e.free,
-                      color=None if e.free else (COLOR_MINE if e.mine else COLOR_TAKEN),
-                      file_path=str(to_abs(root, e.path)) if root else None)
+                      color=None if e.free else (COLOR_MINE if e.mine else
+                                                 COLOR_MIRROR if e.mirror else COLOR_TAKEN),
+                      file_path=str(to_abs(root, e.path)) if root else None,
+                      tooltip=(f"Soubor spravuje zrcadlo z {e.mirror} – zde ho nelze zamknout, "
+                               "změny se dělají ve zdroji." if e.mirror else ""))
             for e in entries
         ], checked)
+        # sloupec Zrcadlo jen u projektu, do kterého se zrcadlí (soubory ze zrcadla nelze vybrat)
+        self.tree.setColumnHidden(2, not any(e.mirror for e in entries))
         self.tree.toggled.connect(self._update_count)
 
         select_all = QPushButton("Vybrat vše volné")

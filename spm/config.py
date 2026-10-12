@@ -79,6 +79,8 @@ class Settings:
     # v nové verzi se tak do existujícího nastavení doplní jen jednou (a uživatel ho
     # pak může v nastavení odebrat, aniž by se znovu vracel).
     known_default_ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
+    # Pravidla zrcadlení mezi záložkami (osobní; viz mirror.MirrorRule)
+    mirror_rules: list[dict] = field(default_factory=list)
     # Stav rozhraní (poloha a velikost oken, šířky sloupců, poslední projekt)
     ui: dict[str, str] = field(default_factory=dict)
     # Záložka, ke které nastavení patří, a celé nastavení aplikace (neukládá se)

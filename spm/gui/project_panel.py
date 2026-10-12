@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from typing import Callable
 
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette
@@ -31,6 +32,7 @@ from ..sync import FileEntry, ProjectManager, ProjectStatus, validate_file_name
 from .check_tree import KEY_ROLE, PATH_ROLE, CheckTree, TreeEntry, in_scope
 
 COLOR_MINE = QColor("#2e8b57")
+COLOR_MIRROR = QColor("#8e44ad")  # spravuje zrcadlo z jiného serveru (jen pro čtení)
 COLOR_OTHER = QColor("#c0392b")
 
 
@@ -86,6 +88,10 @@ class ProjectPanel(QWidget):
         self._thread: EntriesThread | None = None
         self._again = False
         self._closed = False  # okno se zavírá – výsledky z pozadí už nezobrazovat
+        # pravidla zrcadlení, kde je záložka projektu zdrojem: () -> [(název cíle, shoda(projekt, cesta))]
+        self.mirror_matchers: Callable[[], list[tuple[str, Callable[[str, str], bool]]]] | None = None
+        # popis zdroje zrcadla (cesta zdrojového projektu -> např. název záložky)
+        self.mirror_source_label: Callable[[str], str] = lambda source: source
 
         self.title = QLabel()
         self.summary = QLabel()
@@ -97,7 +103,7 @@ class ProjectPanel(QWidget):
         head.addStretch()
         head.addWidget(self.only_locked)
 
-        self.tree = CheckTree(["Soubor", "Drží"], checkable=False)
+        self.tree = CheckTree(["Soubor", "Drží", "Zrcadlo"], checkable=False)
         self.tree.itemDoubleClicked.connect(self._on_double_click)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._context_menu)
@@ -173,7 +179,7 @@ class ProjectPanel(QWidget):
             self.summary.setText(
                 f"Složka je jen v místním úložišti – <b>{len(self.entries)}</b> souborů. "
                 "Pravým tlačítkem můžete soubor otevřít, publikovat celou složku nebo jen její část, "
-                "nebo smazat do Koše.")
+                "nebo smazat do Koše." + self._mark_mirror())
             return
 
         def tree_entry(e: FileEntry) -> TreeEntry:
@@ -198,10 +204,14 @@ class ProjectPanel(QWidget):
                 tip = "Dvojklikem otevřete z místní kopie"
             else:
                 tip = "Dvojklikem otevřete z místní kopie (jen pro čtení – soubor nemáte zamčený)"
-            return TreeEntry(e.path, e.path,
-                             ["" if e.free else ("já" if e.mine else e.owner.label)],
-                             color=None if e.free else (COLOR_MINE if e.mine else COLOR_OTHER),
-                             color_name=True,  # zelená = drží ho já, červená = drží ho jiný
+            if e.mirror:
+                tip = (f"Soubor spravuje zrcadlo z {e.mirror} – zde ho nelze převzít ani upravit, "
+                       "změny se dělají ve zdroji." + (f"\n{tip}" if tip else ""))
+            return TreeEntry(e.path, e.path, [e.holder],
+                             color=None if e.free else (COLOR_MINE if e.mine else
+                                                        COLOR_MIRROR if e.mirror else COLOR_OTHER),
+                             # zelená = drží ho já, červená = drží ho jiný, fialová = zrcadlo
+                             color_name=True,
                              file_path=str(to_abs(root, e.path)), tooltip=tip)
 
         shown = [e for e in self.entries
@@ -210,13 +220,59 @@ class ProjectPanel(QWidget):
         counts = Counter("já" if e.mine else e.owner.label for e in self.entries if e.owner)
         free = sum(1 for e in self.entries if e.free)
         new = sum(1 for e in self.entries if e.local_new)
+        mirrored = sum(1 for e in self.entries if e.mirror and not e.owner)
         parts = [f"{who}: <b>{n}</b>" for who, n in sorted(counts.items())]
         users = ", ".join(u.label for u in self.project.users) or "nikdo (projekt je volný)"
         self.summary.setText(
             f"Aktivováno: {users}<br>Zamčené soubory – " + (", ".join(parts) or "žádné")
             + f" &nbsp;|&nbsp; volné: <b>{free}</b>"
+            + (f" &nbsp;|&nbsp; zrcadlo: <b>{mirrored}</b>" if mirrored else "")
             + (f" &nbsp;|&nbsp; nové neodevzdané: <b>{new}</b>" if new else "")
-            + f" &nbsp;|&nbsp; na serveru celkem: {len(self.entries) - new}")
+            + f" &nbsp;|&nbsp; na serveru celkem: {len(self.entries) - new}"
+            + self._mark_mirror())
+
+    def _mark_mirror(self) -> str:
+        """Sloupec Zrcadlo (zobrazený vždy):
+        - „← zdroj“ u souborů, které sem zrcadlo přináší z jiného serveru (jen pro čtení),
+        - „→ cíl“ u souborů, které odpovídají pravidlům zrcadlení z této záložky,
+        u složek s počtem takových souborů. Vrací doplněk souhrnu."""
+        if self.project is None:
+            return ""
+        matchers = self.mirror_matchers() if self.mirror_matchers else []
+        texts: dict[str, tuple[str, str]] = {}
+        folders: dict[str, Counter] = {}
+        outgoing = 0
+        for e in self.entries:
+            if e.local_deleted:
+                continue
+            labels, tips = [], []
+            if e.mirror:
+                source = self.mirror_source_label(e.mirror)
+                labels.append(f"← {source}")
+                tips.append(f"Soubor spravuje zrcadlo z {e.mirror} – zde ho nelze převzít ani "
+                            "upravit, změny se dělají ve zdroji.")
+            targets = [name for name, match in matchers if match(self.project.name, e.path)]
+            if targets:
+                outgoing += 1
+                labels += [f"→ {t}" for t in targets]
+                tips.append("Soubor odpovídá pravidlu zrcadlení – po odevzdání se zrcadlí do: "
+                            + ", ".join(targets))
+            if not labels:
+                continue
+            texts[e.path] = (", ".join(labels), "\n".join(tips))
+            parts = e.path.split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                folders.setdefault("/".join(parts[:i]) + "/", Counter()).update(labels)
+        for folder, counter in folders.items():
+            texts[folder] = (", ".join(f"{label} ({n})" for label, n in sorted(counter.items())),
+                             "Počet souborů ve složce: " + ", ".join(
+                                 f"{label}: {n}" for label, n in sorted(counter.items())))
+        self.tree.set_column_texts(2, texts, COLOR_MIRROR)
+        if not matchers:
+            return ""
+        targets = sorted({name for name, _ in matchers})
+        return (f" &nbsp;|&nbsp; zrcadlí se: <b>{outgoing}</b> → {', '.join(targets)}" if outgoing
+                else f" &nbsp;|&nbsp; nic z projektu neodpovídá pravidlům zrcadlení do {', '.join(targets)}")
 
     def context_actions(self, scope: str) -> dict[str, bool]:
         """Které akce kontextového menu jsou pro soubor / složku dostupné."""

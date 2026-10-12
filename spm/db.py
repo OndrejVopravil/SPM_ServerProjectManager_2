@@ -82,6 +82,23 @@ CREATE INDEX IF NOT EXISTS ix_changes_commit ON changes(commit_id);
 CREATE INDEX IF NOT EXISTS ix_changes_file ON changes(file_id);
 """
 
+# Zrcadlení (v cílovém projektu): soubory spravované zrcadlem z jiného serveru. Tabulky se
+# zakládají až při prvním zrcadlení – ostatní databáze zůstávají beze změny.
+MIRROR_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mirror_files (
+    file_id        TEXT PRIMARY KEY REFERENCES files(file_id),
+    source         TEXT NOT NULL,       -- zdrojový projekt (cesta ke složce na serveru)
+    source_file_id TEXT NOT NULL        -- file_id souboru v databázi zdrojového projektu
+);
+CREATE INDEX IF NOT EXISTS ix_mirror_source ON mirror_files(source, source_file_id);
+
+CREATE TABLE IF NOT EXISTS mirror_sources (
+    source        TEXT PRIMARY KEY,
+    synced_commit INTEGER,              -- poslední záznam historie zdroje, ke kterému je zrcadlo aktuální
+    synced_at     TEXT
+);
+"""
+
 # Typy změn souborů
 ADDED = "added"
 MODIFIED = "modified"
@@ -116,6 +133,7 @@ PROJECT_RENAMED = "project-renamed"
 CANCELLED = "cancelled"             # zrušení vlastní aktivace
 FORCE_UNLOCK = "force-unlock"       # odebrání zámků jiného uživatele
 PROJECT_COMMENT = "project-comment"  # změna komentáře projektu (komentář záznamu = nový text)
+MIRROR = "mirror"                   # soubory zrcadlené z jiného serveru (v cílovém projektu)
 
 COMMIT_LABELS = {
     UPLOAD: "Odevzdání",
@@ -125,6 +143,7 @@ COMMIT_LABELS = {
     CANCELLED: "Zrušení aktivace",
     FORCE_UNLOCK: "Odebrání zámků",
     PROJECT_COMMENT: "Komentář projektu",
+    MIRROR: "Zrcadlení",
 }
 
 
@@ -342,6 +361,43 @@ class ProjectDB:
             "mtime, sha256, backup_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (commit_id, file_id, change_type, old_path, new_path, size, mtime, sha256, backup_path),
         )
+
+    # --- zrcadlení (cílový projekt) --------------------------------------
+
+    def ensure_mirror_tables(self) -> None:
+        self.conn.executescript(MIRROR_SCHEMA)
+
+    def mirrored(self) -> dict[str, tuple[str, str]]:
+        """file_id -> (zdroj, file_id ve zdroji) u souborů spravovaných zrcadlem."""
+        try:
+            rows = self.conn.execute(
+                "SELECT m.file_id, m.source, m.source_file_id FROM mirror_files m "
+                "JOIN files f USING(file_id) WHERE f.deleted = 0").fetchall()
+        except sqlite3.OperationalError:
+            return {}  # projekt nikdy nebyl cílem zrcadlení
+        return {r[0]: (r[1], r[2]) for r in rows}
+
+    def set_mirrored(self, file_id: str, source: str, source_file_id: str) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO mirror_files(file_id, source, source_file_id) "
+                          "VALUES (?, ?, ?)", (file_id, source, source_file_id))
+
+    def unset_mirrored(self, file_id: str) -> None:
+        self.conn.execute("DELETE FROM mirror_files WHERE file_id = ?", (file_id,))
+
+    def mirror_synced(self, source: str) -> int | None:
+        try:
+            row = self.conn.execute("SELECT synced_commit FROM mirror_sources WHERE source = ?",
+                                    (source,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return row[0] if row else None
+
+    def set_mirror_synced(self, source: str, commit_id: int | None) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO mirror_sources(source, synced_commit, synced_at) "
+                          "VALUES (?, ?, ?)", (source, commit_id, now_iso()))
+
+    def last_commit_id(self) -> int | None:
+        return self.conn.execute("SELECT MAX(commit_id) FROM commits").fetchone()[0]
 
     # --- historie ------------------------------------------------------
 

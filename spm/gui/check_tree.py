@@ -118,6 +118,21 @@ class CheckTree(QTreeWidget):
         if to_load:
             icons.loader().request(to_load)
 
+    def set_column_texts(self, column: int, texts: dict[str, tuple[str, str]],
+                         color: QColor | None = None) -> None:
+        """Doplní text (a tooltip) sloupce podle cesty – soubor 'a/b.nc', složka 'a/'."""
+        self.blockSignals(True)
+        it = QTreeWidgetItemIterator(self)
+        while it.value():
+            item = it.value()
+            text, tip = texts.get(item.data(0, PATH_ROLE), ("", ""))
+            item.setText(column, text)
+            item.setToolTip(column, tip)
+            if color is not None and text:
+                item.setForeground(column, color)
+            it += 1
+        self.blockSignals(False)
+
     def _on_icon(self, path: str, image: QImage) -> None:
         """Doručena skutečná ikona souboru z vlákna na pozadí."""
         item = self._by_file.pop(path, None)

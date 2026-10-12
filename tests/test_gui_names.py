@@ -1,6 +1,7 @@
 import os
 
 import pytest
+from conftest import settle_panel
 
 from spm import config
 from spm.config import Settings
@@ -66,7 +67,7 @@ def test_tree_shown_for_any_project(window):
     from PySide6.QtWidgets import QApplication
     select(window, "Spatny")
     assert not window.panel.isHidden()
-    window.panel._thread.wait()
+    settle_panel(window.panel)
     QApplication.processEvents()
     assert sorted(e.path for e in window.panel.entries) == ["Výkresy/a.dwg", "ok.txt"]
     actions = window.panel.context_actions("ok.txt")

@@ -2,6 +2,7 @@ from PySide6.QtGui import QPalette
 import os
 
 import pytest
+from conftest import settle_panel
 
 from spm.config import Settings
 from spm.gui.main_window import COL_STATE, COL_USERS
@@ -147,13 +148,13 @@ def test_project_panel_shows_locks_only_for_active_projects(app, pms, tmp_path, 
     # strom se zobrazí i u volného projektu
     w.table.selectRow(names.index("Volny"))
     assert not w.panel.isHidden() and "Stav projektu Volny" in w.panel.title.text()
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
     assert "nikdo (projekt je volný)" in w.panel.summary.text()
 
     w.table.selectRow(names.index("Forma"))
     assert not w.panel.isHidden()
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
     owners = {e.path: (e.owner.user if e.owner else None, e.mine) for e in w.panel.entries}
     assert owners["sestava/sestava.elt"] == ("alice", False)
@@ -188,7 +189,7 @@ def test_click_refreshes_row_without_full_refresh(app, pms, tmp_path, monkeypatc
     assert w.table.item(row, COL_STATE).text() == "Pracují jiní"
     assert w.table.item(row, COL_USERS).text() == "alice"
     assert not w.panel.isHidden()
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     w.close()
 
 
@@ -221,7 +222,7 @@ def test_f3_toggles_activation(app, pms, tmp_path, monkeypatch):
     w.table.clearSelection()                  # nic vybráno -> nic
     w.toggle_activation()
     assert calls == ["activate", "deactivate"]
-    w.panel._thread and w.panel._thread.wait()
+    w.panel._thread and settle_panel(w.panel)
     w.close()
 
 
@@ -242,7 +243,7 @@ def test_panel_double_click_opens_files_in_local_copy(app, pms, tmp_path, monkey
     w.pm = w.panel.pm = bob
     w.refresh(check_names=False)
     w.table.selectRow([p.name for p in w.projects].index("Forma"))
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
 
     for path in ("sestava/sestava.elt", "sestava/elektrody/E01.elt", "dily/deska.elt"):
@@ -269,7 +270,7 @@ def test_panel_context_actions_and_preselection(app, pms, tmp_path, monkeypatch)
     w.pm = w.panel.pm = bob
     w.refresh(check_names=False)
     w.table.selectRow([p.name for p in w.projects].index("Forma"))
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
 
     ca = w.panel.context_actions
@@ -322,7 +323,7 @@ def test_panel_colors_file_names_by_owner(app, pms, tmp_path, monkeypatch):
     w.pm = w.panel.pm = bob
     w.refresh(check_names=False)
     w.table.selectRow([p.name for p in w.projects].index("Forma"))
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
     tree = w.panel.tree
     assert find(tree, "dily/deska.elt").foreground(0).color() == COLOR_MINE
@@ -355,7 +356,7 @@ def test_panel_shows_new_local_files(app, pms, tmp_path, monkeypatch):
     w.pm = w.panel.pm = bob
     w.refresh(check_names=False)
     w.table.selectRow([p.name for p in w.projects].index("Forma"))
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
 
     new = sorted(e.path for e in w.panel.entries if e.local_new)
@@ -415,14 +416,14 @@ def test_panel_delete_to_recycle_bin(app, pms, tmp_path, monkeypatch):
     w.pm = w.panel.pm = bob
     w.refresh(check_names=False)
     w.table.selectRow([p.name for p in w.projects].index("Forma"))
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
 
     assert sorted(w.panel.deletable("sestava/")) == ["sestava/elektrody/E01.elt", "sestava/elektrody/E09.elt"]
     w.panel._delete("sestava/")
     assert "2 dalších souborů ve složce nemáte zamčených" in questions[0]   # sestava.elt + E02
     assert sorted(p.name for p in kos.iterdir()) == ["E01.elt", "E09.elt"]
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
 
     e01 = next(e for e in w.panel.entries if e.path == "sestava/elektrody/E01.elt")
@@ -461,7 +462,7 @@ def test_panel_open_unavailable_for_files_not_in_local_copy(app, pms, tmp_path, 
     w.pm = w.panel.pm = bob
     w.refresh(check_names=False)
     w.table.selectRow([p.name for p in w.projects].index("Forma"))
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
     assert w.panel.context_actions("dily/deska.elt")["open"] is True
     assert w.panel.context_actions("sestava/sestava.elt")["open"] is False   # nestaženo
@@ -491,7 +492,7 @@ def test_panel_for_local_only_folder(app, pms, tmp_path, monkeypatch):
     w.refresh(check_names=False)
     w.table.selectRow([p.name for p in w.projects].index("NovaForma"))
     assert not w.panel.isHidden() and "jen místně" in w.panel.title.text()
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
     assert sorted(e.path for e in w.panel.entries) == ["dily/deska.elt", "dily/kolik.elt", "poznamky.txt"]
     assert w.panel.context_actions("dily/") == {"open": False, "submit": False, "take": False,
@@ -540,7 +541,7 @@ def test_refresh_when_app_becomes_active(app, pms, tmp_path, monkeypatch):
     assert w.table.item([p.name for p in w.projects].index("Forma"), COL_USERS).text() == "alice"
     w._on_app_state(active)
     assert len(calls) == 1                               # hned znovu – nic
-    w.panel._thread and w.panel._thread.wait()
+    w.panel._thread and settle_panel(w.panel)
     w.close()
 
 
@@ -557,7 +558,7 @@ def test_panel_rename_with_f2(app, pms, tmp_path, monkeypatch):
     w.pm = w.panel.pm = bob
     w.refresh(check_names=False)
     w.table.selectRow([p.name for p in w.projects].index("Forma"))
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
     assert w.panel.context_actions("dily/deska.elt")["rename"] is True
     assert w.panel.context_actions("sestava/sestava.elt")["rename"] is False   # volný – nejdřív převzít
@@ -565,7 +566,7 @@ def test_panel_rename_with_f2(app, pms, tmp_path, monkeypatch):
     monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("deska_pevna.elt", True))
     w.panel.tree.setCurrentItem(find(w.panel.tree, "dily/deska.elt"))
     w.panel.rename_selected()                                                  # = F2
-    w.panel._thread.wait()
+    settle_panel(w.panel)
     app.processEvents()
     assert (bob.local_dir("Forma") / "dily" / "deska_pevna.elt").exists()
     item = find(w.panel.tree, "dily/deska_pevna.elt")
