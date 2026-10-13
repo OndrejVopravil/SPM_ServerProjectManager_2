@@ -8,11 +8,15 @@ místní kopie a zveřejní se s odevzdáním. Okno může zůstat otevřené ve
 
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from urllib.parse import quote, unquote
 
-from PySide6.QtCore import QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QEvent, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QPalette, QTextDocument
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -60,35 +64,141 @@ def recipient_from_text(text: str, known: dict[str, str]) -> tuple[str, str]:
 
 def notes_markdown(notes: list[Note], me: str, seen: int, show_resolved: bool,
                    links: bool = True) -> str:
-    """Poznámky jako jeden Markdown dokument (pro okno i export do .md)."""
+    """Poznámky jako jeden Markdown dokument (export do .md)."""
     parts = []
     for n in notes:
         if n.resolved and not show_resolved:
             continue
         flags = []
-        if links and n.note_id > seen:
-            flags.append("**NOVÁ**")
         if n.is_for(me):
             flags.append("**pro vás**")
         elif n.recipient:
             flags.append(f"pro {n.recipient_name or n.recipient}")
+        if n.edited_at:
+            flags.append(f"upraveno {fmt_time(n.edited_at)}")
         if n.resolved:
             flags.append(f"vyřízeno ({n.resolved_by}, {fmt_time(n.resolved_at)})")
         head = f"### {n.author} · {fmt_time(n.created_at)}"
         lines = [head + (" · " + " · ".join(flags) if flags else "")]
         if n.targets:
-            if links:
-                lines.append("Týká se: " + ", ".join(f"[{t}](spmfile:{quote(t)})" for t in n.targets))
-            else:
-                lines.append("Týká se: " + ", ".join(f"`{t}`" for t in n.targets))
+            lines.append("Týká se: " + ", ".join(f"`{t}`" for t in n.targets))
         lines.append("")
         lines.append(n.text)
-        if links:
+        for r in n.replies:
+            edited = f" · upraveno {fmt_time(r.edited_at)}" if r.edited_at else ""
             lines.append("")
-            lines.append(f"[Znovu otevřít](spmreopen:{n.note_id})" if n.resolved
-                         else f"[Označit jako vyřízené](spmresolve:{n.note_id})")
+            lines.append(f"> **{r.author}** · {fmt_time(r.created_at)}{edited}  ")
+            lines += [f"> {line}" for line in r.text.splitlines()]
         parts.append("\n".join(lines))
     return "\n\n---\n\n".join(parts)
+
+
+@dataclass(frozen=True)
+class ForMeColors:
+    """Barvy karty poznámky „pro mě“."""
+    background: str
+    border: str
+    label: str      # nápis „PRO VÁS“
+    text: str
+
+
+# světlý režim: tlumená teplá béžová, tmavý text
+FOR_ME_LIGHT = ForMeColors(background="#faf6ea", border="#d8c9a0", label="#8a6d1f", text="#000000")
+# tmavý režim: šedožlutá (tmavá olivově šedá), bílý text
+FOR_ME_DARK = ForMeColors(background="#4a4636", border="#7d7350", label="#e3c86f", text="#ffffff")
+FOR_ME_BACKGROUND = FOR_ME_LIGHT.background  # (pro testy a zpětnou kompatibilitu)
+
+
+def is_dark(widget: QWidget) -> bool:
+    """Tmavý režim – podle jasu pozadí (funguje se systémovým tmavým motivem i vlastní paletou)."""
+    return widget.palette().color(QPalette.ColorRole.Base).lightness() < 128
+REPLY_BORDER = "#9e9e9e"        # odsazení doplnění
+
+
+def markdown_to_html(text: str) -> str:
+    """Text poznámky (Markdown) jako HTML fragment (obsah <body>)."""
+    doc = QTextDocument()
+    doc.setMarkdown(text)
+    html = doc.toHtml()
+    match = re.search(r"<body[^>]*>(.*)</body>", html, re.S)
+    return match.group(1) if match else html
+
+
+def _links(*items: tuple[str, str]) -> str:
+    return "<p>" + " &nbsp;·&nbsp; ".join(f'<a href="{href}">{escape(text)}</a>'
+                                           for href, text in items) + "</p>"
+
+
+def _edited(n: Note) -> str:
+    if not n.edited_at:
+        return ""
+    return f" · upraveno {fmt_time(n.edited_at)}"
+
+
+def _reply_html(r: Note, me: str, seen: int) -> str:
+    new = " · <b>NOVÉ</b>" if r.is_new(seen, me) else ""
+    actions = []
+    if r.is_author(me):
+        actions.append((f"spmedit:{r.note_id}", "Upravit"))
+    if r.versions:
+        actions.append((f"spmversions:{r.note_id}", f"Předchozí znění ({len(r.versions)})"))
+    return (f'<table width="100%" cellpadding="4" cellspacing="0" border="0"><tr>'
+            f'<td width="6" bgcolor="{REPLY_BORDER}"></td><td>'
+            f"<p><b>{escape(r.author)}</b> · {fmt_time(r.created_at)}{_edited(r)}{new}</p>"
+            f"{markdown_to_html(r.text)}{_links(*actions) if actions else ''}</td></tr></table>")
+
+
+def notes_html(notes: list[Note], me: str, seen: int, show_resolved: bool,
+               colors: ForMeColors = FOR_ME_LIGHT) -> str:
+    """Poznámky pro okno: každá jako karta s doplněními pod sebou; poznámka pro mě je
+    zvýrazněná barvou a rámečkem. Odkazy: soubory (spmfile), vyřídit / znovu otevřít,
+    doplnit (spmreply), upravit (spmedit – jen autor), předchozí znění (spmversions)."""
+    cards = []
+    for n in notes:
+        if n.resolved and not show_resolved:
+            continue
+        for_me = n.is_for(me)
+        flags = []
+        if n.is_new(seen, me):
+            flags.append("<b>NOVÁ</b>" if not n.edited_at else "<b>UPRAVENÁ</b>")
+        elif any(r.is_new(seen, me) for r in n.replies):
+            flags.append("<b>nové doplnění</b>")
+        if for_me:
+            flags.append("<b>pro vás</b>")
+        elif n.recipient:
+            flags.append(f"pro {escape(n.recipient_name or n.recipient)}")
+        if n.resolved:
+            flags.append(f"vyřízeno ({escape(n.resolved_by or '')}, {fmt_time(n.resolved_at)})")
+        head = f"<b>{escape(n.author)}</b> · {fmt_time(n.created_at)}{_edited(n)}"
+        if flags:
+            head += " · " + " · ".join(flags)
+        rows = []
+        if for_me:
+            rows.append(f'<p style="color:{colors.label};"><b>▶ PRO VÁS</b></p>')
+        rows.append(f"<p>{head}</p>")
+        if n.targets:
+            rows.append("<p>Týká se: " + ", ".join(
+                f'<a href="spmfile:{quote(t)}">{escape(t)}</a>' for t in n.targets) + "</p>")
+        rows.append(markdown_to_html(n.text))
+        rows += [_reply_html(r, me, seen) for r in n.replies]
+        actions = [(f"spmreply:{n.note_id}", "Doplnit")]
+        if n.is_author(me):
+            actions.append((f"spmedit:{n.note_id}", "Upravit"))
+        if n.versions:
+            actions.append((f"spmversions:{n.note_id}", f"Předchozí znění ({len(n.versions)})"))
+        actions.append((f"spmreopen:{n.note_id}", "Znovu otevřít") if n.resolved
+                       else (f"spmresolve:{n.note_id}", "Označit jako vyřízené"))
+        rows.append(_links(*actions))
+        body = "".join(rows)
+        if for_me:
+            cards.append(f'<table width="100%" cellpadding="8" cellspacing="0" border="1" '
+                         f'style="border-color:{colors.border}; border-style:solid;" '
+                         f'bgcolor="{colors.background}"><tr><td style="color:{colors.text};">'
+                         f"{body}</td></tr></table>")
+        else:
+            cards.append(f'<table width="100%" cellpadding="8" cellspacing="0" border="0">'
+                         f"<tr><td>{body}</td></tr></table>")
+    return "<hr>".join(cards)
 
 
 class NotesWindow(QWidget):
@@ -206,28 +316,82 @@ class NotesWindow(QWidget):
 
     def _render(self) -> None:
         seen = self._seen_get()
-        text = notes_markdown(self.notes, self.pm.user, seen, self.show_resolved.isChecked())
-        if not text:
-            text = ("*Projekt nemá žádné otevřené poznámky.*" if self.notes
-                    else "*Projekt zatím nemá žádné poznámky.*")
+        html = notes_html(self.notes, self.pm.user, seen, self.show_resolved.isChecked(),
+                          FOR_ME_DARK if is_dark(self.view) else FOR_ME_LIGHT)
+        if not html:
+            html = ("<p><i>Projekt nemá žádné otevřené poznámky.</i></p>" if self.notes
+                    else "<p><i>Projekt zatím nemá žádné poznámky.</i></p>")
         bar = self.view.verticalScrollBar().value()
-        self.view.setMarkdown(text)
+        self.view.setHtml(html)
         self.view.verticalScrollBar().setValue(bar)
         if self.notes:
-            self._seen_set(max(n.note_id for n in self.notes))  # zobrazeno = přečteno
+            self._seen_set(max(n.last_seq for n in self.notes))  # zobrazeno = přečteno
+
+    def _find(self, note_id: int) -> Note | None:
+        for n in self.notes:
+            if n.note_id == note_id:
+                return n
+            for r in n.replies:
+                if r.note_id == note_id:
+                    return r
+        return None
 
     def _on_link(self, url: QUrl) -> None:
         scheme, value = url.scheme(), unquote(url.path() or url.toString().split(":", 1)[-1])
         if scheme == "spmfile":
             self.file_clicked.emit(value)
-        elif scheme in ("spmresolve", "spmreopen"):
-            try:
-                self.pm.resolve_note(self.name, int(value), resolved=scheme == "spmresolve")
-            except Exception as e:  # noqa: BLE001
-                QMessageBox.critical(self, "Poznámky", str(e))
-            self.notes = self.pm.notes(self.name)
-            self._render()
-            self.changed.emit()
+            return
+        note = self._find(int(value)) if value.isdigit() else None
+        if note is None:
+            return
+        try:
+            if scheme in ("spmresolve", "spmreopen"):
+                self.pm.resolve_note(self.name, note.note_id, resolved=scheme == "spmresolve")
+            elif scheme == "spmreply":
+                dlg = NoteEditDialog(f"Doplnit poznámku – {note.author}", "", None, [], self,
+                                     hint="Doplnění se zveřejní hned. Původní poznámka se nemění.",
+                                     ok_text="Doplnit")
+                if not dlg.exec():
+                    return
+                self.pm.reply_note(self.name, note.note_id, dlg.text_value())
+            elif scheme == "spmedit":
+                users = [] if note.parent_id else self._user_list()
+                dlg = NoteEditDialog("Upravit poznámku", note.text,
+                                     None if note.parent_id else (note.recipient, note.recipient_name),
+                                     users, self, ok_text="Uložit",
+                                     hint="Předchozí znění se uloží; ostatním se poznámka znovu "
+                                          "označí jako upravená.")
+                if not dlg.exec():
+                    return
+                recipient, recipient_name = dlg.recipient_value() if not note.parent_id else (None, None)
+                self.pm.edit_note(self.name, note.note_id, dlg.text_value(), recipient, recipient_name)
+            elif scheme == "spmversions":
+                self._show_versions(note)
+                return
+            else:
+                return
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Poznámky", str(e))
+        self.notes = self.pm.notes(self.name)
+        self._render()
+        self.changed.emit()
+
+    def _user_list(self) -> list:
+        try:
+            return self.pm.users()
+        except OSError:
+            return []
+
+    def _show_versions(self, note: Note) -> None:
+        lines = [f"Aktuální znění ({fmt_time(note.edited_at)}):\n{note.text}"]
+        for v in note.versions:
+            to = f" – pro {v.recipient_name or v.recipient}" if v.recipient else ""
+            lines.append(f"Nahrazeno {fmt_time(v.saved_at)}{to}:\n{v.text}")
+        box = QMessageBox(QMessageBox.Icon.Information, "Předchozí znění poznámky",
+                          f"Poznámka byla upravena {len(note.versions)}×. Všechna znění jsou "
+                          "v podrobnostech (nejnovější první).", parent=self)
+        box.setDetailedText("\n\n────────\n\n".join(lines))
+        box.exec()
 
     def export_md(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export poznámek", f"{self.name}_poznamky.md",
@@ -358,6 +522,12 @@ class NotesWindow(QWidget):
             self.targets.setText("Týká se: celého projektu")
             self.flush()
 
+    def changeEvent(self, event) -> None:
+        # přepnutí světlého / tmavého motivu za běhu -> překreslit barvy karet
+        if event.type() == QEvent.Type.PaletteChange and hasattr(self, "view"):
+            self._render()
+        super().changeEvent(event)
+
     def closeEvent(self, event) -> None:
         self.flush()
         super().closeEvent(event)
@@ -409,3 +579,61 @@ class QuickNoteDialog(QDialog):
                                           {self.recipient.itemText(i): self.recipient.itemData(i)
                                            for i in range(1, self.recipient.count())})
         return Draft(self.text.toPlainText(), login, name, self.targets)
+
+
+class NoteEditDialog(QDialog):
+    """Úprava zveřejněné poznámky autorem, nebo doplnění k poznámce (bez adresáta)."""
+
+    def __init__(self, title: str, text: str, recipient: tuple[str, str] | None, users: list,
+                 parent: QWidget | None = None, hint: str = "", ok_text: str = "OK"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(520, 360)
+        layout = QVBoxLayout(self)
+        if hint:
+            info = QLabel(hint)
+            info.setWordWrap(True)
+            layout.addWidget(info)
+        self.recipient = None
+        if recipient is not None:  # poznámka (ne doplnění): adresát lze změnit
+            self.recipient = QComboBox()
+            self.recipient.setEditable(True)
+            self.recipient.addItem("", "")
+            for u in users:
+                self.recipient.addItem(u.display, u.login)
+            login, name = recipient
+            index = self.recipient.findData(login) if login else 0
+            if login and index < 0:
+                self.recipient.setEditText(name or login)
+            else:
+                self.recipient.setCurrentIndex(max(index, 0))
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Pro:"))
+            row.addWidget(self.recipient, stretch=1)
+            layout.addLayout(row)
+        self.text = QPlainTextEdit(text)
+        self.text.setPlaceholderText("Text (Markdown: # nadpis, **tučně**, - odrážka)…")
+        self.text.textChanged.connect(self._validate)
+        layout.addWidget(self.text, stretch=1)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                        | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText(ok_text)
+        self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self._validate()
+        self.text.setFocus()
+
+    def _validate(self) -> None:
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(bool(self.text.toPlainText().strip()))
+
+    def text_value(self) -> str:
+        return self.text.toPlainText()
+
+    def recipient_value(self) -> tuple[str, str]:
+        if self.recipient is None:
+            return "", ""
+        return recipient_from_text(self.recipient.currentText(),
+                                   {self.recipient.itemText(i): self.recipient.itemData(i)
+                                    for i in range(1, self.recipient.count())})

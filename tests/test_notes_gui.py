@@ -233,3 +233,125 @@ def test_nickname_in_settings(qapp, pms):
     dlg.nickname.setText("  Alča ")
     dlg._accept()
     assert alice.settings.nickname == "Alča" and alice.display_name == "Alča"
+
+
+def test_note_for_me_is_highlighted(qapp, pms):
+    from spm.gui.notes_window import FOR_ME_BACKGROUND, NotesWindow, notes_html
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("pro Boba", recipient="bob"), Draft("pro všechny"),
+                              Draft("pro Alici", recipient="alice")])
+    notes = bob.notes("Forma")
+    html = notes_html(notes, "bob", seen=0, show_resolved=False)
+    cards = html.split("<hr>")
+    by_text = {n.text: card for n, card in zip(notes, cards)}
+    assert FOR_ME_BACKGROUND in by_text["pro Boba"] and "PRO VÁS" in by_text["pro Boba"]
+    assert FOR_ME_BACKGROUND not in by_text["pro všechny"]
+    assert FOR_ME_BACKGROUND not in by_text["pro Alici"] and "pro alice" in by_text["pro Alici"]
+    window = NotesWindow(bob, "Forma")
+    assert "PRO VÁS" in window.view.toPlainText()
+    assert window.view.toPlainText().count("PRO VÁS") == 1
+
+
+def test_edit_and_reply_in_window(qapp, pms, monkeypatch):
+    from PySide6.QtCore import QUrl
+    from PySide6.QtWidgets import QMessageBox
+
+    from spm.gui import notes_window
+    from spm.gui.notes_window import NotesWindow, notes_html
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Deska hotová", recipient="bob")])
+    note_id = bob.notes("Forma")[0].note_id
+    # odkaz Upravit jen u autora, Doplnit u všech
+    assert f"spmedit:{note_id}" in notes_html(alice.notes("Forma"), "alice", 0, False)
+    bob_html = notes_html(bob.notes("Forma"), "bob", 0, False)
+    assert f"spmedit:{note_id}" not in bob_html and f"spmreply:{note_id}" in bob_html
+
+    answers = {}
+
+    class FakeEdit:
+        def __init__(self, title, text, recipient, users, parent, hint="", ok_text=""):
+            answers["prefill"] = text
+        def exec(self):
+            return True
+        def text_value(self):
+            return answers["text"]
+        def recipient_value(self):
+            return ("bob", "Bob")
+    monkeypatch.setattr(notes_window, "NoteEditDialog", FakeEdit)
+
+    seen = {"bob": 0}
+    bob_window = NotesWindow(bob, "Forma", seen_get=lambda: seen["bob"],
+                             seen_set=lambda v: seen.__setitem__("bob", v))
+    assert "NOVÁ" in bob_window.view.toPlainText()
+    answers["text"] = "Ano, rozumím."
+    bob_window._on_link(QUrl(f"spmreply:{note_id}"))                 # Bob doplní
+    assert [r.text for r in bob.notes("Forma")[0].replies] == ["Ano, rozumím."]
+    assert "Ano, rozumím." in bob_window.view.toPlainText()
+
+    alice_window = NotesWindow(alice, "Forma")
+    answers["text"] = "Deska hotová, **díry posunuty**"
+    alice_window._on_link(QUrl(f"spmedit:{note_id}"))               # Alice upraví
+    assert answers["prefill"] == "Deska hotová"
+    bob_window.reload()
+    text = bob_window.view.toPlainText()
+    assert "UPRAVENÁ" in text and "díry posunuty" in text and "Předchozí znění (1)" in text
+    shown = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: shown.append(box.detailedText()) or 0)
+    bob_window._on_link(QUrl(f"spmversions:{note_id}"))
+    assert "Deska hotová" in shown[0]
+    # Bob upravit cizí poznámku nemůže (ani podvrženým odkazem)
+    errors = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: errors.append(a[2]))
+    bob_window._on_link(QUrl(f"spmedit:{note_id}"))
+    assert errors and "autor" in errors[0]
+
+
+def test_new_reply_to_my_note_opens_window(qapp, pms):
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Otázka pro všechny")])
+    w = make_window(qapp, alice)
+    try:
+        select_forma(w)
+        assert (w.settings.workspace_id, "Forma") not in w._notes_windows   # vlastní, bez doplnění
+        w.open_notes("Forma").close()                              # Alice poznámky viděla
+        bob.reply_note("Forma", bob.notes("Forma")[0].note_id, "Odpověď od Boba")
+        w.refresh(check_names=False)
+        w.table.clearSelection()
+        select_forma(w)
+        window = w._notes_windows[(w.settings.workspace_id, "Forma")]
+        assert window.isVisible() and "nové doplnění" in window.view.toPlainText()
+    finally:
+        close(w, qapp)
+
+
+def test_own_changes_are_not_new(qapp, pms):
+    from spm.gui.notes_window import notes_html
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Otázka", recipient="bob")])
+    note_id = alice.notes("Forma")[0].note_id
+    seen = alice.notes("Forma")[0].seq
+    alice.reply_note("Forma", note_id, "Moje doplnění")
+    alice.edit_note("Forma", note_id, "Otázka upravená")
+    html = notes_html(alice.notes("Forma"), "alice", seen, False)
+    assert "NOV" not in html and "UPRAVENÁ" not in html            # pro autorku nic nového
+    html = notes_html(bob.notes("Forma"), "bob", seen, False)
+    assert "UPRAVENÁ" in html and "NOVÉ" in html                    # pro Boba ano
+
+
+def test_for_me_card_colors_follow_dark_mode(qapp, pms):
+    from PySide6.QtGui import QColor, QPalette
+
+    from spm.gui.notes_window import FOR_ME_DARK, FOR_ME_LIGHT, NotesWindow
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("pro Boba", recipient="bob")])
+    window = NotesWindow(bob, "Forma")
+    html = window.view.toHtml().lower()
+    assert FOR_ME_LIGHT.background in html                          # světlý režim (výchozí paleta)
+    dark = QPalette(window.palette())
+    dark.setColor(QPalette.ColorRole.Base, QColor("#1e1e1e"))
+    dark.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
+    window.view.setPalette(dark)
+    window.setPalette(dark)                                          # změna palety -> překreslení
+    html = window.view.toHtml().lower()
+    assert FOR_ME_DARK.background in html and FOR_ME_LIGHT.background not in html
+    assert FOR_ME_DARK.text in html                                 # bílý text

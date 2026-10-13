@@ -1306,8 +1306,8 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             return
         seen = int(self.settings.ui.get(self._notes_seen_key(name)) or 0)
-        if only_for_me:
-            notes = [n for n in notes if n.is_for(self.pm.user) and n.note_id > seen]
+        if only_for_me:  # pro mě / moje doplněná – nová, upravená nebo s novým doplněním
+            notes = [n for n in notes if n.concerns(self.pm.user) and n.has_news(seen, self.pm.user)]
         if notes or (after_activation and self.pm.drafts(name)):
             self.open_notes(name)
 

@@ -375,6 +375,36 @@ class ProjectManager:
             notes_mod.set_resolved(db, note_id, resolved, self.display_name)
             notes_mod.write_summary(server, db)
 
+    def edit_note(self, name: str, note_id: int, text: str, recipient: str | None = None,
+                  recipient_name: str | None = None) -> bool:
+        """Úprava zveřejněné poznámky (nebo doplnění) – jen jejím autorem; předchozí znění se
+        uloží. Upravená poznámka se ostatním znovu označí jako nová."""
+        server = self.server_dir(name)
+        self._ensure_notes_tables(server)
+        try:
+            with self._write(server) as db:
+                changed = notes_mod.edit_note(db, note_id, self.user, text, recipient, recipient_name)
+                notes_mod.write_summary(server, db)
+        except notes_mod.NoteError as e:
+            raise SyncError(str(e)) from None
+        return changed
+
+    def reply_note(self, name: str, parent_id: int, text: str) -> int:
+        """Doplnění (odpověď) k poznámce – může kdokoliv; původní text se nemění."""
+        if not text.strip():
+            raise SyncError("Doplnění nesmí být prázdné.")
+        server = self.server_dir(name)
+        self._ensure_notes_tables(server)
+        with self._write(server) as db:
+            parent = db.conn.execute("SELECT parent_id FROM notes WHERE note_id = ?", (parent_id,)).fetchone()
+            if parent is None:
+                raise SyncError("Poznámka už neexistuje.")
+            parent_id = parent[0] or parent_id  # doplnění k doplnění patří k původní poznámce
+            note_id = notes_mod.insert_notes(db, [Draft(text)], self.user, self.pc, self.display_name,
+                                             None, parent_id=parent_id)[0]
+            notes_mod.write_summary(server, db)
+        return note_id
+
     def drafts(self, name: str) -> list[Draft]:
         """Rozepsané poznámky v mé místní kopii projektu."""
         local = self.local_dir(name)
