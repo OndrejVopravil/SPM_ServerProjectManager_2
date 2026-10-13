@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSplitter,
+    QStyle,
     QTabBar,
     QTableWidget,
     QTableWidgetItem,
@@ -46,6 +47,8 @@ from ..sync import (
 from ..mirror import Mirror, MirrorPermissionError, MirrorRule, mirrors_for, resolve_target
 from .comment_dialog import CommentDialog
 from .mirror_dialog import MirrorDialog, format_mirror_counts, format_mirror_problems
+from .notes_window import NotesWindow, QuickNoteDialog
+from .. import notes as notes_mod
 from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
 from .project_panel import ProjectPanel
@@ -164,6 +167,8 @@ class MainWindow(QMainWindow):
         self.act_publish = self._action(tb, "Publikovat…", self.publish)
         self.act_open = self._action(tb, "Otevřít místní složku", self.open_local)
         self.act_history = self._action(tb, "Historie", self.history)
+        self.act_notes = self._action(tb, "Poznámky", self.open_notes,
+                                      tip="Předávací poznámky k projektu (plovoucí okno)")
         tb.addSeparator()
         self.act_mirrors = self._action(tb, "Zrcadlení", self.open_mirrors,
                                         tip="Pravidla zrcadlení souborů mezi záložkami")
@@ -218,9 +223,12 @@ class MainWindow(QMainWindow):
         self.panel.publish_requested.connect(self.publish)
         self.panel.take_requested.connect(self.take)
         self.panel.activate_requested.connect(self.activate)
+        self.panel.note_requested.connect(self.add_note)
+        self._notes_windows: dict[tuple[str, str], NotesWindow] = {}  # (záložka, projekt) -> okno
         self.panel.can_activate = lambda: self.act_activate.isEnabled()
         self.panel.mirror_matchers = self._mirror_matchers  # označení zrcadlených souborů ve stromu
         self.panel.mirror_source_label = self.mirror_source_label
+        self.panel.tree.default_expanded = settings.tree_expanded  # výchozí stav složek ve stromu
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.addWidget(self.table)
         self.splitter.addWidget(self.panel)
@@ -549,6 +557,10 @@ class MainWindow(QMainWindow):
         try:
             if self._sync_shared() and not check_names:
                 check_names = True  # změnila se kontrola znaků / ignorované soubory
+            try:
+                self.pm.register_user()  # adresář uživatelů (výběr adresáta poznámek)
+            except OSError:
+                pass
             self.projects = self.pm.list_projects()
         except Exception as e:  # noqa: BLE001
             self.projects = []
@@ -647,6 +659,11 @@ class MainWindow(QMainWindow):
                 item.setForeground(COLOR_MINE if p.mine else COLOR_OTHER)
                 item.setToolTip("Aktivováno:\n" + "\n".join(
                     f"{u.label} od {u.since.replace('T', ' ')}" for u in p.users))
+            if c == COL_NAME and p.notes_for_me:
+                item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
+                note = (f"Čeká na vás {p.notes_for_me} "
+                        + ("poznámka" if p.notes_for_me == 1 else "poznámky") + " – tlačítko Poznámky.")
+                item.setToolTip((item.toolTip() + "\n\n" if item.toolTip() else "") + note)
             self.table.setItem(r, c, item)
 
     def _refresh_selected_row(self) -> ProjectStatus | None:
@@ -704,6 +721,8 @@ class MainWindow(QMainWindow):
             self.settings.ui[self._ui_key("last_project")] = p.name
         self._update_actions()
         self.panel.show_project(p)
+        if p and p.notes_for_me and not self._rendering:
+            self._open_notes_if_new(p.name, only_for_me=True)
 
     def activated_projects(self) -> dict[str, list[str]]:
         """Název záložky -> mé aktivované projekty (aktuální záložka podle seznamu, ostatní
@@ -750,6 +769,8 @@ class MainWindow(QMainWindow):
             return
         self.timer.stop()
         self._closing = True  # výsledky vláken na pozadí už nezobrazovat
+        for window in self._notes_windows.values():
+            window.close()  # uloží rozepsané poznámky
         if self._name_check:
             self._name_check.wait(5000)
         self.panel.stop()
@@ -784,6 +805,7 @@ class MainWindow(QMainWindow):
             "Otevře místní složku vybraného projektu" if p and p.local_exists
             else "Otevře místní složku pro projekty")
         self.act_history.setEnabled(bool(p and not p.local_only))
+        self.act_notes.setEnabled(bool(p and not p.local_only))
         self.act_restore.setEnabled(bool(p and not p.local_only))
         self.act_rename.setEnabled(bool(p and not p.active and not p.local_only))
         self.act_comment.setEnabled(bool(p and not p.local_only))
@@ -796,7 +818,7 @@ class MainWindow(QMainWindow):
         self.table.selectRow(row)
         menu = QMenu(self)
         actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
-                   self.act_deactivate, self.act_publish, None, self.act_open, self.act_history,
+                   self.act_deactivate, self.act_publish, None, self.act_open, self.act_history, self.act_notes,
                    self.act_restore, None, self.act_comment, self.act_rename, None,
                    self.act_cancel, self.act_unlock,
                    None, self.act_refresh]
@@ -857,6 +879,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Aktivace", msg + "\n\n" + format_external(res.external))
             else:
                 QMessageBox.information(self, "Aktivace", msg)
+            self._open_notes_if_new(p.name, only_for_me=False, after_activation=True)
 
         run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
                  only_locked=only_locked, on_done=done, on_error=lambda _: self.refresh())
@@ -934,9 +957,14 @@ class MainWindow(QMainWindow):
 
     def _confirm_upload(self, plan: UploadPlan, end_session: bool,
                         preselect: str | list[str] | None = None) -> None:
-        dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name), preselect=preselect)
+        window = self._notes_windows.get((self.settings.workspace_id, plan.name))
+        if window is not None:
+            window.flush()  # rozepsané v otevřeném okně se uloží (okno může zůstat otevřené)
+        dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name), preselect=preselect,
+                           drafts=self.pm.drafts(plan.name))
         accepted = self._exec_dialog(dlg, "upload")
         assignments, comment, selected = dlg.assignments(), dlg.comment_text(), dlg.selected_keys()
+        notes = dlg.selected_notes()
         dlg.deleteLater()
         if not accepted:
             return
@@ -955,11 +983,14 @@ class MainWindow(QMainWindow):
                 msg += "\n\n" + res.note
             if ended and self.settings.delete_local_after_deactivate and not res.local_deleted:
                 msg += "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
+            if res.notes_published:
+                msg += f"\n\nZveřejněné poznámky: {res.notes_published}"
+            self._reload_notes_window(plan.name)
             QMessageBox.information(self, title, msg)
             self._mirror_after(plan.name)
 
         run_task(self, f"{title} – nahrávání projektu {plan.name}", self.pm.upload, plan,
-                 assignments, comment, selected, end_session, on_done=done,
+                 assignments, comment, selected, end_session, notes=notes, on_done=done,
                  on_error=lambda _: self.refresh())
 
     def rename_project(self) -> None:
@@ -1238,6 +1269,125 @@ class MainWindow(QMainWindow):
             self._exec_dialog(dlg, "history")
             dlg.deleteLater()
 
+    # --- poznámky -----------------------------------------------------------------
+
+    def _notes_seen_key(self, name: str) -> str:
+        return f"notes_seen.{self.settings.workspace_id}.{name}"
+
+    def open_notes(self, name: str | None = None) -> NotesWindow | None:
+        """Plovoucí okno poznámek projektu (jedno na projekt; další volání ho jen vyzvedne)."""
+        if name is None:
+            p = self.selected()
+            if not p or p.local_only:
+                return None
+            name = p.name
+        key = (self.settings.workspace_id, name)
+        window = self._notes_windows.get(key)
+        if window is None:
+            seen_key = self._notes_seen_key(name)
+            window = NotesWindow(self.pm, name, self,
+                                 seen_get=lambda: int(self.settings.ui.get(seen_key) or 0),
+                                 seen_set=lambda note_id: self.settings.ui.__setitem__(seen_key, str(note_id)))
+            window.file_clicked.connect(lambda path, n=name: self._show_in_tree(n, path))
+            window.changed.connect(lambda: self._refresh_selected_row())
+            self._notes_windows[key] = window
+        else:
+            window.reload()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+        return window
+
+    def _open_notes_if_new(self, name: str, only_for_me: bool, after_activation: bool = False) -> None:
+        """Otevře poznámky, pokud jsou nové (od posledního zobrazení) – jen pro mě, nebo po
+        aktivaci jakékoliv otevřené."""
+        try:
+            notes = [n for n in self.pm.notes(name) if not n.resolved]
+        except Exception:  # noqa: BLE001
+            return
+        seen = int(self.settings.ui.get(self._notes_seen_key(name)) or 0)
+        if only_for_me:
+            notes = [n for n in notes if n.is_for(self.pm.user) and n.note_id > seen]
+        if notes or (after_activation and self.pm.drafts(name)):
+            self.open_notes(name)
+
+    def _reload_notes_window(self, name: str) -> None:
+        window = self._notes_windows.get((self.settings.workspace_id, name))
+        if window is not None and window.isVisible():
+            window.reload()
+
+    def _show_in_tree(self, name: str, path: str) -> None:
+        """Odkaz na soubor v okně poznámek: vybrat projekt a soubor označit ve stromu."""
+        current = self.selected()
+        if current is None or current.name != name:
+            names = [p.name for p in self.projects]
+            if name not in names:
+                return
+            self.table.selectRow(names.index(name))
+        self.raise_()
+        self.activateWindow()
+        if not self.panel.select_path(path):
+            QMessageBox.information(self, "Poznámky",
+                                    f"Soubor ani složka „{path}“ ve stromu projektu není "
+                                    "(byl smazán, nebo se strom ještě načítá).")
+
+    def add_note(self, scopes: list[str]) -> None:
+        """Přidat poznámku k označeným souborům / složkám (z nabídky stromu)."""
+        p = self.selected()
+        if not p or p.local_only:
+            return
+        if p.mine:  # aktivovaný projekt: rozepsaná poznámka – zveřejní se s odevzdáním
+            window = self.open_notes(p.name)
+            if window is not None:
+                window.add_draft(scopes)
+            return
+        dlg = QuickNoteDialog(p.name, scopes, self._known_users(), self)
+        if not self._exec_dialog(dlg, "quick_note"):
+            return
+        try:
+            self.pm.add_notes(p.name, [dlg.draft()])
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Poznámky", str(e))
+            return
+        self._refresh_selected_row()
+        self.panel.reload()
+        self._reload_notes_window(p.name)
+
+    def _known_users(self) -> list:
+        try:
+            return self.pm.users()
+        except OSError:
+            return []
+
+    def _settle_drafts_before_cancel(self, name: str) -> bool:
+        """Zrušení aktivace: co s rozepsanými poznámkami? False = nerušit."""
+        window = self._notes_windows.get((self.settings.workspace_id, name))
+        if window is not None:
+            window.flush()
+        drafts = [d for d in self.pm.drafts(name) if d.text.strip()]
+        if not drafts:
+            return True
+        box = QMessageBox(QMessageBox.Icon.Question, "Zrušit aktivaci",
+                          f"Máte {len(drafts)} rozepsaných poznámek. Co s nimi?", parent=self)
+        publish = box.addButton("Zveřejnit", QMessageBox.ButtonRole.AcceptRole)
+        keep = box.addButton("Ponechat na příště", QMessageBox.ButtonRole.ActionRole)
+        discard = box.addButton("Zahodit", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Nerušit aktivaci", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        chosen = box.clickedButton()
+        try:
+            if chosen is publish:
+                self.pm.add_notes(name, drafts)
+            elif chosen is keep:  # místní kopie se při příští aktivaci odloží – poznámky stranou
+                notes_mod.park_drafts(self.pm.local_root, name, self.pm.local_dir(name))
+            elif chosen is not discard:
+                return False
+            self.pm.save_drafts(name, [])
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Poznámky", str(e))
+            return False
+        return True
+
     def cancel_activation(self) -> None:
         p = self.selected()
         if not p or not p.mine:
@@ -1248,8 +1398,12 @@ class MainWindow(QMainWindow):
             "vaše zámky se uvolní. Místní kopie zůstane zachována, ale neodevzdané změny z ní už "
             "nepůjde nahrát.",
         )
-        if answer == QMessageBox.StandardButton.Yes:
-            self._safe(lambda: self.pm.cancel_activation(p.name))
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not self._settle_drafts_before_cancel(p.name):
+            return
+        self._safe(lambda: self.pm.cancel_activation(p.name))
+        self._reload_notes_window(p.name)
 
     def force_unlock(self) -> None:
         p = self.selected()
@@ -1289,6 +1443,7 @@ class MainWindow(QMainWindow):
                              folder_check=lambda server, local: self.app_settings.folder_conflict(
                                  ws_id, server, local))
         if dlg.exec():
+            self.panel.tree.default_expanded = self.settings.tree_expanded
             self._fill_tabs()  # tooltip záložky se složkami
             self._update_status_bar()
             self._apply_refresh_timer()

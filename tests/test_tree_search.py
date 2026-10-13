@@ -77,3 +77,53 @@ def test_found_text_is_black_and_original_color_restored(window):
     panel.search.clear()
     assert [item.foreground(c) for c in range(panel.tree.columnCount())] == original
     assert item.foreground(1).color() == QColor("#2e8b57")
+
+
+def test_collapsed_folders_stay_collapsed_after_reload(window, tmp_path):
+    panel = window.panel
+    dily, nc = find_item(panel.tree, "dily"), find_item(panel.tree, "dily/nc")
+    assert dily.isExpanded() and nc.isExpanded()               # poprvé vše rozbalené
+    nc.setExpanded(False)
+    (tmp_path / "server" / "Forma" / "nova" / "x.txt").parent.mkdir()
+    (tmp_path / "server" / "Forma" / "nova" / "x.txt").write_text("x")
+    window.refresh(check_names=False)                          # F5
+    settle_panel(panel)
+    assert not find_item(panel.tree, "dily/nc").isExpanded()   # zůstala sbalená
+    assert find_item(panel.tree, "dily").isExpanded()
+    assert find_item(panel.tree, "nova").isExpanded()          # nová složka rozbalená
+    # jiný projekt se zobrazí celý rozbalený
+    (tmp_path / "server" / "Druhy" / "dily" / "nc").mkdir(parents=True)
+    (tmp_path / "server" / "Druhy" / "dily" / "nc" / "a.nc").write_text("a")
+    window.refresh(check_names=False)
+    window.table.selectRow([p.name for p in window.projects].index("Druhy"))
+    settle_panel(panel)
+    assert find_item(panel.tree, "dily/nc").isExpanded()
+
+
+def test_folders_collapsed_by_default_and_expanded_stay_expanded(window, tmp_path):
+    panel = window.panel
+    window.settings.tree_expanded = False                      # jako po změně v Nastavení
+    panel.tree.default_expanded = False
+    (tmp_path / "server" / "Druhy" / "dily" / "nc").mkdir(parents=True)
+    (tmp_path / "server" / "Druhy" / "dily" / "nc" / "a.nc").write_text("a")
+    window.refresh(check_names=False)
+    window.table.selectRow([p.name for p in window.projects].index("Druhy"))
+    settle_panel(panel)
+    assert not find_item(panel.tree, "dily").isExpanded()      # výchozí stav: sbaleno
+    find_item(panel.tree, "dily").setExpanded(True)             # uživatel rozbalí
+    (tmp_path / "server" / "Druhy" / "nova").mkdir()
+    (tmp_path / "server" / "Druhy" / "nova" / "b.txt").write_text("b")
+    window.refresh(check_names=False)                          # F5
+    settle_panel(panel)
+    assert find_item(panel.tree, "dily").isExpanded()          # zůstala rozbalená
+    assert not find_item(panel.tree, "dily/nc").isExpanded()   # vnořená zůstává podle výchozího
+    assert not find_item(panel.tree, "nova").isExpanded()      # nová složka podle výchozího stavu
+
+
+def test_tree_expanded_setting_in_dialog(window):
+    from spm.gui.settings_dialog import SettingsDialog
+    dlg = SettingsDialog(window.settings)
+    assert dlg.tree_expanded.isChecked()
+    dlg.tree_expanded.setChecked(False)
+    dlg._accept()
+    assert window.settings.tree_expanded is False

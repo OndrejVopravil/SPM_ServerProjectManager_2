@@ -47,6 +47,7 @@ class CheckTree(QTreeWidget):
     def __init__(self, headers: list[str], checkable: bool = True, parent: QWidget | None = None):
         super().__init__(parent)
         self.checkable = checkable
+        self.default_expanded = True  # složky, o kterých strom ještě neví, rozbalit?
         self.setHeaderLabels(headers)
         self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for i in range(1, len(headers)):
@@ -61,6 +62,9 @@ class CheckTree(QTreeWidget):
     # --- naplnění --------------------------------------------------------
 
     def set_entries(self, entries: list[TreeEntry], checked: set[str] = frozenset()) -> None:
+        # sbalené / rozbalené složky zůstanou po novém naplnění tak, jak je uživatel nechal
+        # (obnovení stromu stejného projektu); nové složky podle default_expanded
+        previous = {item.data(0, PATH_ROLE): item.isExpanded() for item in self._folder_items()}
         self.blockSignals(True)
         self.clear()
         self._items.clear()
@@ -117,7 +121,8 @@ class CheckTree(QTreeWidget):
             (parent.addChild(item) if parent else self.addTopLevelItem(item))
             self._items[e.key] = item
         self.sortItems(0, Qt.SortOrder.AscendingOrder)
-        self.expandAll()
+        for item in folders.values():
+            item.setExpanded(previous.get(item.data(0, PATH_ROLE), self.default_expanded))
         self.blockSignals(False)
         if to_load:
             icons.loader().request(to_load)
@@ -175,6 +180,14 @@ class CheckTree(QTreeWidget):
             self.blockSignals(False)
 
     # --- výběr -----------------------------------------------------------
+
+    def _folder_items(self):
+        it = QTreeWidgetItemIterator(self)
+        while it.value():
+            item = it.value()
+            if not item.data(0, KEY_ROLE):
+                yield item
+            it += 1
 
     def leaf_items(self):
         it = QTreeWidgetItemIterator(self)

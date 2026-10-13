@@ -16,6 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..names import format_invalid
+from ..notes import Draft
 from ..scanner import to_abs
 from ..sync import UploadPlan, auto_deactivation, new_key
 from .check_tree import CheckTree, TreeEntry, in_scope
@@ -53,9 +55,11 @@ TABS = [
 
 class UploadDialog(QDialog):
     def __init__(self, plan: UploadPlan, end_session: bool, parent: QWidget | None = None,
-                 local: Path | None = None, preselect: str | None = None):
+                 local: Path | None = None, preselect: str | list[str] | None = None,
+                 drafts: list[Draft] | None = None):
         """local: místní kopie projektu (pro ikony souborů).
-        preselect: soubor nebo složka (zakončená '/'), jejíž změny budou předem zaškrtnuté."""
+        preselect: soubor nebo složka (zakončená '/'), jejíž změny budou předem zaškrtnuté.
+        drafts: rozepsané poznámky – zaškrtnuté se zveřejní s odevzdáním."""
         super().__init__(parent)
         self.plan = plan
         self.local = local
@@ -125,6 +129,27 @@ class UploadDialog(QDialog):
         self.comment.setMaximumHeight(80)
         self.comment.textChanged.connect(self._validate)
         layout.addWidget(self.comment)
+
+        # rozepsané poznámky (plovoucí okno Poznámky) – zaškrtnuté se zveřejní s odevzdáním
+        self.drafts = list(drafts or [])
+        self.draft_checks: list[QCheckBox] = []
+        if self.drafts:
+            box = QGroupBox("Poznámky pro další uživatele – zveřejnit s odevzdáním")
+            box_lay = QVBoxLayout(box)
+            for d in self.drafts:
+                to = f" → pro {d.recipient_name or d.recipient}" if d.recipient else ""
+                files = f"  ({len(d.targets)} souborů / složek)" if d.targets else ""
+                check = QCheckBox(d.title + to + files)
+                check.setChecked(bool(d.text.strip()))
+                check.setEnabled(bool(d.text.strip()))
+                check.setToolTip(d.text)
+                box_lay.addWidget(check)
+                self.draft_checks.append(check)
+            note = QLabel("Nezaškrtnuté zůstanou rozepsané na příště"
+                          + (" (i po deaktivaci – vrátí se při příští aktivaci)." if end_session else "."))
+            note.setWordWrap(True)
+            box_lay.addWidget(note)
+            layout.addWidget(box)
 
         self.auto_info = QLabel()  # odevzdání posledního drženého souboru = deaktivace
         self.auto_info.setWordWrap(True)
@@ -212,6 +237,10 @@ class UploadDialog(QDialog):
 
     def assignments(self) -> dict[str, str | None]:
         return {fid: combo.currentData() for fid, combo in self.combos.items()}
+
+    def selected_notes(self) -> list[Draft]:
+        """Rozepsané poznámky zaškrtnuté ke zveřejnění."""
+        return [d for d, check in zip(self.drafts, self.draft_checks) if check.isChecked()]
 
     def comment_text(self) -> str:
         return self.comment.toPlainText().strip()

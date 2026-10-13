@@ -15,7 +15,7 @@ import shutil
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -23,9 +23,12 @@ from . import SPM_DIR, recycle
 from . import db as dbm
 from .comment import MAX_LENGTH as COMMENT_MAX_LENGTH
 from .comment import ProjectComment, normalize_text, read_comment, write_comment
+from . import notes as notes_mod
+from . import users
+from .notes import Draft, Note
 from .config import Settings
 from .db import DbFile, LockOwner, ProjectDB, db_path
-from .identity import current_pc, current_user
+from .identity import current_full_name, current_pc, current_user
 from .lock import LockInfo, WriteLock, active_users, add_marker, now_iso, remove_marker
 from .manifest import Entry, Manifest
 from .matcher import RenameSuggestion, similarity, suggest_renames
@@ -61,6 +64,17 @@ PUBLISH_TMP_PREFIX = ".spm_publish_"
 INVALID_NAME_CHARS = set('<>:"/\\|?*')
 RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
                   *(f"lpt{i}" for i in range(1, 10))}
+
+
+def original_copy_path(local: Path, name: str) -> Path:
+    """Volná složka <projekt>_puvodni_<datum_čas> vedle místní kopie. Při kolizi (dvě odložení
+    během jedné sekundy) se čas posune – název musí končit datem (ORIGINAL_COPY_RE)."""
+    when = datetime.now()
+    while True:
+        target = local.with_name(f"{name}_puvodni_{when:%Y%m%d_%H%M%S}")
+        if not target.exists():
+            return target
+        when += timedelta(seconds=1)
 
 
 def validate_project_name(name: str) -> str | None:
@@ -112,6 +126,7 @@ class ProjectStatus:
     local_only: bool = False  # složka je jen v místním úložišti (lze ji publikovat)
     others: list[LockInfo] = field(default_factory=list)  # aktivní uživatelé kromě mě
     comment: ProjectComment | None = None  # komentář projektu (jen projekty na serveru)
+    notes_for_me: int = 0         # otevřené poznámky adresované mně
 
     @property
     def active(self) -> bool:
@@ -231,6 +246,7 @@ class UploadResult:
     local_deleted: bool = False
     auto_deactivated: bool = False   # odevzdán poslední držený soubor -> projekt deaktivován
     note: str = ""                   # proč se automaticky nedeaktivoval (je-li co říct)
+    notes_published: int = 0         # zveřejněné rozepsané poznámky
 
 
 @dataclass
@@ -306,7 +322,68 @@ class ProjectManager:
         others = [u for u in users if not u.is_mine(self.user, self.pc)]
         return ProjectStatus(name=name, users=users, local_exists=self.local_dir(name).exists(),
                              mine=len(others) < len(users), others=others,
-                             comment=read_comment(server))
+                             comment=read_comment(server),
+                             notes_for_me=notes_mod.read_summary(server).for_user(self.user))
+
+    # --- poznámky ---------------------------------------------------------------
+
+    @property
+    def display_name(self) -> str:
+        """Jak uživatele vidí ostatní: přezdívka z nastavení, jinak jméno z Windows, jinak login."""
+        if self.settings.nickname.strip():
+            return self.settings.nickname.strip()
+        if not hasattr(self, "_full_name"):
+            self._full_name = current_full_name()
+        return self._full_name or self.user
+
+    def register_user(self) -> None:
+        """Zapíše uživatele do adresáře síťové složky (výběr adresáta poznámek)."""
+        if not hasattr(self, "_full_name"):
+            self._full_name = current_full_name()
+        users.register(self.server_root, users.UserInfo(self.user, self.settings.nickname.strip(),
+                                                        self._full_name, self.pc))
+
+    def users(self) -> list[users.UserInfo]:
+        return users.list_users(self.server_root)
+
+    def notes(self, name: str) -> list[Note]:
+        return notes_mod.read_notes(self.server_dir(name))
+
+    def _ensure_notes_tables(self, server: Path) -> None:
+        with WriteLock(server, self.user, self.pc):
+            with ProjectDB.for_project(server, create=True) as db:
+                notes_mod.ensure_tables(db)
+
+    def add_notes(self, name: str, drafts: list[Draft], commit_id: int | None = None) -> int:
+        """Zveřejní poznámky hned (bez odevzdání – např. u projektu, který nemám aktivovaný)."""
+        drafts = [d for d in drafts if d.text.strip()]
+        server = self.server_dir(name)
+        if not drafts:
+            return 0
+        if not server.is_dir():
+            raise SyncError(f"Projekt neexistuje: {server}")
+        self._ensure_notes_tables(server)
+        with self._write(server, create=True) as db:
+            notes_mod.insert_notes(db, drafts, self.user, self.pc, self.display_name, commit_id)
+            notes_mod.write_summary(server, db)
+        return len(drafts)
+
+    def resolve_note(self, name: str, note_id: int, resolved: bool = True) -> None:
+        server = self.server_dir(name)
+        self._ensure_notes_tables(server)
+        with self._write(server) as db:
+            notes_mod.set_resolved(db, note_id, resolved, self.display_name)
+            notes_mod.write_summary(server, db)
+
+    def drafts(self, name: str) -> list[Draft]:
+        """Rozepsané poznámky v mé místní kopii projektu."""
+        local = self.local_dir(name)
+        return notes_mod.load_drafts(local) if local.is_dir() else []
+
+    def save_drafts(self, name: str, drafts: list[Draft]) -> None:
+        local = self.local_dir(name)
+        if local.is_dir():
+            notes_mod.save_drafts(local, drafts)
 
     def set_comment(self, name: str, text: str) -> bool:
         """Změní komentář projektu (prázdný text = smazat) a zapíše změnu do historie.
@@ -611,8 +688,7 @@ class ProjectManager:
             if local.is_dir() and not any(local.iterdir()):
                 local.rmdir()
             if local.exists():
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                moved_to = local.with_name(f"{name}_puvodni_{stamp}")
+                moved_to = original_copy_path(local, name)
                 local.rename(moved_to)
             copied: dict[str, FileInfo] = {}
             to_copy = [p for p in server_paths if p in want_paths] if only_locked else server_paths
@@ -656,6 +732,7 @@ class ProjectManager:
                 if f.file_id not in locked:
                     set_readonly(to_abs(local, rel), True)
             manifest.save(local)
+            notes_mod.restore_drafts(self.local_root, name, local)  # odložené při deaktivaci
         except BaseException:
             if sid is not None:
                 try:
@@ -1055,13 +1132,17 @@ class ProjectManager:
         selected: set[str] | None = None,
         end_session: bool = False,
         progress: Progress | None = None,
+        notes: list[Draft] | None = None,
     ) -> UploadResult:
         """Odevzdá vybrané změny na server a uvolní odevzdané soubory.
 
         assignments: file_id chybějícího souboru -> nová cesta (přejmenování) / None (smazán).
         selected:    klíče položek k odevzdání (file_id, u nových souborů new_key(cesta));
                      None = vše. Při end_session se vždy odevzdá vše a uvolní všechny zámky.
+        notes:       rozepsané poznámky, které se zveřejní spolu s odevzdáním (a z rozepsaných
+                     zmizí).
         """
+        notes = [d for d in (notes or []) if d.text.strip()]
         if end_session:
             selected = None
         comment = comment.strip()
@@ -1179,9 +1260,14 @@ class ProjectManager:
         if progress:
             progress(total, total, "Zápis do databáze…")
         released: list[str] = []
+        if notes:
+            self._ensure_notes_tables(server)
         with self._write(server) as db:
             self._my_session(db, sid)
             commit_id = db.add_commit(sid, self.user, self.pc, dbm.UPLOAD, comment) if has_changes else None
+            if notes:
+                notes_mod.insert_notes(db, notes, self.user, self.pc, self.display_name, commit_id)
+                notes_mod.write_summary(server, db)
             for kind, file_id, old_path, lf, backup in ops:
                 if kind == dbm.DELETED:
                     db.mark_deleted(file_id)
@@ -1217,10 +1303,15 @@ class ProjectManager:
 
         result = UploadResult(renamed=len(renames), modified=len(modified), added=len(added),
                               deleted=len(deleted), released=len(released),
-                              auto_deactivated=auto_end, note=auto_note)
+                              auto_deactivated=auto_end, note=auto_note, notes_published=len(notes))
+        if notes:  # zveřejněné už nejsou rozepsané
+            published = {d.id for d in notes}
+            notes_mod.save_drafts(local, [d for d in notes_mod.load_drafts(local) if d.id not in published])
         if end_session or auto_end:
             remove_marker(server, self.user, self.pc)
             if self.settings.delete_local_after_deactivate:
+                # nezveřejněné rozepsané poznámky se se složkou nesmažou – vrátí se při aktivaci
+                notes_mod.park_drafts(self.local_root, plan.name, local)
                 rmtree(local)
                 result.local_deleted = not local.exists()
             else:
@@ -1339,8 +1430,7 @@ class ProjectManager:
         for rel in selected:
             to_abs(local, rel).unlink(missing_ok=True)
             remove_empty_parents(local, rel)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        leftover = local.with_name(f"{name}_puvodni_{stamp}")
+        leftover = original_copy_path(local, name)
         try:
             local.rename(leftover)
             result.leftover = leftover

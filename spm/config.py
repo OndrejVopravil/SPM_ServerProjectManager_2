@@ -79,6 +79,10 @@ class Settings:
     # v nové verzi se tak do existujícího nastavení doplní jen jednou (a uživatel ho
     # pak může v nastavení odebrat, aniž by se znovu vracel).
     known_default_ignore: list[str] = field(default_factory=lambda: list(DEFAULT_IGNORE))
+    # Přezdívka – jak uživatele uvidí ostatní (u poznámek, výběr adresáta); "" = jméno z Windows
+    nickname: str = ""
+    # Složky ve stromu projektu (panel pod seznamem) ve výchozím stavu rozbalené
+    tree_expanded: bool = True
     # Při ukončení aplikace upozornit na projekty, které mám stále aktivované
     warn_active_on_exit: bool = True
     # Pravidla zrcadlení mezi záložkami (osobní, místní; viz mirror.MirrorRule)

@@ -37,6 +37,7 @@ COLOR_MINE = QColor("#2e8b57")
 COLOR_MIRROR = QColor("#8e44ad")  # spravuje zrcadlo z jiného serveru (jen pro čtení)
 COLOR_OTHER = QColor("#c0392b")
 COLOR_FOUND = QColor("#fff176")  # podbarvení souborů nalezených hledáním
+COLOR_NOTE = QColor("#b9770e")   # soubory / složky s otevřenou poznámkou
 
 
 class EntriesThread(QThread):
@@ -45,6 +46,7 @@ class EntriesThread(QThread):
     def __init__(self, pm: ProjectManager, name: str, mine: bool, local_only: bool = False):
         super().__init__()
         self.pm, self.name, self.mine, self.local_only = pm, name, mine, local_only
+        self.open_notes: list = []  # otevřené (nevyřízené) poznámky projektu – značky ve stromu
 
     def run(self) -> None:
         try:
@@ -72,6 +74,10 @@ class EntriesThread(QThread):
             if local.is_dir():  # co je v místní kopii, lze otevřít (cizí / volné jen pro čtení)
                 for e in entries:
                     e.in_local = to_abs(local, e.path).is_file()
+            try:
+                self.open_notes = [n for n in self.pm.notes(self.name) if not n.resolved]
+            except Exception:  # noqa: BLE001 – poznámky nejsou pro strom nezbytné
+                self.open_notes = []
             self.done.emit(self.name, entries, "")
         except Exception as e:  # noqa: BLE001 – zobrazí se v panelu
             self.done.emit(self.name, [], str(e) or type(e).__name__)
@@ -83,6 +89,7 @@ class ProjectPanel(QWidget):
     submit_requested = Signal(object)
     take_requested = Signal(object)
     activate_requested = Signal(object)  # projekt, který nemám aktivovaný
+    note_requested = Signal(object)      # přidat poznámku k označeným souborům / složkám
     publish_requested = Signal(object)   # složka „Jen místně“
 
     def __init__(self, pm: ProjectManager, parent: QWidget | None = None):
@@ -90,6 +97,7 @@ class ProjectPanel(QWidget):
         self.pm = pm
         self.project: ProjectStatus | None = None
         self.entries: list[FileEntry] = []
+        self.open_notes: list = []  # otevřené poznámky projektu (sloupec Poznámky)
         self._thread: EntriesThread | None = None
         self._again = False
         self._closed = False  # okno se zavírá – výsledky z pozadí už nezobrazovat
@@ -122,7 +130,7 @@ class ProjectPanel(QWidget):
         head.addWidget(self.search)
         head.addWidget(self.only_locked)
 
-        self.tree = CheckTree(["Soubor", "Drží", "Zrcadlo"], checkable=False)
+        self.tree = CheckTree(["Soubor", "Drží", "Zrcadlo", "Poznámky"], checkable=False)
         self.tree.itemDoubleClicked.connect(self._on_double_click)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._context_menu)
@@ -174,11 +182,13 @@ class ProjectPanel(QWidget):
             return
         self._again = False
         thread = EntriesThread(self.pm, self.project.name, self.project.mine, self.project.local_only)
-        thread.done.connect(lambda name, entries, error: self._on_loaded(name, entries, error, thread.pm))
+        thread.done.connect(lambda name, entries, error: self._on_loaded(
+            name, entries, error, thread.pm, thread.open_notes))
         self._thread = thread
         thread.start()
 
-    def _on_loaded(self, name: str, entries: list, error: str, pm: ProjectManager | None = None) -> None:
+    def _on_loaded(self, name: str, entries: list, error: str, pm: ProjectManager | None = None,
+                   open_notes: list | None = None) -> None:
         if self._closed:
             return
         if self._again:
@@ -189,6 +199,7 @@ class ProjectPanel(QWidget):
             self.summary.setText(f"Stav projektu nelze načíst: {error}")
             return
         self.entries = entries
+        self.open_notes = open_notes or []
         self._fill()
 
     def _fill(self) -> None:
@@ -257,6 +268,37 @@ class ProjectPanel(QWidget):
             + f" &nbsp;|&nbsp; na serveru celkem: {len(self.entries) - new}"
             + self._mark_mirror())
 
+    def _mark_notes(self) -> None:
+        """Sloupec Poznámky: počet otevřených poznámek k souboru / složce (text v bublině)."""
+        texts: dict[str, tuple[str, str]] = {}
+        by_path: dict[str, list] = {}
+        for note in self.open_notes:
+            for path in note.targets:
+                by_path.setdefault(path, []).append(note)
+        for path, notes in by_path.items():
+            tip = "\n\n".join(f"{n.author}: {n.text.strip()[:300]}" for n in notes)
+            texts[path] = (f"📝 {len(notes)}", tip + "\n\n(celé poznámky: okno Poznámky)")
+        self.tree.set_column_texts(3, texts, COLOR_NOTE)
+
+    def select_path(self, path: str) -> bool:
+        """Označí soubor / složku ('/' na konci) ve stromu (z odkazu v okně poznámek)."""
+        from PySide6.QtWidgets import QTreeWidgetItemIterator
+        it = QTreeWidgetItemIterator(self.tree)
+        while it.value():
+            item = it.value()
+            if item.data(0, PATH_ROLE) == path:
+                parent = item.parent()
+                while parent is not None:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+                self.tree.clearSelection()
+                self.tree.setCurrentItem(item)
+                item.setSelected(True)
+                self.tree.scrollToItem(item)
+                return True
+            it += 1
+        return False
+
     def _apply_search(self, scroll: bool = False) -> None:
         """Podbarví žlutě soubory, jejichž název obsahuje hledaný text (s * jako „cokoliv“)."""
         match = wildcard_matcher(self.search.text())
@@ -302,6 +344,7 @@ class ProjectPanel(QWidget):
                              "Počet souborů ve složce: " + ", ".join(
                                  f"{label}: {n}" for label, n in sorted(counter.items())))
         self.tree.set_column_texts(2, texts, COLOR_MIRROR)
+        self._mark_notes()
         self._apply_search()  # strom je nově naplněný – znovu podbarvit nalezené
         if not matchers:
             return ""
@@ -438,6 +481,10 @@ class ProjectPanel(QWidget):
         act_rename.setEnabled(enabled["rename"])
         act_delete = menu.addAction("Smazat… (do Koše)" + many + "\tDel")
         act_delete.setEnabled(enabled["delete"])
+        act_note = None
+        if not self.project.local_only:
+            menu.addSeparator()
+            act_note = menu.addAction("Přidat poznámku…" + many)
         if not self.project.mine and not self.project.local_only:
             menu.addSeparator()
             note = menu.addAction("Odevzdat a převzít lze až u aktivovaného projektu")
@@ -459,6 +506,8 @@ class ProjectPanel(QWidget):
             self.take_requested.emit(scopes)
         elif chosen is act_delete:
             self._delete(scopes)
+        elif chosen is act_note:
+            self.note_requested.emit(scopes)
 
     OPEN_CONFIRM_OVER = 10  # při otevírání víc souborů najednou se nejdřív zeptat
 

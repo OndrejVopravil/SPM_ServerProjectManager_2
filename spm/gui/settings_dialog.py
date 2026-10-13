@@ -78,6 +78,16 @@ class SettingsDialog(QDialog):
             "při každé aktivaci ho lze změnit. Zapnuto = stáhnou se jen zamčené soubory.")
         self.skip_unlocked.setChecked(settings.skip_unlocked_download)
 
+        self.nickname = QLineEdit(settings.nickname)
+        self.nickname.setPlaceholderText("prázdné = jméno z Windows")
+        self.nickname.setToolTip("Jak vás uvidí ostatní u poznámek a při výběru adresáta poznámky.")
+
+        self.tree_expanded = QCheckBox("Rozbalovat složky ve stromu projektu")
+        self.tree_expanded.setToolTip(
+            "Výchozí stav složek ve stromu pod seznamem projektů (po klepnutí na projekt a u nově\n"
+            "přidaných složek). Složky, které sami rozbalíte nebo sbalíte, zůstanou tak i po obnovení.")
+        self.tree_expanded.setChecked(settings.tree_expanded)
+
         self.warn_exit = QCheckBox("Při ukončení upozornit na aktivované projekty")
         self.warn_exit.setChecked(settings.warn_active_on_exit)
 
@@ -137,9 +147,11 @@ class SettingsDialog(QDialog):
         form.addRow(shared_box)
 
         form.addRow(QLabel("<b>Osobní nastavení</b> – platí pro všechny záložky"))
+        form.addRow("Přezdívka:", self.nickname)
         form.addRow(self.delete_local)
         form.addRow("Min. shoda pro návrh přejmenování:", self.threshold)
         form.addRow(self.skip_unlocked)
+        form.addRow(self.tree_expanded)
         form.addRow(self.warn_exit)
         form.addRow(self.mirror_enabled)
         form.addRow(self.auto_refresh)
@@ -320,6 +332,8 @@ class SettingsDialog(QDialog):
         s.rename_threshold = self.threshold.value() / 100
         s.skip_unlocked_download = self.skip_unlocked.isChecked()
         s.warn_active_on_exit = self.warn_exit.isChecked()
+        s.tree_expanded = self.tree_expanded.isChecked()
+        s.nickname = self.nickname.text().strip()
         s.mirror_enabled = self.mirror_enabled.isChecked()
         s.auto_refresh_seconds = (self.refresh_seconds.value() if self.auto_refresh.isChecked()
                                   else AUTO_REFRESH_OFF)
