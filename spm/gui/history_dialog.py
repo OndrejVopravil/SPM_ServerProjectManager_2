@@ -8,6 +8,7 @@ souborů, zobrazí se u záznamu jen změny těchto souborů.
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -159,5 +160,13 @@ class HistoryDialog(QDialog):
             values = [dbm.CHANGE_LABELS.get(ch["change_type"], ch["change_type"]),
                       ch["old_path"] or "", ch["new_path"] or "", ch["backup_path"] or ""]
             for c, v in enumerate(values):
-                self.changes.setItem(r, c, QTableWidgetItem(v))
+                item = QTableWidgetItem(v)
+                if c >= 1 and v:  # cesty: bublina s celou cestou (sloupec může být úzký)
+                    item.setToolTip(self.path_tooltip(v))
+                self.changes.setItem(r, c, item)
         self.changes.resizeColumnToContents(0)
+
+    def path_tooltip(self, rel: str) -> str:
+        """Relativní cesta v projektu a úplná cesta na serveru."""
+        project = Path(self.db.path).parent.parent  # <projekt>/.spm/project.db
+        return f"{rel}\n{project.joinpath(*rel.split('/'))}"

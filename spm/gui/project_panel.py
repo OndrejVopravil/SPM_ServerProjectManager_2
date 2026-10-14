@@ -12,8 +12,8 @@ import os
 from collections import Counter
 from typing import Callable
 
-from PySide6.QtCore import QThread, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPalette, QShortcut
+from PySide6.QtCore import QPointF, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPalette, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QToolButton,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -37,6 +38,24 @@ COLOR_MINE = QColor("#2e8b57")
 COLOR_MIRROR = QColor("#8e44ad")  # spravuje zrcadlo z jiného serveru (jen pro čtení)
 COLOR_OTHER = QColor("#c0392b")
 COLOR_FOUND = QColor("#fff176")  # podbarvení souborů nalezených hledáním
+SEARCH_EXPAND_DELAY_MS = 1000    # prodleva před rozbalením složek s nalezenými soubory
+
+
+def _tree_icon(expand: bool) -> QIcon:
+    """Ikona „rozbalit vše“ (⊞) / „sbalit vše“ (⊟): čtvereček s plusem / mínusem."""
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#7a7a7a"))
+    pen.setWidthF(1.4)
+    painter.setPen(pen)
+    painter.drawRoundedRect(2, 2, 12, 12, 2, 2)
+    painter.drawLine(QPointF(5, 8), QPointF(11, 8))
+    if expand:
+        painter.drawLine(QPointF(8, 5), QPointF(8, 11))
+    painter.end()
+    return QIcon(pixmap)
 COLOR_NOTE = QColor("#b9770e")   # soubory / složky s otevřenou poznámkou
 
 
@@ -118,13 +137,24 @@ class ProjectPanel(QWidget):
         self.search.setPlaceholderText("Hledat soubor…  (* = cokoliv, Esc zruší)")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(300)
-        self.search.textChanged.connect(lambda _: self._apply_search(scroll=True))
+        self.search.textChanged.connect(self._on_search_text)
         self.found = QLabel()
+        # po dopsání hledaného textu (1 s bez změny) se rozbalí složky s nalezenými soubory
+        self._expand_timer = QTimer(self)
+        self._expand_timer.setSingleShot(True)
+        self._expand_timer.setInterval(SEARCH_EXPAND_DELAY_MS)
+        self._expand_timer.timeout.connect(self.expand_found)
+        self.btn_expand = self._tool_button(_tree_icon(expand=True), "Rozbalit všechny složky",
+                                            lambda: self.tree.expandAll())
+        self.btn_collapse = self._tool_button(_tree_icon(expand=False), "Sbalit všechny složky",
+                                              lambda: self.tree.collapseAll())
         clear = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         clear.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)  # jen v panelu (pole, strom)
         clear.activated.connect(self.search.clear)
         head = QHBoxLayout()
         head.addWidget(self.title)
+        head.addWidget(self.btn_expand)
+        head.addWidget(self.btn_collapse)
         head.addStretch()
         head.addWidget(self.found)
         head.addWidget(self.search)
@@ -298,6 +328,36 @@ class ProjectPanel(QWidget):
                 return True
             it += 1
         return False
+
+    def _tool_button(self, icon: QIcon, tip: str, slot) -> QToolButton:
+        button = QToolButton()
+        button.setIcon(icon)
+        button.setToolTip(tip)
+        button.setAutoRaise(True)
+        button.clicked.connect(lambda: slot())
+        return button
+
+    def _on_search_text(self, _text: str) -> None:
+        # podbarvit hned; rozbalit složky a posunout se k prvnímu nalezenému až po prodlevě
+        # (posun stromu sbalené složky sám rozbaluje)
+        self._apply_search(scroll=False)
+        self._expand_timer.start()  # znovu od nuly při každém dalším znaku
+
+    def expand_found(self) -> None:
+        """Rozbalí složky, ve kterých jsou soubory odpovídající hledání (ostatní nechá být)."""
+        match = wildcard_matcher(self.search.text())
+        if match is None:
+            return
+        first = None
+        for item in self.tree.leaf_items():
+            if match(item.text(0)):
+                parent = item.parent()
+                while parent is not None:
+                    parent.setExpanded(True)
+                    parent = parent.parent()
+                first = first or item
+        if first is not None:
+            self.tree.scrollToItem(first)
 
     def _apply_search(self, scroll: bool = False) -> None:
         """Podbarví žlutě soubory, jejichž název obsahuje hledaný text (s * jako „cokoliv“)."""

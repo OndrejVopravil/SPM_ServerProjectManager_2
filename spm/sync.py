@@ -184,6 +184,9 @@ class UploadPlan:
     # místní práce, kterou nelze nahrát (změněné cizí soubory, nové soubory s obsazeným
     # názvem) – po smazání místní kopie by se ztratila
     unsavable: list[str] = field(default_factory=list)
+    # moje zamčené soubory, které někdo smazal přímo na serveru (mimo aplikaci) – při odevzdání
+    # se nahrají zpět z místní kopie
+    gone_on_server: set[str] = field(default_factory=set)
 
     @property
     def held(self) -> list[str]:
@@ -252,6 +255,8 @@ class UploadResult:
     auto_deactivated: bool = False   # odevzdán poslední držený soubor -> projekt deaktivován
     note: str = ""                   # proč se automaticky nedeaktivoval (je-li co říct)
     notes_published: int = 0         # zveřejněné rozepsané poznámky
+    restored: list[str] = field(default_factory=list)       # smazané na serveru, nahrané zpět
+    lost_versions: list[str] = field(default_factory=list)  # jejich poslední verze ze serveru se nezachovala
 
 
 @dataclass
@@ -1145,6 +1150,7 @@ class ProjectManager:
         locked_unchanged: list[DbFile] = []
         conflicts: list[str] = []
         unsavable: list[str] = []
+        gone: set[str] = set()
         for path, entry in manifest.files.items():
             lf = local_files.get(path)
             dbf = by_id.get(entry.file_id)
@@ -1163,7 +1169,9 @@ class ProjectManager:
                         if not same_stat(st.st_size, st.st_mtime, dbf.size, dbf.mtime):
                             conflicts.append(f"{path} – změněn na serveru mimo aplikaci (bude přepsán)")
                     except FileNotFoundError:
-                        conflicts.append(f"{path} – smazán na serveru mimo aplikaci")
+                        gone.add(entry.file_id)
+                        conflicts.append(f"{path} – smazán na serveru mimo aplikaci – obnoví se "
+                                         "z vaší místní kopie")
             elif lf is None:
                 conflicts.append(f"{path} – smazán v místní kopii, ale nemáte ho zamčený "
                                  "(na serveru zůstane)")
@@ -1190,7 +1198,7 @@ class ProjectManager:
         suggestions = suggest_renames(missing, new, self.settings.rename_threshold)
         invalid = self._invalid_paths([lf.path for lf in new] + [lf.path for _, lf in modified])
         return UploadPlan(name, sid, local_files, unchanged, modified, missing, new,
-                          locked_unchanged, suggestions, conflicts, invalid, unsavable)
+                          locked_unchanged, suggestions, conflicts, invalid, unsavable, gone)
 
     # zpětně čitelné názvy pro deaktivaci
     plan_deactivation = plan_upload
@@ -1241,6 +1249,12 @@ class ProjectManager:
         modified = [(bf, lf) for bf, lf in plan.modified if sel(bf.file_id)]
         added = [lf for lf in plan.new if lf.path not in set(targets) and sel(new_key(lf.path))]
         release_only = [bf for bf in plan.locked_unchanged if sel(bf.file_id)]
+        # zamčené beze změny, ale na serveru smazané mimo aplikaci -> nahrát zpět z místní kopie
+        restored = [(bf, plan.local_files[bf.path]) for bf in release_only
+                    if bf.file_id in plan.gone_on_server and bf.path in plan.local_files]
+        release_only = [bf for bf in release_only if bf.file_id not in {r.file_id for r, _ in restored}]
+        # upravené a zároveň na serveru smazané: nahrají se jako upravené + záznam o smazání
+        modified_gone = [bf for bf, _ in modified if bf.file_id in plan.gone_on_server]
         has_changes = bool(renames or deleted or modified or added)
 
         if has_changes and not comment:
@@ -1249,7 +1263,9 @@ class ProjectManager:
         if invalid:
             raise SyncError("Soubory mají názvy s nepovolenými znaky – nejdřív je opravte:\n\n"
                             + format_invalid(invalid))
-        if not (has_changes or release_only or end_session):
+        if restored and not comment:  # jen obnova smazaných – komentář není potřeba psát
+            comment = "Obnoveno z místní kopie (smazáno na serveru mimo aplikaci)."
+        if not (has_changes or restored or release_only or end_session):
             raise SyncError("Není vybráno nic k odevzdání.")
 
         server = self.server_dir(plan.name)
@@ -1277,10 +1293,11 @@ class ProjectManager:
                 f = by_lower.get(lf.path.lower())
                 if f is not None and f.file_id != bf.file_id:
                     raise SyncError(f"Na serveru už je soubor se stejným názvem:\n{lf.path}")
-            db.set_pending([bf.file_id for bf, _ in renames + modified] + [bf.file_id for bf in deleted])
+            db.set_pending([bf.file_id for bf, _ in renames + modified + restored]
+                           + [bf.file_id for bf in deleted])
 
         # 2) Soubory na serveru
-        total = 2 * len(renames) + len(modified) + len(added) + len(deleted)
+        total = 2 * len(renames) + len(modified) + len(added) + len(deleted) + len(restored)
         step = 0
 
         def tick(text: str) -> None:
@@ -1325,6 +1342,20 @@ class ProjectManager:
             self._upload(server, local, lf, backup_existing=False)
             ops.append((dbm.ADDED, new_ids[lf.path], None, lf, None))
 
+        for bf, lf in restored:
+            tick(f"Obnova {lf.path}")
+            self._upload(server, local, lf, backup_existing=False)
+            ops.append((dbm.RESTORED, bf.file_id, bf.path, lf, None))
+
+        # upravené soubory smazané na serveru: zachovala se jejich poslední verze ze serveru?
+        lost_versions: list[str] = []
+        if modified_gone:
+            with ProjectDB.for_project(server) as db:
+                db_sha = {f.file_id: f.sha256 for f in db.active_files(include_pending=True).values()}
+            for bf in modified_gone:
+                if not self._version_in_backups(server, bf.path, db_sha.get(bf.file_id)):
+                    lost_versions.append(bf.path)
+
         for bf in deleted:
             # na serveru se nemažou, ale přesouvají do .spm/trash/<sezení>/
             tick(f"Mazání {bf.path}")
@@ -1340,7 +1371,10 @@ class ProjectManager:
             self._ensure_notes_tables(server)
         with self._write(server) as db:
             self._my_session(db, sid)
-            commit_id = db.add_commit(sid, self.user, self.pc, dbm.UPLOAD, comment) if has_changes else None
+            commit_id = (db.add_commit(sid, self.user, self.pc, dbm.UPLOAD, comment)
+                         if has_changes or restored else None)
+            for bf in modified_gone:  # v historii je vidět, že soubor někdo smazal mimo aplikaci
+                db.add_change(commit_id, bf.file_id, dbm.EXTERNAL_DELETED, bf.path, None)
             if notes:
                 notes_mod.insert_notes(db, notes, self.user, self.pc, self.display_name, commit_id)
                 notes_mod.write_summary(server, db)
@@ -1379,7 +1413,9 @@ class ProjectManager:
 
         result = UploadResult(renamed=len(renames), modified=len(modified), added=len(added),
                               deleted=len(deleted), released=len(released),
-                              auto_deactivated=auto_end, note=auto_note, notes_published=len(notes))
+                              auto_deactivated=auto_end, note=auto_note, notes_published=len(notes),
+                              restored=[lf.path for _, lf in restored] + [bf.path for bf in modified_gone],
+                              lost_versions=lost_versions)
         if notes:  # zveřejněné už nejsou rozepsané
             published = {d.id for d in notes}
             notes_mod.save_drafts(local, [d for d in notes_mod.load_drafts(local) if d.id not in published])
@@ -1598,6 +1634,20 @@ class ProjectManager:
             backup = self._backup(server, rel)
         copy_with_hash(to_abs(local, rel), dst)
         return backup
+
+    @staticmethod
+    def _version_in_backups(server: Path, rel: str, sha256: str | None) -> bool:
+        """Je verze souboru (podle hashe) mezi zálohami projektu?"""
+        if not sha256:
+            return False
+        backup_dir = to_abs(server / SPM_DIR / "backup", rel).parent
+        name = rel.rsplit("/", 1)[-1].lower()
+        try:
+            candidates = [p for p in backup_dir.iterdir()
+                          if p.name.lower().startswith(name + ".backup")]
+        except OSError:
+            return False
+        return any(file_hash(p) == sha256 for p in candidates)
 
     def _backup(self, server: Path, rel: str) -> str:
         """Přesune soubor do .spm/backup/<cesta>.backupXY a ponechá jen posledních N záloh."""

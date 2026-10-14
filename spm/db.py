@@ -124,6 +124,7 @@ IMPORTED = "imported"
 EXTERNAL_MODIFIED = "external-modified"
 EXTERNAL_DELETED = "external-deleted"
 EXTERNAL_RENAMED = "external-renamed"
+RESTORED = "restored"  # smazán na serveru mimo aplikaci, nahrán zpět z místní kopie
 
 CHANGE_LABELS = {
     ADDED: "Přidán",
@@ -136,6 +137,7 @@ CHANGE_LABELS = {
     EXTERNAL_MODIFIED: "Změněn mimo aplikaci",
     EXTERNAL_DELETED: "Smazán mimo aplikaci",
     EXTERNAL_RENAMED: "Přejmenován mimo aplikaci",
+    RESTORED: "Obnoven z místní kopie",
 }
 
 # Druhy odevzdání (commits)

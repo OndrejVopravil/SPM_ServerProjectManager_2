@@ -83,3 +83,14 @@ def test_clear_search_shows_everything(history):
     history.search.clear()
     assert len(visible_comments(history)) == 4
     assert history.found.isHidden()
+
+
+def test_path_cells_have_full_path_tooltip(history, tmp_path):
+    history.search.setText("Úprava sestavy")
+    rows = {history.changes.item(r, 2).text(): r for r in range(history.changes.rowCount())}
+    item = history.changes.item(rows["sestava/sestava.elt"], 2)      # nová cesta
+    full = tmp_path / "server" / "Forma" / "sestava" / "sestava.elt"
+    assert item.toolTip() == f"sestava/sestava.elt\n{full}"
+    old = history.changes.item(rows["sestava/sestava.elt"], 1)       # původní cesta
+    assert old.toolTip().endswith(str(full))
+    assert history.changes.item(rows["sestava/sestava.elt"], 0).toolTip() == ""   # druh změny bez bubliny

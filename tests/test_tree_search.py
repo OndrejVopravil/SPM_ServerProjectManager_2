@@ -127,3 +127,30 @@ def test_tree_expanded_setting_in_dialog(window):
     dlg.tree_expanded.setChecked(False)
     dlg._accept()
     assert window.settings.tree_expanded is False
+
+
+def test_expand_and_collapse_all_buttons(window):
+    panel = window.panel
+    panel.btn_collapse.click()
+    assert not find_item(panel.tree, "dily").isExpanded() and not find_item(panel.tree, "dily/nc").isExpanded()
+    panel.btn_expand.click()
+    assert find_item(panel.tree, "dily").isExpanded() and find_item(panel.tree, "dily/nc").isExpanded()
+    assert panel.btn_expand.toolTip() == "Rozbalit všechny složky" and not panel.btn_expand.icon().isNull()
+
+
+def test_search_expands_matching_folders_after_delay(window, tmp_path):
+    from spm.gui.project_panel import SEARCH_EXPAND_DELAY_MS
+    panel = window.panel
+    panel.btn_collapse.click()
+    panel.search.setText("xyz")
+    assert not find_item(panel.tree, "dily/nc").isExpanded()     # hned ne – až po prodlevě
+    assert panel._expand_timer.isActive() and panel._expand_timer.interval() == SEARCH_EXPAND_DELAY_MS == 1000
+    panel.search.setText("*xyz")                                  # další znak -> prodleva znovu
+    assert panel._expand_timer.isActive()
+    panel._expand_timer.timeout.emit()                            # = uplynula 1 s
+    assert find_item(panel.tree, "dily").isExpanded() and find_item(panel.tree, "dily/nc").isExpanded()
+    # složka bez nalezeného souboru zůstane sbalená
+    panel.btn_collapse.click()
+    panel.search.setText("deska")
+    panel._expand_timer.timeout.emit()
+    assert find_item(panel.tree, "dily").isExpanded() and not find_item(panel.tree, "dily/nc").isExpanded()

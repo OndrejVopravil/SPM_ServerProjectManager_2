@@ -1079,6 +1079,13 @@ class MainWindow(QMainWindow):
                 msg += "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
             if res.notes_published:
                 msg += f"\n\nZveřejněné poznámky: {res.notes_published}"
+            if res.restored:
+                msg += ("\n\nSoubory smazané na serveru mimo aplikaci byly obnoveny z vaší místní kopie:\n  "
+                        + "\n  ".join(res.restored[:15]) + ("\n  …" if len(res.restored) > 15 else ""))
+            if res.lost_versions:
+                msg += ("\n\nPOZOR – poslední verze těchto souborů na serveru (před smazáním) se "
+                        "nezachovala v zálohách, nahrála se rovnou vaše upravená verze:\n  "
+                        + "\n  ".join(res.lost_versions[:15]))
             self._reload_notes_window(plan.name)
             QMessageBox.information(self, title, msg)
             self._mirror_after(plan.name)

@@ -647,3 +647,50 @@ def test_project_list_reads_small_files_only_when_changed(tmp_path, monkeypatch)
     assert reads == ["comment"] and third["B"].comment.text == "nový komentář"
     other.cancel_activation("A")
     assert not {p.name: p for p in pm.list_projects()}["A"].active
+
+
+# --- soubor smazaný na serveru mimo aplikaci, zatímco ho držím -----------------------------
+
+def _changes_of(proj):
+    from spm.db import ProjectDB
+    with ProjectDB.for_project(proj) as db:
+        return [(c["change_type"], c["old_path"] or c["new_path"]) for c in db.all_changes()]
+
+
+def test_unchanged_held_file_deleted_on_server_is_restored(tmp_path):
+    proj = tmp_path / "server" / "Forma"
+    for f in ("a.txt", "b.txt"):
+        (proj / f).parent.mkdir(parents=True, exist_ok=True)
+        (proj / f).write_text(f)
+    pm = ProjectManager(Settings(server_root=str(tmp_path / "server"), local_root=str(tmp_path / "l")))
+    pm.activate("Forma", lock_paths=["a.txt", "b.txt"])
+    (proj / "a.txt").unlink()                                   # mimo aplikaci (Průzkumník)
+    plan = pm.plan_upload("Forma")
+    assert any("a.txt" in c and "obnoví se" in c for c in plan.conflicts)
+    a_id = next(bf.file_id for bf in plan.locked_unchanged if bf.path == "a.txt")
+    res = pm.upload(plan, plan.default_assignments(), "", selected={a_id})   # jen uvolnit a.txt
+    assert res.restored == ["a.txt"] and not res.lost_versions
+    assert (proj / "a.txt").read_text() == "a.txt"
+    assert ("restored", "a.txt") in _changes_of(proj)
+
+
+def test_modified_held_file_deleted_on_server_is_uploaded_and_recorded(tmp_path):
+    proj = tmp_path / "server" / "Forma"
+    for f in ("a.txt", "b.txt"):
+        (proj / f).parent.mkdir(parents=True, exist_ok=True)
+        (proj / f).write_text(f)
+    pm = ProjectManager(Settings(server_root=str(tmp_path / "server"), local_root=str(tmp_path / "l")))
+    pm.activate("Forma", lock_paths=["a.txt", "b.txt"])
+    local = pm.local_dir("Forma")
+    (local / "a.txt").write_text("a v2")
+    (proj / "a.txt").unlink()
+    plan = pm.plan_upload("Forma")
+    a_id = next(bf.file_id for bf, _ in plan.modified if bf.path == "a.txt")
+    res = pm.upload(plan, plan.default_assignments(), "uprava", selected={a_id})
+    assert res.restored == ["a.txt"] and res.lost_versions == ["a.txt"]   # původní verze nezálohována
+    assert (proj / "a.txt").read_text() == "a v2"
+    changes = _changes_of(proj)
+    assert changes.index(("external-deleted", "a.txt")) < changes.index(("modified", "a.txt"))
+    # obnova ze záloh s ním počítá (soubor existuje)
+    latest = pm.restore_points("Forma").points[0]
+    assert "a.txt" in {path for path, _ in latest.files.values()} and not latest.missing
