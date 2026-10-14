@@ -89,6 +89,8 @@ class Settings:
     mirror_rules: list[dict] = field(default_factory=list)
     # Zrcadlit z tohoto počítače (vypnout např. bez práva zápisu do cílové síťové složky)
     mirror_enabled: bool = True
+    # Barva záložky (klíč z gui.tab_bar.TAB_COLORS; "" = bez barvy)
+    tab_color: str = ""
     # --- převzato ze spm_config.json síťové složky záložky (viz shared_config) ---
     # identita síťové složky – stejná pro všechny uživatele bez ohledu na připojení disku
     server_id: str = ""
@@ -158,7 +160,7 @@ INTERNAL_FIELDS = ("workspace_id", "_app")
 # Nastavení, která má každá záložka vlastní; ostatní (kromě ui) jsou osobní – pro všechny záložky
 WORKSPACE_FIELDS = ("server_root", "local_root", "backup_enabled", "backup_count",
                     "check_forbidden_chars", "ignore_patterns", "known_default_ignore",
-                    "server_id", "server_name", "shared_mirror_rules")
+                    "server_id", "server_name", "shared_mirror_rules", "tab_color")
 PERSONAL_FIELDS = tuple(f.name for f in fields(Settings)
                         if f.name not in WORKSPACE_FIELDS + INTERNAL_FIELDS + ("ui",))
 DEFAULT_WORKSPACE_NAME = "Projekty"

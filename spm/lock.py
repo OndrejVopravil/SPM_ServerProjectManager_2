@@ -56,6 +56,14 @@ def marker_path(project_dir: Path, user: str, pc: str) -> Path:
     return active_dir(project_dir) / f"{_safe(user)}@{_safe(pc)}.json".lower()
 
 
+def read_marker(path: Path) -> LockInfo | None:
+    """Jedna značka aktivace; None = právě se zapisuje / je poškozená."""
+    try:
+        return LockInfo(**json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def active_users(project_dir: Path) -> list[LockInfo]:
     """Uživatelé, kteří mají projekt aktivovaný (podle značek)."""
     folder = active_dir(project_dir)

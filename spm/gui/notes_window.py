@@ -112,7 +112,8 @@ FOR_ME_BACKGROUND = FOR_ME_LIGHT.background  # (pro testy a zpětnou kompatibili
 def is_dark(widget: QWidget) -> bool:
     """Tmavý režim – podle jasu pozadí (funguje se systémovým tmavým motivem i vlastní paletou)."""
     return widget.palette().color(QPalette.ColorRole.Base).lightness() < 128
-REPLY_BORDER = "#9e9e9e"        # odsazení doplnění
+REPLY_BORDER = "#9e9e9e"        # svislý pruh vlevo od doplnění
+REPLY_BAR_WIDTH = 3             # šířka pruhu v px
 
 
 def markdown_to_html(text: str) -> str:
@@ -124,9 +125,31 @@ def markdown_to_html(text: str) -> str:
     return match.group(1) if match else html
 
 
-def _links(*items: tuple[str, str]) -> str:
-    return "<p>" + " &nbsp;·&nbsp; ".join(f'<a href="{href}">{escape(text)}</a>'
-                                           for href, text in items) + "</p>"
+@dataclass(frozen=True)
+class TextSizes:
+    """Velikosti písma v okně poznámek (body): text poznámky největší, ostatní menší."""
+    text: float = 11.0   # text poznámky a doplnění
+    meta: float = 8.0    # autor, datum, příznaky, „Týká se“, odkazy (Upravit, Doplnit…)
+
+    @classmethod
+    def from_base(cls, base: float) -> "TextSizes":
+        base = base if base > 0 else 9.0
+        return cls(text=round(base * 1.2, 1), meta=round(base * 0.9, 1))
+
+
+def _meta(html: str, sizes: TextSizes) -> str:
+    """Odstavec doprovodných údajů (menší písmo)."""
+    return f'<p style="font-size:{sizes.meta}pt;">{html}</p>'
+
+
+def _text(markdown: str, sizes: TextSizes) -> str:
+    """Text poznámky (největší písmo)."""
+    return f'<div style="font-size:{sizes.text}pt;">{markdown_to_html(markdown)}</div>'
+
+
+def _links(sizes: TextSizes, *items: tuple[str, str]) -> str:
+    return _meta(" &nbsp;·&nbsp; ".join(f'<a href="{href}">{escape(text)}</a>'
+                                        for href, text in items), sizes)
 
 
 def _edited(n: Note) -> str:
@@ -135,21 +158,24 @@ def _edited(n: Note) -> str:
     return f" · upraveno {fmt_time(n.edited_at)}"
 
 
-def _reply_html(r: Note, me: str, seen: int) -> str:
+def _reply_html(r: Note, me: str, seen: int, sizes: TextSizes) -> str:
     new = " · <b>NOVÉ</b>" if r.is_new(seen, me) else ""
     actions = []
     if r.is_author(me):
         actions.append((f"spmedit:{r.note_id}", "Upravit"))
     if r.versions:
         actions.append((f"spmversions:{r.note_id}", f"Předchozí znění ({len(r.versions)})"))
-    return (f'<table width="100%" cellpadding="4" cellspacing="0" border="0"><tr>'
-            f'<td width="6" bgcolor="{REPLY_BORDER}"></td><td>'
-            f"<p><b>{escape(r.author)}</b> · {fmt_time(r.created_at)}{_edited(r)}{new}</p>"
-            f"{markdown_to_html(r.text)}{_links(*actions) if actions else ''}</td></tr></table>")
+    # pruh vlevo: úzká buňka bez odsazení (odsazení má jen buňka s textem – jinak by se
+    # přičítalo k šířce pruhu)
+    return (f'<table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>'
+            f'<td width="{REPLY_BAR_WIDTH}" bgcolor="{REPLY_BORDER}"></td>'
+            f'<td style="padding-left:8px; padding-top:2px; padding-bottom:2px;">'
+            + _meta(f"<b>{escape(r.author)}</b> · {fmt_time(r.created_at)}{_edited(r)}{new}", sizes)
+            + _text(r.text, sizes) + (_links(sizes, *actions) if actions else "") + "</td></tr></table>")
 
 
 def notes_html(notes: list[Note], me: str, seen: int, show_resolved: bool,
-               colors: ForMeColors = FOR_ME_LIGHT) -> str:
+               colors: ForMeColors = FOR_ME_LIGHT, sizes: TextSizes = TextSizes()) -> str:
     """Poznámky pro okno: každá jako karta s doplněními pod sebou; poznámka pro mě je
     zvýrazněná barvou a rámečkem. Odkazy: soubory (spmfile), vyřídit / znovu otevřít,
     doplnit (spmreply), upravit (spmedit – jen autor), předchozí znění (spmversions)."""
@@ -174,13 +200,13 @@ def notes_html(notes: list[Note], me: str, seen: int, show_resolved: bool,
             head += " · " + " · ".join(flags)
         rows = []
         if for_me:
-            rows.append(f'<p style="color:{colors.label};"><b>▶ PRO VÁS</b></p>')
-        rows.append(f"<p>{head}</p>")
+            rows.append(f'<p style="color:{colors.label}; font-size:{sizes.meta}pt;"><b>▶ PRO VÁS</b></p>')
+        rows.append(_meta(head, sizes))
         if n.targets:
-            rows.append("<p>Týká se: " + ", ".join(
-                f'<a href="spmfile:{quote(t)}">{escape(t)}</a>' for t in n.targets) + "</p>")
-        rows.append(markdown_to_html(n.text))
-        rows += [_reply_html(r, me, seen) for r in n.replies]
+            rows.append(_meta("Týká se: " + ", ".join(
+                f'<a href="spmfile:{quote(t)}">{escape(t)}</a>' for t in n.targets), sizes))
+        rows.append(_text(n.text, sizes))
+        rows += [_reply_html(r, me, seen, sizes) for r in n.replies]
         actions = [(f"spmreply:{n.note_id}", "Doplnit")]
         if n.is_author(me):
             actions.append((f"spmedit:{n.note_id}", "Upravit"))
@@ -188,7 +214,7 @@ def notes_html(notes: list[Note], me: str, seen: int, show_resolved: bool,
             actions.append((f"spmversions:{n.note_id}", f"Předchozí znění ({len(n.versions)})"))
         actions.append((f"spmreopen:{n.note_id}", "Znovu otevřít") if n.resolved
                        else (f"spmresolve:{n.note_id}", "Označit jako vyřízené"))
-        rows.append(_links(*actions))
+        rows.append(_links(sizes, *actions))
         body = "".join(rows)
         if for_me:
             cards.append(f'<table width="100%" cellpadding="8" cellspacing="0" border="1" '
@@ -317,7 +343,8 @@ class NotesWindow(QWidget):
     def _render(self) -> None:
         seen = self._seen_get()
         html = notes_html(self.notes, self.pm.user, seen, self.show_resolved.isChecked(),
-                          FOR_ME_DARK if is_dark(self.view) else FOR_ME_LIGHT)
+                          FOR_ME_DARK if is_dark(self.view) else FOR_ME_LIGHT,
+                          TextSizes.from_base(self.view.font().pointSizeF()))
         if not html:
             html = ("<p><i>Projekt nemá žádné otevřené poznámky.</i></p>" if self.notes
                     else "<p><i>Projekt zatím nemá žádné poznámky.</i></p>")

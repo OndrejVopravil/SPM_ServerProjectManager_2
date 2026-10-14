@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -22,14 +23,14 @@ from typing import Iterable, Iterator
 from . import SPM_DIR, recycle
 from . import db as dbm
 from .comment import MAX_LENGTH as COMMENT_MAX_LENGTH
-from .comment import ProjectComment, normalize_text, read_comment, write_comment
+from .comment import COMMENT_FILE, ProjectComment, normalize_text, read_comment, write_comment
 from . import notes as notes_mod
 from . import users
 from .notes import Draft, Note
 from .config import Settings
 from .db import DbFile, LockOwner, ProjectDB, db_path
 from .identity import current_full_name, current_pc, current_user
-from .lock import LockInfo, WriteLock, active_users, add_marker, now_iso, remove_marker
+from .lock import LockInfo, WriteLock, active_users, add_marker, now_iso, read_marker, remove_marker
 from .manifest import Entry, Manifest
 from .matcher import RenameSuggestion, similarity, suggest_renames
 from .names import describe_chars, find_invalid_names, forbidden_in, format_invalid, invalid_rel_paths
@@ -54,6 +55,10 @@ from .scanner import (
 
 class SyncError(Exception):
     pass
+
+
+# Kolik projektů zjišťovat najednou (dotazy na síť čekají hlavně na odezvu serveru)
+STATUS_WORKERS = 16
 
 
 # Složky, do kterých aktivace odkládá dřívější místní kopii (viz activate) – nejsou to projekty.
@@ -300,15 +305,22 @@ class ProjectManager:
     # --- přehled -----------------------------------------------------------
 
     def list_projects(self) -> list[ProjectStatus]:
-        if not self.server_root.is_dir():
-            raise SyncError(f"Síťová složka není dostupná:\n{self.server_root}")
-        result = []
-        server_names: set[str] = set()
-        for entry in self.server_root.iterdir():
-            if not entry.is_dir() or entry.name.startswith("."):
-                continue
-            server_names.add(entry.name.lower())
-            result.append(self._server_status(entry.name))
+        """Projekty na serveru a složky jen v místním úložišti.
+
+        Rychlé i při stovkách projektů na síti: stav projektů se zjišťuje souběžně a u každého
+        stačí výpis jeho složky .spm – soubory (značky aktivace, komentář, souhrn poznámek)
+        se čtou jen tehdy, když se od minulého obnovení změnily (viz _cached)."""
+        try:
+            with os.scandir(self.server_root) as it:  # typ položky bez dalšího dotazu na síť
+                names = [e.name for e in it if not e.name.startswith(".") and e.is_dir()]
+        except OSError:
+            raise SyncError(f"Síťová složka není dostupná:\n{self.server_root}") from None
+        server_names = {n.lower() for n in names}
+        if names:
+            with ThreadPoolExecutor(max_workers=min(STATUS_WORKERS, len(names))) as pool:
+                result = list(pool.map(self._server_status, names))
+        else:
+            result = []
         for name in self.local_only_projects(server_names):
             result.append(ProjectStatus(name=name, users=[], local_exists=True, mine=False,
                                         local_only=True))
@@ -318,12 +330,46 @@ class ProjectManager:
 
     def _server_status(self, name: str) -> ProjectStatus:
         server = self.server_dir(name)
-        users = active_users(server)
+        # jeden výpis .spm: které soubory existují a kdy se změnily (DirEntry.stat() ve Windows
+        # nepotřebuje další dotaz na síť)
+        entries: dict[str, os.DirEntry] = {}
+        try:
+            with os.scandir(server / SPM_DIR) as it:
+                entries = {e.name: e for e in it}
+        except OSError:
+            pass  # projekt bez evidence
+        users: list[LockInfo] = []
+        if "active" in entries:
+            try:
+                with os.scandir(entries["active"].path) as it:
+                    markers = sorted((e for e in it if e.name.endswith(".json")), key=lambda e: e.name)
+                    users = [u for u in (self._cached(e, read_marker) for e in markers) if u]
+            except OSError:
+                pass
+        comment = self._cached(entries.get(COMMENT_FILE), lambda _path: read_comment(server))
+        summary = self._cached(entries.get(notes_mod.SUMMARY_FILE),
+                               lambda _path: notes_mod.read_summary(server)) or notes_mod.Summary()
         others = [u for u in users if not u.is_mine(self.user, self.pc)]
         return ProjectStatus(name=name, users=users, local_exists=self.local_dir(name).exists(),
                              mine=len(others) < len(users), others=others,
-                             comment=read_comment(server),
-                             notes_for_me=notes_mod.read_summary(server).for_user(self.user))
+                             comment=comment, notes_for_me=summary.for_user(self.user))
+
+    def _cached(self, entry: os.DirEntry | None, read):
+        """Obsah malého souboru ze serveru; znovu se čte jen při změně (čas a velikost)."""
+        if entry is None:
+            return None
+        try:
+            st = entry.stat()
+        except OSError:
+            return None
+        stamp = (st.st_mtime_ns, st.st_size)
+        cache = self.__dict__.setdefault("_status_cache", {})
+        hit = cache.get(entry.path)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        value = read(Path(entry.path))
+        cache[entry.path] = (stamp, value)
+        return value
 
     # --- poznámky ---------------------------------------------------------------
 

@@ -355,3 +355,18 @@ def test_for_me_card_colors_follow_dark_mode(qapp, pms):
     html = window.view.toHtml().lower()
     assert FOR_ME_DARK.background in html and FOR_ME_LIGHT.background not in html
     assert FOR_ME_DARK.text in html                                 # bílý text
+
+
+def test_note_text_larger_than_meta(qapp, pms):
+    from spm.gui.notes_window import NotesWindow, TextSizes, notes_html
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Hlavní text", recipient="bob")])
+    sizes = TextSizes.from_base(9)
+    assert sizes.text > 9 > sizes.meta
+    html = notes_html(bob.notes("Forma"), "bob", 0, False, sizes=sizes)
+    assert f"font-size:{sizes.text}pt" in html and f"font-size:{sizes.meta}pt" in html
+    window = NotesWindow(bob, "Forma")
+    doc = window.view.document()
+    text_block = doc.find("Hlavní text")
+    meta_block = doc.find("Označit jako vyřízené")
+    assert text_block.charFormat().fontPointSize() > meta_block.charFormat().fontPointSize()

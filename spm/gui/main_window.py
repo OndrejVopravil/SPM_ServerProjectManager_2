@@ -4,7 +4,7 @@ import os
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QByteArray, QEvent, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSplitter,
     QStyle,
-    QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
@@ -48,6 +47,7 @@ from ..mirror import Mirror, MirrorPermissionError, MirrorRule, mirrors_for, res
 from .comment_dialog import CommentDialog
 from .mirror_dialog import MirrorDialog, format_mirror_counts, format_mirror_problems
 from .notes_window import NotesWindow, QuickNoteDialog
+from .tab_bar import TAB_COLORS, ColorTabBar, is_dark
 from .. import notes as notes_mod
 from .file_select_dialog import FileSelectDialog
 from .history_dialog import HistoryDialog
@@ -61,6 +61,7 @@ from .upload_dialog import UploadDialog
 from .worker import run_task
 
 COLOR_MINE = QColor("#2e8b57")      # aktivováno mnou
+COLOR_MINE_DARK = QColor("#6fdc95")  # totéž v tmavém režimu (záložky)
 COLOR_OTHER = QColor("#2f6fb5")     # pracují na něm jiní (lze se přidat)
 COLOR_INVALID = QColor("#e67e22")   # nepovolené znaky v názvech – nelze aktivovat
 
@@ -69,6 +70,26 @@ COL_NAME, COL_COMMENT, COL_STATE, COL_USERS, COL_SINCE, COL_LOCAL = range(len(CO
 HEADER_KEY = "main.v3"  # změna sloupců -> neobnovovat šířky uložené pro starší rozvržení
 COMMENT_COLUMN_MAX = 300  # výchozí šířka sloupce Komentář nejvýše (zbytek je v tooltipu)
 FOCUS_REFRESH_MIN_GAP = 5.0  # s – při rychlém přepínání oken (Alt+Tab) neobnovovat pokaždé
+
+
+class ProjectListThread(QThread):
+    """Seznam projektů na pozadí (tiché obnovení – po návratu do okna, automatické)."""
+
+    done = Signal(object, str)  # projekty (nebo None), chyba
+
+    def __init__(self, pm: ProjectManager):
+        super().__init__()
+        self.pm = pm
+
+    def run(self) -> None:
+        try:
+            try:
+                self.pm.register_user()  # adresář uživatelů (výběr adresáta poznámek)
+            except OSError:
+                pass
+            self.done.emit(self.pm.list_projects(), "")
+        except Exception as e:  # noqa: BLE001 – tiché obnovení chybu nehlásí
+            self.done.emit(None, str(e) or type(e).__name__)
 
 
 class NameCheckThread(QThread):
@@ -122,6 +143,7 @@ class MainWindow(QMainWindow):
         self.projects: list[ProjectStatus] = []
         self.name_issues: dict[str, list[str]] = {}  # projekt -> názvy s nepovolenými znaky
         self._name_check: NameCheckThread | None = None
+        self._bg_refresh: ProjectListThread | None = None  # tiché obnovení seznamu na pozadí
         self._name_check_again = False
         self._rendering = False
         self._closing = False
@@ -239,7 +261,9 @@ class MainWindow(QMainWindow):
         if state:
             self.splitter.restoreState(QByteArray.fromBase64(state.encode("ascii")))
         # záložky = pracovní prostory (každá má vlastní síťovou a místní složku)
-        self.tabs = QTabBar()
+        self.tabs = ColorTabBar()
+        self.tabs.setMovable(True)  # pořadí záložek přetažením myší
+        self.tabs.tabMoved.connect(lambda *_: self._save_tab_order())
         self.tabs.setExpanding(False)
         self.tabs.setDocumentMode(True)
         # bez posouvacích šipek – jinak si lišta i s jedinou záložkou rezervuje místo navíc
@@ -281,7 +305,7 @@ class MainWindow(QMainWindow):
         clear.activated.connect(self.search.clear)
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(lambda: self.refresh(silent=True, check_names=False))
+        self.timer.timeout.connect(lambda: self.refresh(silent=True, check_names=False, background=True))
         self._apply_refresh_timer()
 
         self._update_status_bar()
@@ -378,9 +402,37 @@ class MainWindow(QMainWindow):
         return f"{ws['name']} ({count})" if count else ws["name"]
 
     def _style_tab(self, i: int, ws: dict) -> None:
-        """Text záložky; zeleně, pokud v ní mám aktivovaný alespoň jeden projekt."""
+        """Text záložky (zeleně, pokud v ní mám aktivovaný alespoň jeden projekt) a její barva."""
         self.tabs.setTabText(i, self._tab_label(ws))
-        self.tabs.setTabTextColor(i, COLOR_MINE if self._activated_count(ws["id"]) else QColor())
+        mine = COLOR_MINE_DARK if is_dark(self) else COLOR_MINE
+        self.tabs.setTabTextColor(i, mine if self._activated_count(ws["id"]) else QColor())
+        self.tabs.set_tab_color(i, self.app_settings.view(ws["id"]).tab_color)
+
+    def _save_tab_order(self) -> None:
+        """Záložka přetažena myší: pořadí záložek se uloží (bez přestavění lišty – drag běží)."""
+        order = [self.tabs.tabData(i) for i in range(self.tabs.count())]
+        by_id = {w["id"]: w for w in self.app_settings.workspaces}
+        if set(order) == set(by_id):
+            self.app_settings.workspaces = [by_id[i] for i in order]
+            self._save_settings()
+
+    def set_tab_color(self, ws_id: str, key: str) -> None:
+        view = self.app_settings.view(ws_id)
+        view.tab_color = key
+        self._save_settings_of(view)
+        self._fill_tabs()
+
+    def _save_settings_of(self, view: Settings) -> None:
+        try:
+            view.save()
+        except OSError as e:
+            QMessageBox.warning(self, "Nastavení", f"Nastavení nelze uložit:\n{e}")
+
+    def changeEvent(self, event) -> None:
+        # světlý / tmavý režim: jiná varianta barev záložek a zelené barvy textu
+        if event.type() == QEvent.Type.PaletteChange and hasattr(self, "tabs"):
+            self._fill_tabs()
+        super().changeEvent(event)
 
     def _fill_tabs(self) -> None:
         self.tabs.blockSignals(True)
@@ -461,6 +513,13 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         act_rename = menu.addAction("Přejmenovat záložku…")
         act_settings = menu.addAction("Nastavení složek…")
+        colors = menu.addMenu("Barva záložky")
+        current_color = self.app_settings.view(ws_id).tab_color
+        for key, (label, _light, _dark) in TAB_COLORS.items():
+            act = colors.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(key == current_color)
+            act.triggered.connect(lambda _=False, k=key: self.set_tab_color(ws_id, k))
         menu.addSeparator()
         act_remove = menu.addAction("Odebrat záložku…")
         act_remove.setEnabled(len(self.app_settings.workspaces) > 1)
@@ -544,12 +603,17 @@ class MainWindow(QMainWindow):
                 or QApplication.activeModalWidget() is not None          # otevřený dialog
                 or time.monotonic() - self._last_refresh < FOCUS_REFRESH_MIN_GAP):
             return
-        self.refresh(silent=True, check_names=False)
+        self.refresh(silent=True, check_names=False, background=True)
 
-    def refresh(self, silent: bool = False, check_names: bool = True) -> None:
+    def refresh(self, silent: bool = False, check_names: bool = True, background: bool = False) -> None:
         """Obnoví seznam projektů. Kontrola nepovolených znaků (prochází celé stromy projektů
-        na serveru) běží jen při spuštění a při ručním obnovení, ne při automatickém."""
+        na serveru) běží jen při spuštění a při ručním obnovení, ne při automatickém.
+        background: seznam se načte ve vlákně a okno mezitím zůstane použitelné (tiché
+        obnovení po návratu do okna a automatické obnovení)."""
         if not self.settings.is_complete() or getattr(self, "_running_task", None):
+            return
+        if background:
+            self._refresh_in_background(check_names)
             return
         self._last_refresh = time.monotonic()
         current = self.selected().name if self.selected() else self.settings.ui.get(self._ui_key("last_project"))
@@ -569,6 +633,30 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
+        self._render(current)
+        self._update_tab_label()
+        if check_names:
+            self._start_name_check()
+        self.panel.show_project(self.selected())
+
+    def _refresh_in_background(self, check_names: bool) -> None:
+        if self._bg_refresh is not None and self._bg_refresh.isRunning():
+            return  # už se načítá
+        self._last_refresh = time.monotonic()
+        if self._sync_shared():  # společná konfigurace – jen pár malých souborů
+            check_names = True
+        thread = ProjectListThread(self.pm)
+        thread.done.connect(lambda projects, error, t=thread: self._on_background_list(t, projects, check_names))
+        self._bg_refresh = thread
+        thread.start()
+
+    def _on_background_list(self, thread: ProjectListThread, projects, check_names: bool) -> None:
+        if self._closing or thread.pm is not self.pm or getattr(self, "_running_task", None):
+            return  # okno se zavírá / jiná záložka / mezitím běží akce (ta seznam obnoví sama)
+        if projects is None:
+            return  # síť nedostupná – tiché obnovení nic nehlásí, seznam zůstane
+        current = self.selected().name if self.selected() else self.settings.ui.get(self._ui_key("last_project"))
+        self.projects = projects
         self._render(current)
         self._update_tab_label()
         if check_names:
@@ -773,6 +861,12 @@ class MainWindow(QMainWindow):
             window.close()  # uloží rozepsané poznámky
         if self._name_check:
             self._name_check.wait(5000)
+        if self._bg_refresh:
+            self._bg_refresh.wait(5000)
+            try:
+                self._bg_refresh.done.disconnect()  # výsledek po zavření okna už nezpracovat
+            except (RuntimeError, TypeError):
+                pass
         self.panel.stop()
         self.settings.ui["main.splitter"] = bytes(self.splitter.saveState().toBase64()).decode("ascii")
         save_geometry(self.settings, "main", self)

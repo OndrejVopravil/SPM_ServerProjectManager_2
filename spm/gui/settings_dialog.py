@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -24,6 +26,14 @@ from PySide6.QtWidgets import (
 
 from .. import shared_config as sc
 from ..config import AUTO_REFRESH_MIN, AUTO_REFRESH_OFF, Settings
+from .tab_bar import TAB_COLORS
+
+
+def _color_icon(color: str) -> QIcon:
+    """Čtvereček barvy pro výběr barvy záložky (prázdný = bez barvy)."""
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(QColor(color) if color else QColor(0, 0, 0, 0))
+    return QIcon(pixmap)
 
 
 class SettingsDialog(QDialog):
@@ -114,6 +124,13 @@ class SettingsDialog(QDialog):
         form = QFormLayout()
         form.addRow("Síťová složka s projekty:", self._with_browse(self.server))
         form.addRow("Místní složka:", self._with_browse(self.local))
+        self.tab_color = QComboBox()
+        for key, (label, light, dark) in TAB_COLORS.items():
+            self.tab_color.addItem(_color_icon(light), label, key)
+        self.tab_color.setCurrentIndex(max(self.tab_color.findData(settings.tab_color), 0))
+        self.tab_color.setToolTip("Barva pozadí záložky – ve světlém režimu světlý odstín, "
+                                  "v tmavém tmavý (text zůstane čitelný).")
+        form.addRow("Barva záložky:", self.tab_color)
         self.server.editingFinished.connect(self._server_changed)
 
         # --- společná nastavení (mohou se řídit souborem spm_config.json na síti) ---
@@ -326,6 +343,7 @@ class SettingsDialog(QDialog):
             self.exported = True
         s = self.settings
         s.server_root, s.local_root = server, local
+        s.tab_color = self.tab_color.currentData() or ""
         # zamčená pole ukazují hodnoty ze sítě (nebo naposledy převzaté) -> převzetí je v pořádku
         sc.apply(s, self._shared_values())
         s.delete_local_after_deactivate = self.delete_local.isChecked()

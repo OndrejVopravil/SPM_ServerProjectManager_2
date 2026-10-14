@@ -616,3 +616,34 @@ def test_rename_rules(electrodes):
         alice.rename_local("ProjektA", "zprava.docx", "nc.txt")           # obsazeno na serveru
     write(alice.local_dir("ProjektA") / "muj_novy.txt", "x")
     assert alice.rename_local("ProjektA", "muj_novy.txt", "muj_novy_2.txt") == "muj_novy_2.txt"  # nový soubor
+
+
+def test_project_list_reads_small_files_only_when_changed(tmp_path, monkeypatch):
+    """Seznam projektů čte značky aktivace a komentář jen při jejich změně (rychlé obnovení)."""
+    from spm import sync as sync_mod
+    from spm.comment import read_comment as real_read_comment
+    from spm.lock import read_marker as real_read_marker
+    for name in ("A", "B", "C"):
+        (tmp_path / "server" / name).mkdir(parents=True)
+        (tmp_path / "server" / name / "x.txt").write_text("x")
+    pm = ProjectManager(Settings(server_root=str(tmp_path / "server"), local_root=str(tmp_path / "l")),
+                        user="alice", pc="PC")
+    other = ProjectManager(Settings(server_root=str(tmp_path / "server"), local_root=str(tmp_path / "l2")),
+                           user="bob", pc="PC2")
+    other.activate("A", lock_paths=[])
+    other.set_comment("B", "komentář")
+    reads = []
+    monkeypatch.setattr(sync_mod, "read_marker", lambda p: reads.append(p.name) or real_read_marker(p))
+    monkeypatch.setattr(sync_mod, "read_comment", lambda s: reads.append("comment") or real_read_comment(s))
+    first = {p.name: p for p in pm.list_projects()}
+    assert first["A"].others[0].user == "bob" and first["B"].comment.text == "komentář"
+    assert sorted(reads) == ["bob@pc2.json", "comment"]
+    reads.clear()
+    second = {p.name: p for p in pm.list_projects()}             # beze změn – nic se nečte
+    assert reads == [] and second["A"].others[0].user == "bob" and second["B"].comment.text == "komentář"
+    other.set_comment("B", "nový komentář")                     # změna -> přečte se jen ona
+    reads.clear()                                               # (set_comment čte komentář sám)
+    third = {p.name: p for p in pm.list_projects()}
+    assert reads == ["comment"] and third["B"].comment.text == "nový komentář"
+    other.cancel_activation("A")
+    assert not {p.name: p for p in pm.list_projects()}["A"].active

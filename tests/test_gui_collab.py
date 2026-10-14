@@ -537,10 +537,12 @@ def test_refresh_when_app_becomes_active(app, pms, tmp_path, monkeypatch):
     w._on_app_state(Qt.ApplicationState.ApplicationInactive)
     assert calls == []                                   # odchod z aplikace – nic
     w._on_app_state(active)
-    assert calls == [{"silent": True, "check_names": False}]
+    assert calls == [{"silent": True, "check_names": False, "background": True}]
+    w._bg_refresh.wait()                                 # seznam se načítá na pozadí
+    app.processEvents()
     assert w.table.item([p.name for p in w.projects].index("Forma"), COL_USERS).text() == "alice"
     w._on_app_state(active)
-    assert len(calls) == 1                               # hned znovu – nic
+    assert len([c for c in calls if c.get("background")]) == 1   # hned znovu – nic
     w.panel._thread and settle_panel(w.panel)
     w.close()
 

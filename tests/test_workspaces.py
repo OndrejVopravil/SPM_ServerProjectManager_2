@@ -192,3 +192,45 @@ def test_add_tab_suggests_local_folder(window, monkeypatch, tmp_path):
     w.add_workspace()
     assert seen["local"] == str(tmp_path / "Treti") and w.tabs.count() == 3
     assert w.tabs.tabText(w.tabs.currentIndex()) == "Treti"
+
+
+def test_tabs_reordered_by_drag(window):
+    w = window
+    w.set_tab_color(w.app_settings.workspaces[0]["id"], "blue")
+    first, second = (ws["id"] for ws in w.app_settings.workspaces)
+    w.tabs.moveTab(0, 1)                                        # = přetažení myší
+    assert [ws["id"] for ws in w.app_settings.workspaces] == [second, first]
+    assert [w.tabs.tabText(i) for i in range(2)] == ["Výroba", "Nástrojárna"]
+    assert w.tabs.tab_color_key(1) == "blue" and w.tabs.tab_color_key(0) == ""   # barva jde se záložkou
+    assert [ws["id"] for ws in AppSettings.load().workspaces] == [second, first]  # uloženo
+
+
+def test_tab_color_light_and_dark(window):
+    from PySide6.QtGui import QColor, QPalette
+
+    from spm.gui.tab_bar import TAB_COLORS, is_dark, tab_color
+    w = window
+    ws_id = w.app_settings.workspaces[1]["id"]
+    w.set_tab_color(ws_id, "green")
+    assert AppSettings.load().view(ws_id).tab_color == "green"
+    assert w.tabs.tab_color_key(1) == "green"
+    light, dark = tab_color("green", False), tab_color("green", True)
+    assert light.lightness() > 200 and dark.lightness() < 100      # čitelné s tmavým / bílým textem
+    assert tab_color("", False) is None
+    assert all(QColor(v[1]).lightness() > 200 and QColor(v[2]).lightness() < 100
+               for k, v in TAB_COLORS.items() if k)
+    w.tabs.grab()                                                  # vykreslení s barvou
+    pal = QPalette(w.palette())
+    pal.setColor(QPalette.ColorRole.Window, QColor("#202020"))
+    w.setPalette(pal)
+    assert is_dark(w.tabs)
+    w.tabs.grab()
+
+
+def test_tab_color_in_settings_dialog(window):
+    from spm.gui.settings_dialog import SettingsDialog
+    dlg = SettingsDialog(window.settings)
+    assert dlg.tab_color.currentData() == ""
+    dlg.tab_color.setCurrentIndex(dlg.tab_color.findData("orange"))
+    dlg._accept()
+    assert window.settings.tab_color == "orange"
