@@ -16,7 +16,10 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QDialog,
+    QHBoxLayout,
     QHeaderView,
+    QMessageBox,
+    QPushButton,
     QLabel,
     QLineEdit,
     QSplitter,
@@ -72,13 +75,24 @@ class HistoryDialog(QDialog):
         self.show_imported = QCheckBox("Zobrazit i soubory načtené do evidence při aktivaci")
         self.show_imported.toggled.connect(self._apply_filter)
         self.found = QLabel()
+        # skripty spuštěné po odevzdání (záznam běhu u vybraného záznamu)
+        self._runs: dict[int, list] = defaultdict(list)
+        for run in db.script_runs():
+            self._runs[run["commit_id"]].append(run)
+        self.btn_scripts = QPushButton()
+        self.btn_scripts.clicked.connect(lambda: self.show_script_log())
+        self.btn_scripts.hide()
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self.sessions)
         bottom = QWidget()
         lay = QVBoxLayout(bottom)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(QLabel("<b>Změny ve vybraném záznamu</b>"))
+        head = QHBoxLayout()
+        head.addWidget(QLabel("<b>Změny ve vybraném záznamu</b>"))
+        head.addStretch()
+        head.addWidget(self.btn_scripts)
+        lay.addLayout(head)
         lay.addWidget(self.show_imported)
         lay.addWidget(self.changes)
         splitter.addWidget(bottom)
@@ -152,8 +166,15 @@ class HistoryDialog(QDialog):
     def _load_changes(self) -> None:
         rows = self.sessions.selectionModel().selectedRows()
         self.changes.setRowCount(0)
+        self.btn_scripts.hide()
         if not rows or self.sessions.isRowHidden(rows[0].row()):
             return
+        runs = self._runs.get(self._session_rows[rows[0].row()]["commit_id"], [])
+        if runs:
+            ok = bool(runs[0]["ok"])  # poslední běh
+            self.btn_scripts.setText("Skripty: proběhly…" if ok else "Skripty: SELHALY…")
+            self.btn_scripts.setToolTip("Záznam běhu skriptů spuštěných po tomto odevzdání")
+            self.btn_scripts.show()
         items = self._matching_changes(rows[0].row())
         self.changes.setRowCount(len(items))
         for r, ch in enumerate(items):
@@ -165,6 +186,18 @@ class HistoryDialog(QDialog):
                     item.setToolTip(self.path_tooltip(v))
                 self.changes.setItem(r, c, item)
         self.changes.resizeColumnToContents(0)
+
+    def show_script_log(self) -> None:
+        rows = self.sessions.selectionModel().selectedRows()
+        if not rows:
+            return
+        runs = self._runs.get(self._session_rows[rows[0].row()]["commit_id"], [])
+        parts = [f"{_fmt(r['created_at'])}  {r['user']} ({r['pc']})  {r['scripts']}  – "
+                 + ("v pořádku" if r["ok"] else "CHYBA") + "\n\n" + r["log"] for r in runs]
+        box = QMessageBox(QMessageBox.Icon.Information, "Záznam skriptů",
+                          "Skripty spuštěné po odevzdání (nejnovější první) – podrobnosti níže.", parent=self)
+        box.setDetailedText(("\n\n" + "-" * 60 + "\n\n").join(parts))
+        box.exec()
 
     def path_tooltip(self, rel: str) -> str:
         """Relativní cesta v projektu a úplná cesta na serveru."""

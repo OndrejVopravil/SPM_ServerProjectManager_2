@@ -14,3 +14,6 @@ settings.json
 
 # Zástupci Windows (obsahují cesty z konkrétního počítače)
 *.lnk
+
+# Uživatelské skripty odevzdání (složka scripts vedle aplikace)
+/scripts/

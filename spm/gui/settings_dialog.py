@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -34,6 +36,86 @@ def _color_icon(color: str) -> QIcon:
     pixmap = QPixmap(14, 14)
     pixmap.fill(QColor(color) if color else QColor(0, 0, 0, 0))
     return QIcon(pixmap)
+
+
+class SecretsDialog(QDialog):
+    """Tajné hodnoty pro skripty: název a hodnota (skrytá, lze ukázat)."""
+
+    def __init__(self, secrets: dict[str, str], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Tajné hodnoty pro skripty")
+        self.setMinimumWidth(520)
+        info = QLabel("Ve skriptu se použijí jako <code>{SECRET:název}</code> – např. "
+                      "<code>HEADER \"Authorization\" \"Bearer {SECRET:cam}\"</code>. Ukládají se jen "
+                      "do nastavení v tomto počítači a do záznamu běhu skriptu se nevypisují.")
+        info.setWordWrap(True)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Název", "Hodnota"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 160)
+        for name, value in sorted(secrets.items(), key=lambda kv: kv[0].lower()):
+            self._add_row(name, value)
+        self.show_values = QCheckBox("Zobrazit hodnoty")
+        self.show_values.toggled.connect(self._toggle_values)
+        add = QPushButton("Přidat")
+        add.clicked.connect(lambda: self._add_row("", ""))
+        remove = QPushButton("Odebrat")
+        remove.clicked.connect(self._remove_row)
+        row = QHBoxLayout()
+        for w in (add, remove):
+            row.addWidget(w)
+        row.addStretch()
+        row.addWidget(self.show_values)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+        layout.addWidget(self.table)
+        layout.addLayout(row)
+        layout.addWidget(buttons)
+
+    def _add_row(self, name: str, value: str) -> None:
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem(name))
+        edit = QLineEdit(value)
+        edit.setEchoMode(QLineEdit.EchoMode.Normal if getattr(self, "show_values", None) is not None
+                         and self.show_values.isChecked() else QLineEdit.EchoMode.Password)
+        self.table.setCellWidget(r, 1, edit)
+
+    def _remove_row(self) -> None:
+        r = self.table.currentRow()
+        if r >= 0:
+            self.table.removeRow(r)
+
+    def _toggle_values(self, on: bool) -> None:
+        for r in range(self.table.rowCount()):
+            self.table.cellWidget(r, 1).setEchoMode(
+                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password)
+
+    def values(self) -> dict[str, str]:
+        result = {}
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            name = item.text().strip() if item else ""
+            if name:
+                result[name] = self.table.cellWidget(r, 1).text()
+        return result
+
+    def _accept(self) -> None:
+        names = [n.casefold() for n in self.values()]
+        if len(names) != len(set(names)):
+            QMessageBox.warning(self, self.windowTitle(), "Názvy se nesmí opakovat.")
+            return
+        bad = [n for n in self.values() if not n.replace("_", "").replace("-", "").isalnum()]
+        if bad:
+            QMessageBox.warning(self, self.windowTitle(),
+                                "Název může obsahovat jen písmena, číslice, _ a -: " + ", ".join(bad))
+            return
+        self.accept()
 
 
 class SettingsDialog(QDialog):
@@ -101,13 +183,6 @@ class SettingsDialog(QDialog):
         self.warn_exit = QCheckBox("Při ukončení upozornit na aktivované projekty")
         self.warn_exit.setChecked(settings.warn_active_on_exit)
 
-        self.mirror_enabled = QCheckBox("Zrcadlit z tohoto počítače (pravidla v okně Zrcadlení)")
-        self.mirror_enabled.setToolTip(
-            "Po odevzdání se soubory zrcadlí podle pravidel do jiných síťových složek.\n"
-            "Vypněte, pokud do cílové složky nemáte právo zapisovat (sdílená pravidla platí\n"
-            "pro všechny, kdo mají zdroj i cíl jako záložky).")
-        self.mirror_enabled.setChecked(settings.mirror_enabled)
-
         auto_on = settings.auto_refresh_seconds > 0
         self.auto_refresh = QCheckBox("Automaticky obnovovat seznam projektů")
         self.auto_refresh.setToolTip("Vypnuto: seznam se obnoví při spuštění, tlačítkem Obnovit (F5) "
@@ -170,8 +245,13 @@ class SettingsDialog(QDialog):
         form.addRow(self.skip_unlocked)
         form.addRow(self.tree_expanded)
         form.addRow(self.warn_exit)
-        form.addRow(self.mirror_enabled)
         form.addRow(self.auto_refresh)
+        self.secrets = dict(settings.secrets)
+        self.btn_secrets = QPushButton()
+        self.btn_secrets.setToolTip("Hodnoty pro skripty – {SECRET:název}, např. API klíče pro POST.\n"
+                                    "Jsou uložené jen v tomto počítači; do záznamu běhu se nevypíšou.")
+        self.btn_secrets.clicked.connect(self._edit_secrets)
+        self._update_secrets_button()
         refresh_row = QWidget()
         refresh_lay = QHBoxLayout(refresh_row)
         refresh_lay.setContentsMargins(0, 0, 0, 0)
@@ -179,6 +259,12 @@ class SettingsDialog(QDialog):
         refresh_lay.addWidget(QLabel(f"(min. {AUTO_REFRESH_MIN} s)"))
         refresh_lay.addStretch()
         form.addRow("Interval obnovení:", refresh_row)
+        secrets_row = QWidget()
+        secrets_lay = QHBoxLayout(secrets_row)
+        secrets_lay.setContentsMargins(0, 0, 0, 0)
+        secrets_lay.addWidget(self.btn_secrets)
+        secrets_lay.addStretch()
+        form.addRow("Tajné hodnoty pro skripty:", secrets_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")
@@ -267,6 +353,16 @@ class SettingsDialog(QDialog):
         if path != self.shared.path:
             self._set_shared(sc.probe(self.server.text().strip()))
 
+    def _update_secrets_button(self) -> None:
+        self.btn_secrets.setText(f"Upravit… ({len(self.secrets)})")
+
+    def _edit_secrets(self) -> None:
+        dlg = SecretsDialog(self.secrets, self)
+        if dlg.exec():
+            self.secrets = dlg.values()
+            self._update_secrets_button()
+        dlg.deleteLater()
+
     def _edit_shared(self) -> None:
         state = sc.probe(self.server.text().strip())  # mohl se mezitím změnit
         if state.stamp != self.shared.stamp or state.read_only:
@@ -352,7 +448,7 @@ class SettingsDialog(QDialog):
         s.warn_active_on_exit = self.warn_exit.isChecked()
         s.tree_expanded = self.tree_expanded.isChecked()
         s.nickname = self.nickname.text().strip()
-        s.mirror_enabled = self.mirror_enabled.isChecked()
+        s.secrets = dict(self.secrets)
         s.auto_refresh_seconds = (self.refresh_seconds.value() if self.auto_refresh.isChecked()
                                   else AUTO_REFRESH_OFF)
         s.save()

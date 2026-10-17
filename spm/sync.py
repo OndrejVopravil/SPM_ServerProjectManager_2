@@ -36,6 +36,8 @@ from .matcher import RenameSuggestion, similarity, suggest_renames
 from .names import describe_chars, find_invalid_names, forbidden_in, format_invalid, invalid_rel_paths
 from . import restore
 from .restore import RESTORE_DIR_RE, RestoreCatalog, RestorePoint, RestoreResult
+from .scripting import store as script_store
+from .scripting.model import ADDED, DELETED, MODIFIED, RENAMED, UNCHANGED, ScriptFile
 from .scanner import (
     FileInfo,
     Progress,
@@ -132,6 +134,7 @@ class ProjectStatus:
     others: list[LockInfo] = field(default_factory=list)  # aktivní uživatelé kromě mě
     comment: ProjectComment | None = None  # komentář projektu (jen projekty na serveru)
     notes_for_me: int = 0         # otevřené poznámky adresované mně
+    script_pending: bool = False  # skript po mém odevzdání selhal – lze ho spustit znovu
 
     @property
     def active(self) -> bool:
@@ -151,6 +154,7 @@ class FileEntry:
     mirror: str | None = None    # soubor spravuje zrcadlo z jiného serveru (cesta zdrojového projektu)
     mirror_server_id: str = ""   # identita zdrojové síťové složky (pro název záložky)
     mirror_server_name: str = ""
+    mirror_targets: list = field(default_factory=list)  # kam se soubor zrcadlí (db.MirrorTarget)
 
     @property
     def free(self) -> bool:
@@ -221,6 +225,37 @@ def new_key(path: str) -> str:
     return "new:" + path
 
 
+def selection_files(plan: UploadPlan, assignments: dict[str, str | None],
+                    selected: set[str] | None) -> list[ScriptFile]:
+    """Soubory, které se odevzdají (výběr v dialogu) – pro blok BEFORE a zkušební běh skriptu.
+    Nové soubory ještě nemají file_id."""
+    def sel(key: str) -> bool:
+        return selected is None or key in selected
+    new_by_path = {lf.path: lf for lf in plan.new}
+    targets = {p for p in assignments.values() if p}
+    files = [ScriptFile(lf.path, MODIFIED, bf.file_id, None, lf.sha256, lf.size)
+             for bf, lf in plan.modified if sel(bf.file_id)]
+    for bf in plan.missing:
+        if not sel(bf.file_id):
+            continue
+        new = assignments.get(bf.file_id)
+        if new and new in new_by_path:
+            lf = new_by_path[new]
+            files.append(ScriptFile(new, RENAMED, bf.file_id, bf.path, lf.sha256, lf.size))
+        else:
+            files.append(ScriptFile(bf.path, DELETED, bf.file_id, sha256=bf.sha256))
+    files += [ScriptFile(lf.path, ADDED, "", None, lf.sha256, lf.size)
+              for lf in plan.new if lf.path not in targets and sel(new_key(lf.path))]
+    files += [ScriptFile(bf.path, UNCHANGED, bf.file_id, sha256=bf.sha256, size=bf.size)
+              for bf in plan.locked_unchanged if sel(bf.file_id)]
+    return sorted(files, key=lambda f: f.path.lower())
+
+
+def has_script_changes(files: list[ScriptFile]) -> bool:
+    """Skripty se spouštějí jen při odevzdání se změnami."""
+    return any(f.status != UNCHANGED for f in files)
+
+
 def auto_deactivation(plan: UploadPlan, assignments: dict[str, str | None],
                       selected: set[str] | None) -> tuple[bool, str]:
     """Deaktivuje se projekt po odevzdání? Vrací (ano/ne, důvod, proč ne – nebo "").
@@ -257,6 +292,11 @@ class UploadResult:
     notes_published: int = 0         # zveřejněné rozepsané poznámky
     restored: list[str] = field(default_factory=list)       # smazané na serveru, nahrané zpět
     lost_versions: list[str] = field(default_factory=list)  # jejich poslední verze ze serveru se nezachovala
+    commit_id: int | None = None
+    # soubory odevzdání pro skripty; None = odevzdání bez změn (skripty se nespouštějí)
+    script_files: list[ScriptFile] | None = None
+    ended: bool = False              # aktivace skončila (deaktivace / automatická deaktivace)
+    cleanup_pending: bool = False    # místní kopie se smaže až po skriptech (finish_local)
 
 
 @dataclass
@@ -270,6 +310,8 @@ class PublishResult:
     published: int = 0
     local_deleted: bool = False      # celá místní složka odstraněna (publikováno vše)
     leftover: Path | None = None     # kam se odložily nepublikované soubory
+    commit_id: int | None = None
+    script_files: list[ScriptFile] = field(default_factory=list)
 
 
 @dataclass
@@ -357,7 +399,8 @@ class ProjectManager:
         others = [u for u in users if not u.is_mine(self.user, self.pc)]
         return ProjectStatus(name=name, users=users, local_exists=self.local_dir(name).exists(),
                              mine=len(others) < len(users), others=others,
-                             comment=comment, notes_for_me=summary.for_user(self.user))
+                             comment=comment, notes_for_me=summary.for_user(self.user),
+                             script_pending=script_store.pending_path(self.local_root, name).exists())
 
     def _cached(self, entry: os.DirEntry | None, read):
         """Obsah malého souboru ze serveru; znovu se čte jen při změně (čas a velikost)."""
@@ -523,12 +566,14 @@ class ProjectManager:
         owners: dict[str, LockOwner] = {}
         mirrored: dict[str, tuple[str, str]] = {}
         sources: dict = {}
+        targets: dict = {}
         if db_path(server).exists():
             with ProjectDB.for_project(server) as db:
                 files = db.active_files(include_pending=True)
                 owners = db.lock_owners()
                 mirrored = db.mirrored()
                 sources = db.mirror_sources() if mirrored else {}
+                targets = db.mirror_targets()
         result = []
         for path in paths:
             f = files.get(path)
@@ -539,6 +584,8 @@ class ProjectManager:
                 entry.mirror = src.label if src else mirrored[f.file_id][0]
                 entry.mirror_server_id = src.server_id if src else ""
                 entry.mirror_server_name = src.server_name if src else ""
+            if f is not None:
+                entry.mirror_targets = targets.get(f.file_id, [])
             result.append(entry)
         return result
 
@@ -1217,6 +1264,7 @@ class ProjectManager:
         end_session: bool = False,
         progress: Progress | None = None,
         notes: list[Draft] | None = None,
+        keep_local: bool = False,
     ) -> UploadResult:
         """Odevzdá vybrané změny na server a uvolní odevzdané soubory.
 
@@ -1225,6 +1273,8 @@ class ProjectManager:
                      None = vše. Při end_session se vždy odevzdá vše a uvolní všechny zámky.
         notes:       rozepsané poznámky, které se zveřejní spolu s odevzdáním (a z rozepsaných
                      zmizí).
+        keep_local:  po deaktivaci místní kopii zatím nemazat (poběží skripty) – smaže ji
+                     finish_local(); result.cleanup_pending říká, zda je to potřeba.
         """
         notes = [d for d in (notes or []) if d.text.strip()]
         if end_session:
@@ -1415,22 +1465,143 @@ class ProjectManager:
                               deleted=len(deleted), released=len(released),
                               auto_deactivated=auto_end, note=auto_note, notes_published=len(notes),
                               restored=[lf.path for _, lf in restored] + [bf.path for bf in modified_gone],
-                              lost_versions=lost_versions)
+                              lost_versions=lost_versions, commit_id=commit_id,
+                              ended=end_session or auto_end)
+        if has_changes:
+            result.script_files = self._script_files(ops, missing_by_id, release_only)
         if notes:  # zveřejněné už nejsou rozepsané
             published = {d.id for d in notes}
             notes_mod.save_drafts(local, [d for d in notes_mod.load_drafts(local) if d.id not in published])
-        if end_session or auto_end:
+        manifest.save(local)
+        if result.ended:
             remove_marker(server, self.user, self.pc)
             if self.settings.delete_local_after_deactivate:
-                # nezveřejněné rozepsané poznámky se se složkou nesmažou – vrátí se při aktivaci
-                notes_mod.park_drafts(self.local_root, plan.name, local)
-                rmtree(local)
-                result.local_deleted = not local.exists()
-            else:
-                manifest.save(local)
-        else:
-            manifest.save(local)
+                if keep_local:
+                    result.cleanup_pending = True
+                else:
+                    result.local_deleted = self.finish_local(plan.name)
         return result
+
+    @staticmethod
+    def _script_files(ops: list[tuple], missing_by_id: dict[str, DbFile],
+                      release_only: list[DbFile]) -> list[ScriptFile]:
+        """Soubory odevzdání pro skripty – všechny odevzdávané soubory se stavem."""
+        kinds = {dbm.ADDED: ADDED, dbm.MODIFIED: MODIFIED, dbm.RENAMED: RENAMED,
+                 dbm.RENAMED_MODIFIED: RENAMED, dbm.RESTORED: UNCHANGED}
+        files: list[ScriptFile] = []
+        for kind, file_id, old_path, lf, _ in ops:
+            if kind == dbm.DELETED:
+                bf = missing_by_id.get(file_id)
+                files.append(ScriptFile(old_path, DELETED, file_id, sha256=bf.sha256 if bf else None))
+                continue
+            files.append(ScriptFile(lf.path, kinds[kind], file_id,
+                                    old_path if kinds[kind] == RENAMED else None, lf.sha256, lf.size))
+        for bf in release_only:
+            files.append(ScriptFile(bf.path, UNCHANGED, bf.file_id, sha256=bf.sha256, size=bf.size))
+        return sorted(files, key=lambda f: f.path.lower())
+
+    def finish_local(self, name: str) -> bool:
+        """Po deaktivaci (a doběhnutých skriptech) smaže místní kopii. Vrací, zda zmizela celá."""
+        local = self.local_dir(name)
+        if not local.exists():
+            return True
+        # nezveřejněné rozepsané poznámky se se složkou nesmažou – vrátí se při aktivaci
+        notes_mod.park_drafts(self.local_root, name, local)
+        rmtree(local)
+        return not local.exists()
+
+    def preview_files(self, name: str) -> list[ScriptFile]:
+        """Soubory pro zkušební běh skriptu: u mého aktivovaného projektu to, co by se
+        odevzdalo při deaktivaci; jinak všechny soubory projektu jako beze změny."""
+        status = self.project_status(name)
+        if status is not None and status.mine:
+            plan = self.plan_upload(name)
+            return selection_files(plan, plan.default_assignments(), None)
+        with ProjectDB.for_project(self.server_dir(name)) as db:
+            files = [ScriptFile(f.path, UNCHANGED, f.file_id, sha256=f.sha256, size=f.size)
+                     for f in db.active_files().values()]
+        return sorted(files, key=lambda f: f.path.lower())
+
+    def adopt_script_outputs(self, name: str, before: UploadPlan, selected: set[str] | None,
+                             progress: Progress | None = None
+                             ) -> tuple[UploadPlan, set[str] | None, list[str]]:
+        """Po bloku BEFORE: soubory, které skript v místní kopii vytvořil nebo přepsal, se přidají
+        k odevzdání. Přepsaný soubor, který nemám zamčený, se zamkne (Převzít – místní verze
+        zůstane); drží-li ho jiný nebo patří zrcadlu, odevzdání se nespustí (SyncError).
+        Vrací (nový plán, výběr k odevzdání, cesty souborů od skriptu)."""
+        plan = self.plan_upload(name, progress)
+        old = before.local_files
+        touched = sorted(p for p, lf in plan.local_files.items()
+                         if p not in old or old[p].sha256 != lf.sha256)
+        if not touched:
+            return plan, selected, []
+        mine = {lf.path for _, lf in plan.modified} | {lf.path for lf in plan.new}
+        _, manifest = self._manifest(name)
+        to_take = [p for p in touched if p not in mine and p in manifest.files]
+        if to_take:
+            self.take(name, to_take, progress)
+            plan = self.plan_upload(name, progress)
+        new_paths = {lf.path for lf in plan.new}
+        modified = {lf.path: bf.file_id for bf, lf in plan.modified}
+        same = {bf.path for bf in plan.locked_unchanged}  # přepsán stejným obsahem, jaký je na serveru
+        stuck = [p for p in touched if p not in new_paths and p not in modified and p not in same]
+        blocked = [p for p in stuck if any(c.startswith(p + " – ") for c in plan.conflicts)]
+        if stuck:
+            raise SyncError("Soubory vytvořené skriptem (BEFORE) nelze odevzdat:\n" + "\n".join(
+                next((c for c in plan.conflicts if c.startswith(p + " – ")), p)
+                for p in (blocked or stuck)[:15]))
+        if selected is not None:
+            selected = set(selected) | {new_key(p) for p in touched if p in new_paths} \
+                | {modified[p] for p in touched if p in modified}
+        return plan, selected, touched
+
+    def record_mirror_targets(self, name: str, res, label: str, server_id: str,
+                              server_name: str) -> None:
+        """Po zrcadlení (MIRROR) označí soubory zdrojového projektu, kam se zrcadlí."""
+        if not res.target_key or not (res.mirrored or res.removed):
+            return
+        server = self.server_dir(name)
+        with WriteLock(server, self.user, self.pc):
+            with ProjectDB.for_project(server) as db:
+                db.ensure_mirror_target_tables()
+                with db.conn:
+                    for file_id, path in res.mirrored.items():
+                        db.set_mirror_target(file_id, res.target_key, label, server_id, server_name, path)
+                    for file_id in res.removed:
+                        db.remove_mirror_target(file_id, res.target_key)
+
+    def clear_stale_mirror_marks(self, name: str, files: list[ScriptFile],
+                                 keep: set[tuple[str, str]]) -> int:
+        """Po skriptech: změněné soubory odevzdání, které se do cíle tentokrát nezrcadlily
+        (skript zastaven, MIRROR přeskočen nebo selhal), ztratí označení „zrcadleno do“ –
+        kopie v cíli už neodpovídá. keep = (file_id, cíl) zrcadlené v tomto běhu.
+        Vrací počet odebraných označení."""
+        changed = {f.file_id for f in files if f.status != UNCHANGED and f.file_id}
+        server = self.server_dir(name)
+        if not changed or not db_path(server).exists():
+            return 0
+        with ProjectDB.for_project(server) as db:
+            marks = db.mirror_targets()
+        stale = [(fid, t.target) for fid in changed for t in marks.get(fid, [])
+                 if (fid, t.target) not in keep]
+        if not stale:
+            return 0
+        with WriteLock(server, self.user, self.pc):
+            with ProjectDB.for_project(server) as db:
+                with db.conn:
+                    for fid, target in stale:
+                        db.remove_mirror_target(fid, target)
+        return len(stale)
+
+    def record_script_run(self, name: str, commit_id: int | None, action: str, scripts: list[str],
+                          ok: bool, log: str) -> None:
+        """Záznam běhu skriptů do historie projektu (u odevzdání)."""
+        server = self.server_dir(name)
+        with WriteLock(server, self.user, self.pc):
+            with ProjectDB.for_project(server) as db:
+                db.ensure_script_tables()
+                with db.conn:
+                    db.add_script_run(commit_id, self.user, self.pc, action, scripts, ok, log)
 
     def cancel_activation(self, name: str) -> None:
         """Zruší vlastní aktivaci bez nahrání změn a uvolní všechny zámky.
@@ -1521,8 +1692,10 @@ class ProjectManager:
             with ProjectDB.for_project(tmp, create=True) as db:
                 with db.conn:
                     cid = db.add_commit(None, self.user, self.pc, dbm.PUBLISH, comment)
+                    file_ids = []
                     for fi in uploaded:
                         fid = db.add_file(fi.path, fi.size, fi.mtime, fi.sha256)
+                        file_ids.append(fid)
                         db.add_change(cid, fid, dbm.PUBLISHED, None, fi.path, fi.size, fi.mtime, fi.sha256)
             try:
                 tmp.rename(server)
@@ -1532,7 +1705,9 @@ class ProjectManager:
             rmtree(tmp)
             raise
 
-        result = PublishResult(published=len(selected))
+        result = PublishResult(published=len(selected), commit_id=cid,
+                               script_files=[ScriptFile(fi.path, ADDED, fid, None, fi.sha256, fi.size)
+                                             for fi, fid in zip(uploaded, file_ids)])
         if len(selected) == len(all_files):
             rmtree(local)
             result.local_deleted = not local.exists()

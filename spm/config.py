@@ -85,18 +85,16 @@ class Settings:
     tree_expanded: bool = True
     # Při ukončení aplikace upozornit na projekty, které mám stále aktivované
     warn_active_on_exit: bool = True
-    # Pravidla zrcadlení mezi záložkami (osobní, místní; viz mirror.MirrorRule)
-    mirror_rules: list[dict] = field(default_factory=list)
-    # Zrcadlit z tohoto počítače (vypnout např. bez práva zápisu do cílové síťové složky)
-    mirror_enabled: bool = True
+    # Tajné hodnoty pro skripty ({SECRET:název}) – např. API klíče; jen místně, nikdy na síti
+    secrets: dict[str, str] = field(default_factory=dict)
     # Barva záložky (klíč z gui.tab_bar.TAB_COLORS; "" = bez barvy)
     tab_color: str = ""
+    # Skripty spouštěné po odevzdání z této záložky (názvy souborů ve složce scripts, v pořadí běhu)
+    scripts: list[str] = field(default_factory=list)
     # --- převzato ze spm_config.json síťové složky záložky (viz shared_config) ---
     # identita síťové složky – stejná pro všechny uživatele bez ohledu na připojení disku
     server_id: str = ""
     server_name: str = ""
-    # sdílená pravidla zrcadlení z této síťové složky; None = nejsou (platí místní pravidla)
-    shared_mirror_rules: list[dict] | None = None
     # Stav rozhraní (poloha a velikost oken, šířky sloupců, poslední projekt)
     ui: dict[str, str] = field(default_factory=dict)
     # Záložka, ke které nastavení patří, a celé nastavení aplikace (neukládá se)
@@ -160,7 +158,7 @@ INTERNAL_FIELDS = ("workspace_id", "_app")
 # Nastavení, která má každá záložka vlastní; ostatní (kromě ui) jsou osobní – pro všechny záložky
 WORKSPACE_FIELDS = ("server_root", "local_root", "backup_enabled", "backup_count",
                     "check_forbidden_chars", "ignore_patterns", "known_default_ignore",
-                    "server_id", "server_name", "shared_mirror_rules", "tab_color")
+                    "server_id", "server_name", "tab_color", "scripts")
 PERSONAL_FIELDS = tuple(f.name for f in fields(Settings)
                         if f.name not in WORKSPACE_FIELDS + INTERNAL_FIELDS + ("ui",))
 DEFAULT_WORKSPACE_NAME = "Projekty"
@@ -201,6 +199,7 @@ class AppSettings:
         ws.update({k: getattr(values, k) for k in WORKSPACE_FIELDS})
         ws["ignore_patterns"] = list(ws["ignore_patterns"])
         ws["known_default_ignore"] = list(ws["known_default_ignore"])
+        ws["scripts"] = list(ws["scripts"])
         return ws
 
     def workspace(self, ws_id: str) -> dict:
@@ -300,7 +299,8 @@ class AppSettings:
         for w in data["workspaces"]:
             if isinstance(w, dict) and w.get("id"):
                 defaults = cls.new_workspace(DEFAULT_WORKSPACE_NAME)
-                workspaces.append({**defaults, **w})
+                # jen známé údaje (dřívější, např. pravidla zrcadlení, se zahodí)
+                workspaces.append({**defaults, **{k: v for k, v in w.items() if k in defaults}})
         if not workspaces:
             workspaces = [cls.new_workspace(DEFAULT_WORKSPACE_NAME)]
         return cls(base, workspaces, str(data.get("active_workspace") or ""))

@@ -120,10 +120,10 @@ class ProjectPanel(QWidget):
         self._thread: EntriesThread | None = None
         self._again = False
         self._closed = False  # okno se zavírá – výsledky z pozadí už nezobrazovat
-        # pravidla zrcadlení, kde je záložka projektu zdrojem: () -> [(název cíle, shoda(projekt, cesta))]
-        self.mirror_matchers: Callable[[], list[tuple[str, Callable[[str, str], bool]]]] | None = None
         # popis zdroje zrcadla (cesta zdrojového projektu -> např. název záložky)
         self.mirror_source_label: Callable[[FileEntry], str] = lambda entry: entry.mirror or ""
+        # popis cíle zrcadla (db.MirrorTarget -> např. název záložky)
+        self.mirror_target_label: Callable[[object], str] = lambda target: target.label
         # lze vybraný projekt aktivovat? (nastaví hlavní okno – např. nepovolené znaky)
         self.can_activate: Callable[[], bool] = lambda: False
 
@@ -370,14 +370,13 @@ class ProjectPanel(QWidget):
     def _mark_mirror(self) -> str:
         """Sloupec Zrcadlo (zobrazený vždy):
         - „← zdroj“ u souborů, které sem zrcadlo přináší z jiného serveru (jen pro čtení),
-        - „→ cíl“ u souborů, které odpovídají pravidlům zrcadlení z této záložky,
+        - „→ cíl“ u souborů, které se odtud zrcadlí (příkazem MIRROR ve skriptu odevzdání),
         u složek s počtem takových souborů. Vrací doplněk souhrnu."""
         if self.project is None:
             return ""
-        matchers = self.mirror_matchers() if self.mirror_matchers else []
         texts: dict[str, tuple[str, str]] = {}
         folders: dict[str, Counter] = {}
-        outgoing = 0
+        outgoing: Counter = Counter()
         for e in self.entries:
             if e.local_deleted:
                 continue
@@ -387,12 +386,11 @@ class ProjectPanel(QWidget):
                 labels.append(f"← {source}")
                 tips.append(f"Soubor spravuje zrcadlo z {e.mirror} – zde ho nelze převzít ani "
                             "upravit, změny se dělají ve zdroji.")
-            targets = [name for name, match in matchers if match(self.project.name, e.path)]
-            if targets:
-                outgoing += 1
-                labels += [f"→ {t}" for t in targets]
-                tips.append("Soubor odpovídá pravidlu zrcadlení – po odevzdání se zrcadlí do: "
-                            + ", ".join(targets))
+            for target in e.mirror_targets:
+                name = self.mirror_target_label(target)
+                labels.append(f"→ {name}")
+                outgoing[name] += 1
+                tips.append(f"Zrcadleno do {target.label} – {target.path}")
             if not labels:
                 continue
             texts[e.path] = (", ".join(labels), "\n".join(tips))
@@ -406,11 +404,10 @@ class ProjectPanel(QWidget):
         self.tree.set_column_texts(2, texts, COLOR_MIRROR)
         self._mark_notes()
         self._apply_search()  # strom je nově naplněný – znovu podbarvit nalezené
-        if not matchers:
+        if not outgoing:
             return ""
-        targets = sorted({name for name, _ in matchers})
-        return (f" &nbsp;|&nbsp; zrcadlí se: <b>{outgoing}</b> → {', '.join(targets)}" if outgoing
-                else f" &nbsp;|&nbsp; nic z projektu neodpovídá pravidlům zrcadlení do {', '.join(targets)}")
+        return " &nbsp;|&nbsp; zrcadleno: " + ", ".join(
+            f"<b>{n}</b> → {name}" for name, n in sorted(outgoing.items()))
 
     def selected_scopes(self) -> list[str]:
         """Označené položky stromu (Ctrl / Shift = víc najednou): soubory a složky ('/' na konci)."""

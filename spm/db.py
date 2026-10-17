@@ -101,8 +101,48 @@ CREATE TABLE IF NOT EXISTS mirror_sources (
     server_name   TEXT
 );
 """
+# Zrcadlení (ve zdrojovém projektu): kam se soubory zrcadlí – pro označení ve stromu.
+MIRROR_TARGETS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mirror_targets (
+    file_id     TEXT NOT NULL REFERENCES files(file_id),
+    target      TEXT NOT NULL,      -- cílový projekt (jeho project_id)
+    label       TEXT NOT NULL,      -- cesta k cílovému projektu (pro zobrazení)
+    server_id   TEXT,               -- identita cílové síťové složky (spm_config.json)
+    server_name TEXT,
+    path        TEXT NOT NULL,      -- cesta souboru v cílovém projektu
+    mirrored_at TEXT NOT NULL,
+    PRIMARY KEY (file_id, target)
+);
+"""
+
+# Záznamy běhu skriptů odevzdání (zakládá se až při prvním běhu skriptu)
+SCRIPT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS script_runs (
+    run_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    commit_id  INTEGER REFERENCES commits(commit_id),
+    created_at TEXT NOT NULL,
+    user       TEXT NOT NULL,
+    pc         TEXT NOT NULL,
+    action     TEXT NOT NULL,       -- submit / deactivate / publish
+    scripts    TEXT NOT NULL,       -- názvy skriptů oddělené čárkou
+    ok         INTEGER NOT NULL,
+    log        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_script_runs_commit ON script_runs(commit_id);
+"""
+
 # sloupce mirror_sources přidané později (tabulka mohla vzniknout dřív bez nich)
 MIRROR_SOURCE_COLUMNS = ("label", "server_id", "server_name")
+
+
+@dataclass
+class MirrorTarget:
+    """Kam se soubor zdroje zrcadlí – pro zobrazení."""
+    label: str           # cesta k cílovému projektu
+    path: str            # cesta souboru v cíli
+    server_id: str = ""
+    server_name: str = ""
+    target: str = ""     # identita cílového projektu (project_id)
 
 
 @dataclass
@@ -415,6 +455,35 @@ class ProjectDB:
         self.conn.execute("UPDATE mirror_files SET source = ? WHERE source = ?", (new, old))
         self.conn.execute("DELETE FROM mirror_sources WHERE source = ?", (old,))
 
+    # --- zrcadlení (zdrojový projekt) -------------------------------------
+
+    def ensure_mirror_target_tables(self) -> None:
+        self.conn.executescript(MIRROR_TARGETS_SCHEMA)
+        self.conn.commit()
+
+    def set_mirror_target(self, file_id: str, target: str, label: str, server_id: str,
+                          server_name: str, path: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO mirror_targets(file_id, target, label, server_id, server_name, path, "
+            "mirrored_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (file_id, target, label, server_id, server_name, path, now_iso()))
+
+    def remove_mirror_target(self, file_id: str, target: str) -> None:
+        self.conn.execute("DELETE FROM mirror_targets WHERE file_id = ? AND target = ?", (file_id, target))
+
+    def mirror_targets(self) -> dict[str, list[MirrorTarget]]:
+        """file_id -> kam se soubor zrcadlí; prázdné, pokud se z projektu nezrcadlilo."""
+        try:
+            rows = self.conn.execute("SELECT * FROM mirror_targets ORDER BY label").fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        result: dict[str, list[MirrorTarget]] = {}
+        for r in rows:
+            result.setdefault(r["file_id"], []).append(
+                MirrorTarget(r["label"], r["path"], r["server_id"] or "", r["server_name"] or "",
+                             r["target"]))
+        return result
+
     # --- identita projektu -----------------------------------------------
 
     def project_id(self) -> str | None:
@@ -447,22 +516,32 @@ class ProjectDB:
     def unset_mirrored(self, file_id: str) -> None:
         self.conn.execute("DELETE FROM mirror_files WHERE file_id = ?", (file_id,))
 
-    def mirror_synced(self, source: str) -> int | None:
-        try:
-            row = self.conn.execute("SELECT synced_commit FROM mirror_sources WHERE source = ?",
-                                    (source,)).fetchone()
-        except sqlite3.OperationalError:
-            return None
-        return row[0] if row else None
-
-    def set_mirror_synced(self, source: str, commit_id: int | None) -> None:
-        self.conn.execute(
-            "INSERT INTO mirror_sources(source, synced_commit, synced_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(source) DO UPDATE SET synced_commit = excluded.synced_commit, "
-            "synced_at = excluded.synced_at", (source, commit_id, now_iso()))
-
     def last_commit_id(self) -> int | None:
         return self.conn.execute("SELECT MAX(commit_id) FROM commits").fetchone()[0]
+
+    # --- skripty -------------------------------------------------------
+
+    def ensure_script_tables(self) -> None:
+        self.conn.executescript(SCRIPT_SCHEMA)
+        self.conn.commit()
+
+    def has_script_runs(self) -> bool:
+        return self.conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                                 "AND name = 'script_runs'").fetchone() is not None
+
+    def add_script_run(self, commit_id: int | None, user: str, pc: str, action: str,
+                       scripts: list[str], ok: bool, log: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO script_runs(commit_id, created_at, user, pc, action, scripts, ok, log) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (commit_id, now_iso(), user, pc, action, ", ".join(scripts), int(ok), log))
+        return cur.lastrowid
+
+    def script_runs(self) -> list[sqlite3.Row]:
+        """Všechny běhy skriptů (nejnovější první); prázdné, pokud tabulka neexistuje."""
+        if not self.has_script_runs():
+            return []
+        return self.conn.execute("SELECT * FROM script_runs ORDER BY run_id DESC").fetchall()
 
     # --- historie ------------------------------------------------------
 

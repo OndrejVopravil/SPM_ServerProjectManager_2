@@ -32,7 +32,7 @@ from ..config import AppSettings, Settings, _same_dir
 from ..db import ProjectDB
 from ..names import format_invalid
 from ..restore import RestoreCatalog, RestoreResult
-from ..shared_config import ERROR as SHARED_ERROR, NONE as SHARED_NONE, SharedConfig
+from ..shared_config import ERROR as SHARED_ERROR, SharedConfig
 from ..sync import (
     ActivationResult,
     ProjectManager,
@@ -41,11 +41,16 @@ from ..sync import (
     UploadPlan,
     PublishResult,
     UploadResult,
+    has_script_changes,
+    selection_files,
     validate_project_name,
 )
-from ..mirror import Mirror, MirrorPermissionError, MirrorRule, mirrors_for, resolve_target
+from ..scripting import store as script_store
+from ..scripting.model import ADDED, DEACTIVATE, PUBLISH, SUBMIT, RunReport, ScriptFile, TabInfo
+from ..scripting.runtime import ScriptEnv, ScriptSession, clear_stale_marks
 from .comment_dialog import CommentDialog
-from .mirror_dialog import MirrorDialog, format_mirror_counts, format_mirror_problems
+from .script_ui import GuiScriptUI
+from .scripts_dialog import ScriptsDialog
 from .notes_window import NotesWindow, QuickNoteDialog
 from .tab_bar import TAB_COLORS, ColorTabBar, is_dark
 from .. import notes as notes_mod
@@ -69,6 +74,7 @@ COLUMNS = ["Projekt", "Komentář", "Stav", "Aktivováno", "Od", "Místní kopie
 COL_NAME, COL_COMMENT, COL_STATE, COL_USERS, COL_SINCE, COL_LOCAL = range(len(COLUMNS))
 HEADER_KEY = "main.v3"  # změna sloupců -> neobnovovat šířky uložené pro starší rozvržení
 COMMENT_COLUMN_MAX = 300  # výchozí šířka sloupce Komentář nejvýše (zbytek je v tooltipu)
+LOCAL_NOT_DELETED = "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
 FOCUS_REFRESH_MIN_GAP = 5.0  # s – při rychlém přepínání oken (Alt+Tab) neobnovovat pokaždé
 
 
@@ -192,8 +198,8 @@ class MainWindow(QMainWindow):
         self.act_notes = self._action(tb, "Poznámky", self.open_notes,
                                       tip="Předávací poznámky k projektu (plovoucí okno)")
         tb.addSeparator()
-        self.act_mirrors = self._action(tb, "Zrcadlení", self.open_mirrors,
-                                        tip="Pravidla zrcadlení souborů mezi záložkami")
+        self.act_scripts = self._action(tb, "Skripty", self.open_scripts,
+                                        tip="Skripty spouštěné po odevzdání (zrcadlení, kopie, archivy…)")
         self._action(tb, "Nastavení", self.open_settings)
 
         # Popisky zkratek: v liště „Obnovit (F5)“, v kontextové nabídce zarovnaně vpravo.
@@ -229,6 +235,12 @@ class MainWindow(QMainWindow):
         self.act_restore = QAction("Obnovit ze zálohy…", self)
         self.act_restore.setToolTip("Obnoví projekt k dřívějšímu stavu do nové místní složky")
         self.act_restore.triggered.connect(lambda: self.restore_project())
+        self.act_rerun_scripts = QAction("Spustit skripty znovu…", self)
+        self.act_rerun_scripts.setToolTip("Skript po odevzdání selhal – spustí skripty znovu se "
+                                          "soubory tohoto odevzdání")
+        self.act_rerun_scripts.triggered.connect(lambda: self.rerun_scripts())
+        self.act_discard_scripts = QAction("Zahodit nedokončený skript…", self)
+        self.act_discard_scripts.triggered.connect(lambda: self.discard_scripts())
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
 
@@ -239,6 +251,7 @@ class MainWindow(QMainWindow):
         self.search.textChanged.connect(self._apply_filter)
         self.search.returnPressed.connect(self._select_first_visible)
         # pod seznamem: stav vybraného aktivovaného projektu (kdo drží které soubory)
+        self.script_ui = GuiScriptUI(self)  # dialogy skriptů (ASK, INPUT, CHOOSE, FORM)
         self.panel = ProjectPanel(self.pm)
         self.panel.hide()
         self.panel.submit_requested.connect(self.submit)
@@ -248,8 +261,8 @@ class MainWindow(QMainWindow):
         self.panel.note_requested.connect(self.add_note)
         self._notes_windows: dict[tuple[str, str], NotesWindow] = {}  # (záložka, projekt) -> okno
         self.panel.can_activate = lambda: self.act_activate.isEnabled()
-        self.panel.mirror_matchers = self._mirror_matchers  # označení zrcadlených souborů ve stromu
         self.panel.mirror_source_label = self.mirror_source_label
+        self.panel.mirror_target_label = self.mirror_target_label
         self.panel.tree.default_expanded = settings.tree_expanded  # výchozí stav složek ve stromu
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         self.splitter.addWidget(self.table)
@@ -351,7 +364,7 @@ class MainWindow(QMainWindow):
 
     def _sync_shared(self) -> bool:
         """Načte společnou konfiguraci ze sítě (jen při změně souboru) a převezme ji do nastavení.
-        Kvůli zrcadlení (identita složek, sdílená pravidla) i u ostatních záložek.
+        Kvůli skriptům (identita a název síťové složky) i u ostatních záložek.
         Vrací, zda se změnilo nastavení aktuální záložky."""
         changed = False
         for ws in self.app_settings.workspaces:
@@ -363,28 +376,10 @@ class MainWindow(QMainWindow):
                 ws_changed = shared.sync(view)
             except Exception:  # noqa: BLE001 – nedostupná síť apod. nesmí zastavit obnovení
                 ws_changed = False
-            if shared.state.status == SHARED_NONE and view.shared_mirror_rules is not None:
-                self._adopt_shared_rules(view)  # soubor zmizel – pravidla zůstanou jako místní
             if view is self.settings:
                 changed = ws_changed
         self._update_config_label()
         return changed
-
-    def _adopt_shared_rules(self, view: Settings) -> None:
-        """Ze sítě zmizel spm_config.json se sdílenými pravidly: naposledy převzatá pravidla
-        zůstanou jako místní (stejně jako ostatní převzaté hodnoty) a dají se měnit místně."""
-        adopted = []
-        for data in view.shared_mirror_rules or []:
-            rule = MirrorRule.from_shared(data, view.workspace_id)
-            rule.shared = False
-            rule.target = resolve_target(self.app_settings, rule) or ""
-            adopted.append(rule.to_dict())
-        view.shared_mirror_rules = None
-        view.mirror_rules = list(view.mirror_rules) + adopted
-        try:
-            view.save()
-        except OSError:
-            pass
 
     # --- záložky (pracovní prostory) --------------------------------------------
 
@@ -554,19 +549,13 @@ class MainWindow(QMainWindow):
                                 f"Na záložce „{ws['name']}“ máte aktivované projekty.\n"
                                 "Nejdřív je deaktivujte.")
             return
-        rules = [r for r in self.settings.mirror_rules if ws_id in (r.get("source"), r.get("target"))]
         answer = QMessageBox.question(
             self, "Odebrat záložku",
             f"Odebrat záložku „{ws['name']}“?\n\nSíť: {ws.get('server_root') or '—'}\n"
             f"Místní: {ws.get('local_root') or '—'}\n\n"
-            "Projekty na síti ani soubory v místní složce se nemažou – odebere se jen záložka."
-            + (f"\n\nOdeberou se i pravidla zrcadlení, která záložku používají ({len(rules)})."
-               if rules else ""))
+            "Projekty na síti ani soubory v místní složce se nemažou – odebere se jen záložka.")
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if rules:
-            self.settings.mirror_rules = [r for r in self.settings.mirror_rules if r not in rules]
-            self.app_settings.store(self.settings)
         current = self.settings.workspace_id
         self.app_settings.remove_workspace(ws_id)
         self._shared.pop(ws_id, None)
@@ -747,7 +736,12 @@ class MainWindow(QMainWindow):
                 item.setForeground(COLOR_MINE if p.mine else COLOR_OTHER)
                 item.setToolTip("Aktivováno:\n" + "\n".join(
                     f"{u.label} od {u.since.replace('T', ' ')}" for u in p.users))
-            if c == COL_NAME and p.notes_for_me:
+            if c == COL_NAME and p.script_pending:
+                item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
+                item.setToolTip((item.toolTip() + "\n\n" if item.toolTip() else "")
+                                + "Skript po odevzdání selhal – spustíte ho znovu pravým tlačítkem "
+                                  "(Spustit skripty znovu).")
+            elif c == COL_NAME and p.notes_for_me:
                 item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
                 note = (f"Čeká na vás {p.notes_for_me} "
                         + ("poznámka" if p.notes_for_me == 1 else "poznámky") + " – tlačítko Poznámky.")
@@ -904,6 +898,8 @@ class MainWindow(QMainWindow):
         self.act_rename.setEnabled(bool(p and not p.active and not p.local_only))
         self.act_comment.setEnabled(bool(p and not p.local_only))
         self.act_unlock.setEnabled(bool(p and p.others))
+        self.act_rerun_scripts.setEnabled(bool(p and p.script_pending))
+        self.act_discard_scripts.setEnabled(bool(p and p.script_pending))
 
     def _context_menu(self, pos) -> None:
         row = self.table.rowAt(pos.y())
@@ -918,6 +914,8 @@ class MainWindow(QMainWindow):
                    None, self.act_refresh]
         if self.act_invalid.isEnabled():
             actions[:0] = [self.act_invalid, None]
+        if self.act_rerun_scripts.isEnabled():
+            actions[:0] = [self.act_rerun_scripts, self.act_discard_scripts, None]
         for act in actions:
             if act is None:
                 menu.addSeparator()
@@ -1063,10 +1061,35 @@ class MainWindow(QMainWindow):
         if not accepted:
             return
         title = "Deaktivace" if end_session else "Odevzdání"
+        files = selection_files(plan, assignments, selected)
+        session = self._before_session(plan.name, DEACTIVATE if end_session else SUBMIT, files,
+                                       comment, title) if has_script_changes(files) else None
+        if session is False:
+            return
 
-        def done(res: UploadResult) -> None:
+        def work(progress=None):
+            cur_plan, cur_selected, added = plan, selected, []
+            if session is not None and session.has_before:
+                if not session.run_before():
+                    session.abort()
+                    return None, []
+                cur_plan, cur_selected, added = self.pm.adopt_script_outputs(plan.name, plan, selected,
+                                                                             progress)
+            res = self.pm.upload(cur_plan, assignments, comment, cur_selected, end_session,
+                                 progress=progress, notes=notes, keep_local=bool(self.settings.scripts))
+            return res, added
+
+        def failed(_message: str) -> None:
+            if session is not None:
+                session.abort()
             self.refresh()
-            ended = end_session or res.auto_deactivated
+
+        def done(result) -> None:
+            res, added = result
+            if res is None:
+                self._before_failed(title, session)
+                return
+            self.refresh()
             msg = ((f"Projekt {plan.name} byl deaktivován." if end_session else "Změny byly odevzdány.")
                    + f"\n\nUpravené: {res.modified}\nNové: {res.added}\n"
                    f"Přejmenované: {res.renamed}\nSmazané: {res.deleted}\nUvolněno: {res.released}")
@@ -1075,8 +1098,9 @@ class MainWindow(QMainWindow):
                         "byl deaktivován.")
             elif res.note:
                 msg += "\n\n" + res.note
-            if ended and self.settings.delete_local_after_deactivate and not res.local_deleted:
-                msg += "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
+            if res.ended and self.settings.delete_local_after_deactivate and not res.local_deleted \
+                    and not res.cleanup_pending:
+                msg += LOCAL_NOT_DELETED
             if res.notes_published:
                 msg += f"\n\nZveřejněné poznámky: {res.notes_published}"
             if res.restored:
@@ -1086,13 +1110,51 @@ class MainWindow(QMainWindow):
                 msg += ("\n\nPOZOR – poslední verze těchto souborů na serveru (před smazáním) se "
                         "nezachovala v zálohách, nahrála se rovnou vaše upravená verze:\n  "
                         + "\n  ".join(res.lost_versions[:15]))
+            if added:
+                msg += ("\n\nSkript (BEFORE) přidal k odevzdání:\n  " + "\n  ".join(added[:15])
+                        + ("\n  …" if len(added) > 15 else ""))
             self._reload_notes_window(plan.name)
-            QMessageBox.information(self, title, msg)
-            self._mirror_after(plan.name)
+            if res.script_files is None:  # odevzdání bez změn – skripty neběží
+                if session is not None:
+                    session.abort()
+                if res.cleanup_pending:
+                    if not self.pm.finish_local(plan.name):
+                        msg += LOCAL_NOT_DELETED
+                    self.refresh()
+                QMessageBox.information(self, title, msg)
+                return
+            self.run_commit_scripts(plan.name, DEACTIVATE if res.ended else SUBMIT, res.script_files,
+                                    comment, res.commit_id, res.cleanup_pending, title, msg,
+                                    session=session)
 
-        run_task(self, f"{title} – nahrávání projektu {plan.name}", self.pm.upload, plan,
-                 assignments, comment, selected, end_session, notes=notes, on_done=done,
-                 on_error=lambda _: self.refresh())
+        run_task(self, f"{title} – nahrávání projektu {plan.name}", work, on_done=done, on_error=failed)
+
+    def _before_session(self, name: str, action: str, files: list[ScriptFile], comment: str,
+                        title: str):
+        """Skripty záložky pro odevzdání: None = žádné, False = chyba (odevzdání se nespustí)."""
+        if not self.settings.scripts:
+            return None
+        scripts, load_error = self.load_tab_scripts()
+        if load_error:
+            QMessageBox.warning(self, title, load_error + "\n\nNic se neodevzdalo – opravte výběr "
+                                "skriptů v okně Skripty.")
+            return False
+        session = ScriptSession(self.script_env(name, action, files, comment), scripts)
+        if not session.ok:
+            session.abort()
+            QMessageBox.warning(self, title, "Skript obsahuje chybu – nic se neodevzdalo:\n\n"
+                                + session.report.error)
+            return False
+        return session
+
+    def _before_failed(self, title: str, session: ScriptSession) -> None:
+        self.refresh()
+        box = QMessageBox(QMessageBox.Icon.Warning, title,
+                          "SKRIPT SELHAL PŘED ODEVZDÁNÍM (BEFORE):\n" + session.report.error
+                          + "\n\nNic se neodevzdalo. Soubory, které skript stihl vytvořit, zůstaly "
+                            "v místní kopii. Po opravě odevzdejte znovu.", parent=self)
+        box.setDetailedText(session.report.text)
+        box.exec()
 
     def rename_project(self) -> None:
         p = self.selected()
@@ -1149,8 +1211,32 @@ class MainWindow(QMainWindow):
         dlg.deleteLater()
         if not accepted:
             return
+        session = self._before_session(p.name, PUBLISH, [ScriptFile(x, ADDED) for x in paths],
+                                       comment, "Publikovat")
+        if session is False:
+            return
 
-        def done(res: PublishResult) -> None:
+        def work(progress=None):
+            selected, added = (None if len(paths) == len(files) else list(paths)), []
+            if session is not None and session.has_before:
+                if not session.run_before():
+                    session.abort()
+                    return None, []
+                added = [x for x in self.pm.local_files(p.name) if x not in set(files)]
+                if selected is not None:
+                    selected += added
+            return self.pm.publish(p.name, comment, selected, progress=progress), added
+
+        def failed(_message: str) -> None:
+            if session is not None:
+                session.abort()
+            self.refresh()
+
+        def done(result) -> None:
+            res, added = result
+            if res is None:
+                self._before_failed("Publikovat", session)
+                return
             if res.leftover is not None:
                 self.settings.ui[self._ui_key("last_project")] = p.name
             self.refresh()
@@ -1163,14 +1249,14 @@ class MainWindow(QMainWindow):
             elif not res.local_deleted:
                 msg += ("\n\nMístní složku se nepodařilo celou smazat (některý soubor je otevřen). "
                         "Data na serveru jsou kompletní, zbytek místní složky smažte ručně.")
-            QMessageBox.information(self, "Publikovat", msg)
-            self._mirror_after(p.name)
+            if added:
+                msg += "\n\nSkript (BEFORE) přidal k publikování:\n  " + "\n  ".join(added[:15])
+            self.run_commit_scripts(p.name, PUBLISH, res.script_files, comment, res.commit_id,
+                                    False, "Publikovat", msg, session=session)
 
-        run_task(self, f"Publikování projektu {p.name}", self.pm.publish, p.name, comment,
-                 None if len(paths) == len(files) else paths,
-                 on_done=done, on_error=lambda _: self.refresh())
+        run_task(self, f"Publikování projektu {p.name}", work, on_done=done, on_error=failed)
 
-    # --- zrcadlení ---------------------------------------------------------------
+    # --- skripty po odevzdání ---------------------------------------------------------
 
     def pm_for(self, ws_id: str) -> ProjectManager:
         """ProjectManager jiné záložky (stejný uživatel a počítač)."""
@@ -1178,100 +1264,181 @@ class MainWindow(QMainWindow):
             return self.pm
         return ProjectManager(self.app_settings.view(ws_id), user=self.pm.user, pc=self.pm.pc)
 
-    def mirrors(self, source_ws: str | None = None) -> list[tuple[str, Mirror]]:
-        """(cílová záložka, Mirror) pro zapnutá pravidla – volitelně jen s daným zdrojem."""
-        return [(t, Mirror(self.pm_for(s), self.pm_for(t), rules))
-                for s, t, rules in mirrors_for(self.app_settings, source_ws)]
-
     def _ws_name(self, ws_id: str) -> str:
         return next((w["name"] for w in self.app_settings.workspaces if w["id"] == ws_id), ws_id)
 
-    def _mirror_after(self, name: str) -> None:
-        """Po odevzdání / publikování: zrcadlit projekt podle pravidel s touto záložkou jako zdrojem."""
-        if not self.settings.mirror_enabled:  # zrcadlení z tohoto počítače vypnuté
-            return
-        groups = [(t, m) for t, m in self.mirrors(self.settings.workspace_id) if m.applies_to(name)]
-        if not groups:
-            return
-
-        def work(progress=None):
-            out = []
-            for t, m in groups:
-                if not m.target_pm.settings.is_complete():
-                    out.append((t, f"Záložka {self._ws_name(t)} nemá nastavené složky."))
-                    continue
-                try:
-                    out.append((t, m.sync_project(name, progress)))
-                except MirrorPermissionError as e:
-                    out.append((t, e))
-                except Exception as e:  # noqa: BLE001 – zrcadlení nesmí shodit odevzdání
-                    out.append((t, str(e) or type(e).__name__))
-            return out
-
-        run_task(self, f"Zrcadlení projektu {name}", work, on_done=self._mirror_done)
-
-    def _mirror_done(self, results: list) -> None:
-        problems = []
-        summary = []
-        denied = False
-        for ws_id, res in results:
-            target = self._ws_name(ws_id)
-            if isinstance(res, MirrorPermissionError):
-                denied = True
-                res = str(res)
-            if isinstance(res, str):
-                problems.append(f"→ {target}: {res}")
-                continue
-            summary.append(f"{res.project} → {target}: {format_mirror_counts(res)}")
-            if not res.ok:
-                problems.append(f"→ {target}:\n" + format_mirror_problems(res))
-        self._set_mirror_label(summary, bool(problems))
-        if denied:
-            answer = QMessageBox.question(
-                self, "Zrcadlení",
-                "\n\n".join(problems) + "\n\nPravidla zrcadlení platí pro všechny, kdo mají zdroj i cíl "
-                "jako záložky. Pokud do cíle zapisovat nemáte, můžete zrcadlení z tohoto počítače "
-                "vypnout (znovu ho zapnete v Nastavení).\n\nVypnout zrcadlení z tohoto počítače?")
-            if answer == QMessageBox.StandardButton.Yes:
-                self.settings.mirror_enabled = False
-                self._save_settings()
-        elif problems:
-            QMessageBox.warning(self, "Zrcadlení",
-                                "Zrcadlení neproběhlo celé – zbytek se zkusí při příštím zrcadlení.\n\n"
-                                + "\n\n".join(problems))
-
-    def _set_mirror_label(self, summary: list[str], problem: bool) -> None:
-        if not hasattr(self, "mirror_label"):
-            self.mirror_label = QLabel()
-            self.statusBar().insertPermanentWidget(0, self.mirror_label)
-        stamp = time.strftime("%H:%M")
-        self.mirror_label.setText(f"Zrcadlení {stamp}: " + ("s problémy" if problem else "v pořádku"))
-        self.mirror_label.setToolTip("\n".join(summary))
-        self.mirror_label.setStyleSheet("color: #c0392b;" if problem else "")
-
-    def _mirror_matchers(self) -> list[tuple[str, object]]:
-        """Pro strom: (název cílové záložky, shoda(projekt, cesta)) pro zapnutá pravidla,
-        jejichž zdrojem je aktuální záložka."""
-        return [(self._ws_name(t), Mirror(None, None, rules).matches)
-                for _s, t, rules in mirrors_for(self.app_settings, self.settings.workspace_id)]
+    def _tab_name_of(self, server_id: str, project_dir: str) -> str | None:
+        """Název záložky se síťovou složkou projektu (podle identity složky nebo cesty)."""
+        for ws in self.app_settings.workspaces:
+            if server_id and self.app_settings.view(ws["id"]).server_id == server_id:
+                return ws["name"]
+        parent = str(Path(project_dir).parent)
+        for ws in self.app_settings.workspaces:
+            if ws.get("server_root") and _same_dir(ws["server_root"], parent):
+                return ws["name"]
+        return None
 
     def mirror_source_label(self, entry) -> str:
         """Odkud zrcadlo soubor přináší: název záložky (podle identity síťové složky nebo cesty),
         pokud ji uživatel má; jinak název zdrojové složky ze spm_config.json, nebo cesta."""
-        for ws in self.app_settings.workspaces:
-            if entry.mirror_server_id and self.app_settings.view(ws["id"]).server_id == entry.mirror_server_id:
-                return ws["name"]
-        parent = str(Path(entry.mirror).parent)
-        for ws in self.app_settings.workspaces:
-            if ws.get("server_root") and _same_dir(ws["server_root"], parent):
-                return ws["name"]
-        return entry.mirror_server_name or entry.mirror
+        return (self._tab_name_of(entry.mirror_server_id, entry.mirror)
+                or entry.mirror_server_name or entry.mirror)
 
-    def open_mirrors(self) -> None:
-        dlg = MirrorDialog(self, self)
-        self._exec_dialog(dlg, "mirrors")
+    def mirror_target_label(self, target) -> str:
+        """Kam se soubor zrcadlí: název záložky (jinak název síťové složky nebo cesta);
+        u jiného projektu než stejnojmenného i s jeho názvem."""
+        tab = (self._tab_name_of(target.server_id, target.label) or target.server_name
+               or str(Path(target.label).parent))
+        project = Path(target.label).name
+        p = self.panel.project
+        return tab if p is not None and project.lower() == p.name.lower() else f"{tab}/{project}"
+
+    def open_scripts(self) -> None:
+        p = self.selected()
+        dlg = ScriptsDialog(self, project=p.name if p and not p.local_only else None)
+        self._exec_dialog(dlg, "scripts")
         dlg.deleteLater()
-        self.panel._fill()  # pravidla se mohla změnit – označení ve stromu
+
+    def tab_infos(self) -> list[TabInfo]:
+        return [TabInfo(ws["id"], ws["name"], self.app_settings.view(ws["id"]).server_name,
+                        ws.get("server_root") or "", ws.get("local_root") or "")
+                for ws in self.app_settings.workspaces]
+
+    def script_env(self, name: str, action: str, files: list[ScriptFile], comment: str = "",
+                   commit_id: int | None = None) -> ScriptEnv:
+        tabs = self.tab_infos()
+        tab = next(t for t in tabs if t.ws_id == self.settings.workspace_id)
+        return ScriptEnv(self.pm, name, action, files, comment, commit_id, tab, tabs,
+                         lambda t: self.pm_for(t.ws_id), nick=self.settings.nickname,
+                         ui=self.script_ui, secrets=dict(self.settings.secrets))
+
+    def load_tab_scripts(self) -> tuple[list[tuple[str, str]], str]:
+        """Skripty záložky (název, text) v pořadí běhu; chyba = chybějící / nečitelný soubor."""
+        scripts = []
+        for name in self.settings.scripts:
+            try:
+                scripts.append((name, script_store.load_script(name)))
+            except OSError as e:
+                return scripts, f"Skript {name} nelze načíst ({script_store.script_path(name)}): {e}"
+        return scripts, ""
+
+    def run_commit_scripts(self, name: str, action: str, files: list[ScriptFile], comment: str,
+                           commit_id: int | None, cleanup: bool, title: str, summary: str,
+                           session: ScriptSession | None = None, saved_vars: dict | None = None) -> None:
+        """Po odevzdání spustí skripty záložky (session = pokračování po BEFORE; jinak nový běh,
+        u opakování s proměnnými z BEFORE). Když selžou, uloží se nedokončený běh (spustí se
+        znovu z nabídky projektu) a místní kopie se neuklidí."""
+        names = list(self.settings.scripts)
+        if session is None and (not names or not files):
+            try:  # bez skriptů se nic nezrcadlí – označení změněných souborů už neplatí
+                self.pm.clear_stale_mirror_marks(name, files, set())
+            except OSError:
+                pass
+            if cleanup:
+                if not self.pm.finish_local(name):
+                    summary += LOCAL_NOT_DELETED
+                self.refresh()
+            QMessageBox.information(self, title, summary)
+            return
+        load_error = ""
+        if session is None:
+            scripts, load_error = self.load_tab_scripts()
+            env = self.script_env(name, action, files, comment, commit_id)
+            if not load_error:
+                session = ScriptSession(env, scripts)
+                session.import_vars(saved_vars or {})
+        else:
+            env = session.env
+        pending = script_store.PendingRun(name, action, comment, commit_id, files, names, cleanup=cleanup)
+        local_root = self.pm.local_root
+        outcome = {"local_deleted": True}
+
+        def work(progress=None) -> RunReport:
+            if load_error:
+                report = RunReport(ok=False, error=load_error)
+                clear_stale_marks(env, report, set())
+            else:
+                session.interp.progress = progress
+                session.run_after(files, commit_id, action)
+                report = session.report
+                pending.vars = session.export_vars()
+            try:
+                self.pm.record_script_run(name, commit_id, action, names, report.ok, report.text)
+            except Exception as e:  # noqa: BLE001 – záznam nesmí zakrýt výsledek skriptu
+                report.log.append(f"(Záznam do historie projektu se nepodařilo uložit: {e})")
+            if report.ok:
+                script_store.clear_pending(local_root, name)
+                if cleanup:
+                    outcome["local_deleted"] = self.pm.finish_local(name)
+            else:
+                pending.error = report.error
+                script_store.save_pending(local_root, pending)
+            return report
+
+        def done(report: RunReport) -> None:
+            self.refresh()
+            text = (summary + "\n\n") if summary else ""
+            if report.ok:
+                text += "Skripty proběhly: " + ", ".join(names)
+                if not outcome["local_deleted"]:
+                    text += LOCAL_NOT_DELETED
+                icon = QMessageBox.Icon.Information
+            else:
+                text += ("SKRIPT SELHAL:\n" + report.error + "\n\nData jsou odevzdaná na serveru"
+                         + (", místní kopie zůstala" if cleanup else "")
+                         + ". Po opravě spustíte skripty znovu pravým tlačítkem na projektu "
+                           "(Spustit skripty znovu).")
+                icon = QMessageBox.Icon.Warning
+            box = QMessageBox(icon, title, text, parent=self)
+            box.setDetailedText(report.text)
+            box.exec()
+
+        def failed(message: str) -> None:
+            pending.error = message
+            try:
+                script_store.save_pending(local_root, pending)
+            except OSError:
+                pass
+            self.refresh()
+
+        run_task(self, f"Skripty – projekt {name}", work, on_done=done, on_error=failed)
+
+    def rerun_scripts(self) -> None:
+        p = self.selected()
+        if not p or not p.script_pending:
+            return
+        pending = script_store.load_pending(self.pm.local_root, p.name)
+        if pending is None:
+            QMessageBox.warning(self, "Spustit skripty znovu", "Záznam nedokončeného skriptu nelze přečíst.")
+            return
+        names = list(self.settings.scripts)
+        if not names:
+            QMessageBox.warning(self, "Spustit skripty znovu",
+                                "Záložka nemá vybrané žádné skripty (okno Skripty).")
+            return
+        answer = QMessageBox.question(
+            self, "Spustit skripty znovu",
+            f"Odevzdání z {pending.created_at.replace('T', ' ')} ({len(pending.files)} souborů).\n"
+            f"Chyba: {pending.error}\n\nSpustit znovu skripty: {', '.join(names)}?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        # projekt mezitím znovu aktivovaný – místní kopii nemazat
+        cleanup = pending.cleanup and not p.mine
+        self.run_commit_scripts(p.name, pending.action, pending.files, pending.comment,
+                                pending.commit_id, cleanup, "Spustit skripty znovu", "",
+                                saved_vars=pending.vars)
+
+    def discard_scripts(self) -> None:
+        p = self.selected()
+        if not p or not p.script_pending:
+            return
+        answer = QMessageBox.question(
+            self, "Zahodit nedokončený skript",
+            f"Zahodit nedokončený skript projektu {p.name}?\n\nSkripty se pro toto odevzdání už "
+            "nespustí. Místní kopie projektu (pokud zůstala) se nemaže.")
+        if answer == QMessageBox.StandardButton.Yes:
+            script_store.clear_pending(self.pm.local_root, p.name)
+            self.refresh()
 
     def _on_double_click(self, index) -> None:
         """Dvojklik: na názvu aktivace / deaktivace (jako F3), na komentáři jeho úprava,

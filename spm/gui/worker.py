@@ -2,10 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import QMessageBox, QProgressDialog, QWidget
+
+
+# okna průběhu běžících úloh (viz progress_paused)
+_active_progress: list[QProgressDialog] = []
+
+
+@contextmanager
+def progress_paused() -> Iterator[None]:
+    """Dialog, na jehož odpověď čeká úloha na pozadí (např. ASK ve skriptu): okna průběhu se
+    po dobu dialogu skryjí – jinak by se samo zobrazilo (po minimumDuration) a stálo by nad
+    dialogem, ač se nic neděje. Potom se znovu ukáže až po minimumDuration."""
+    paused = list(_active_progress)
+    for dlg in paused:
+        dlg.reset()  # zastaví časovač, který okno samo zobrazí
+        dlg.hide()
+    try:
+        yield
+    finally:
+        for dlg in paused:
+            if dlg in _active_progress:
+                dlg.setValue(dlg.minimum())  # znovu spustí časovač zobrazení
 
 
 class Task(QThread):
@@ -51,6 +73,8 @@ def run_task(
         dlg.setLabelText(f"{title}\n{text}" if text else title)
 
     def finish() -> None:
+        if dlg in _active_progress:
+            _active_progress.remove(dlg)
         dlg.close()
         parent._running_task = None
         task.wait()
@@ -71,5 +95,6 @@ def run_task(
     task.done.connect(ok)
     task.failed.connect(fail)
     parent._running_task = task  # udrží referenci, dokud vlákno běží
+    _active_progress.append(dlg)
     task.start()
     return task
