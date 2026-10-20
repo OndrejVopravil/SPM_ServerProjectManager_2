@@ -12,13 +12,14 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sqlite3
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 from . import SPM_DIR, recycle
 from . import db as dbm
@@ -32,6 +33,7 @@ from .db import DbFile, LockOwner, ProjectDB, db_path
 from .identity import current_full_name, current_pc, current_user
 from .lock import LockInfo, WriteLock, active_users, add_marker, now_iso, read_marker, remove_marker
 from .manifest import Entry, Manifest
+from .mirror import Mirror
 from .matcher import RenameSuggestion, similarity, suggest_renames
 from .names import describe_chars, find_invalid_names, forbidden_in, format_invalid, invalid_rel_paths
 from . import restore
@@ -43,10 +45,13 @@ from .scanner import (
     Progress,
     copy_with_hash,
     file_hash,
+    fix_case,
     list_files,
     move_file,
+    is_ignored,
     remove_empty_parents,
     rmtree,
+    same_path,
     same_stat,
     scan,
     set_readonly,
@@ -107,6 +112,19 @@ def validate_project_name(name: str) -> str | None:
     return None
 
 
+def validate_folder_name(name: str, check_forbidden: bool = True) -> str | None:
+    """Vrátí popis chyby, pokud nový název složky nelze použít, jinak None."""
+    if not name.strip():
+        return "Název složky nesmí být prázdný."
+    error = validate_file_name(name, check_forbidden=False)
+    if error:
+        return error.replace("souboru", "složky")
+    if check_forbidden and forbidden_in(name):
+        return ("Název obsahuje nepovolené znaky: " + describe_chars(forbidden_in(name))
+                + "\n(Nepovolená je česká diakritika, mezera a znaky ( ) & , . ; = ^)")
+    return None
+
+
 def validate_file_name(name: str, check_forbidden: bool = True) -> str | None:
     """Vrátí popis chyby, pokud nový název souboru nelze použít, jinak None."""
     if not name.strip():
@@ -141,6 +159,21 @@ class ProjectStatus:
         return bool(self.users)
 
 
+def project_rank(p: ProjectStatus) -> int:
+    """Skupina projektu v seznamu (uvnitř skupiny abecedně):
+    0 aktivované mnou, 1 s upozorněním pro mě (poznámka pro mě, neproběhlý skript),
+    2 jen v místním úložišti (neodevzdané), 3 aktivované jinými, 4 ostatní."""
+    if p.mine:
+        return 0
+    if p.notes_for_me or p.script_pending:
+        return 1
+    if p.local_only:
+        return 2
+    if p.active:
+        return 3
+    return 4
+
+
 @dataclass
 class FileEntry:
     """Soubor projektu pro výběr v dialogu (zamknutí při aktivaci / převzetí)."""
@@ -155,6 +188,7 @@ class FileEntry:
     mirror_server_id: str = ""   # identita zdrojové síťové složky (pro název záložky)
     mirror_server_name: str = ""
     mirror_targets: list = field(default_factory=list)  # kam se soubor zrcadlí (db.MirrorTarget)
+    mirror_stale: dbm.MirrorStale | None = None  # zrcadlená kopie je neaktuální (zdroj se změnil)
 
     @property
     def free(self) -> bool:
@@ -300,6 +334,18 @@ class UploadResult:
 
 
 @dataclass
+class CopyItem:
+    """Jeden soubor kopírovaný do projektu (přetažením)."""
+    rel: str                 # cílová cesta v projektu
+    source: Path
+    action: str              # ADD (nový) / REPLACE (nahradí můj soubor) / SKIP
+    reason: str = ""         # proč se přeskočí
+
+
+COPY_ADD, COPY_REPLACE, COPY_SKIP = "add", "replace", "skip"
+
+
+@dataclass
 class ActivationResult:
     moved_to: Path | None = None    # kam se odložila původní místní složka
     external: list[str] = field(default_factory=list)  # změny na serveru mimo aplikaci (podle hashe)
@@ -371,8 +417,7 @@ class ProjectManager:
         for name in self.local_only_projects(server_names):
             result.append(ProjectStatus(name=name, users=[], local_exists=True, mine=False,
                                         local_only=True))
-        # projekty, které mám aktivované já, vždy nahoře; jinak abecedně
-        result.sort(key=lambda p: (not p.mine, p.name.lower()))
+        result.sort(key=lambda p: (project_rank(p), p.name.lower()))
         return result
 
     def _server_status(self, name: str) -> ProjectStatus:
@@ -547,6 +592,61 @@ class ProjectManager:
         self.local_root.mkdir(parents=True, exist_ok=True)
         return restore.restore(self.server_dir(catalog.name), self.local_root, catalog, point, progress)
 
+    def create_local_project(self, name: str) -> Path:
+        """Nový projekt jen v místním úložišti – prázdná složka (jako ručně vytvořená);
+        na síť se dostane publikováním. Vrací cestu ke složce."""
+        name = name.strip()
+        error = validate_project_name(name)
+        if error:
+            raise SyncError(error)
+        lower = name.lower()
+        if self.local_root.is_dir() and any(e.name.lower() == lower for e in self.local_root.iterdir()):
+            raise SyncError(f"V místním úložišti už složka {name} existuje:\n{self.local_root}")
+        try:
+            on_server = self.server_root.is_dir() and any(
+                e.name.lower() == lower for e in self.server_root.iterdir())
+        except OSError:
+            on_server = False  # síť nedostupná – shoda se ověří při publikování
+        if on_server:
+            raise SyncError(f"Na serveru už projekt {name} existuje – aktivujte ho, místo "
+                            "vytváření nového.")
+        path = self.local_dir(name)
+        path.mkdir(parents=True)
+        return path
+
+    def rename_local_project(self, name: str, new_name: str) -> Path:
+        """Přejmenuje složku projektu, který je jen v místním úložišti (ještě neodevzdaný).
+        Vrací novou cestu ke složce."""
+        new_name = new_name.strip()
+        src = self.local_dir(name)
+        if new_name == name:
+            return src
+        error = validate_project_name(new_name)
+        if error:
+            raise SyncError(error)
+        if not src.is_dir():
+            raise SyncError(f"Složka projektu neexistuje: {src}")
+        lower = new_name.lower()
+        case_only = lower == name.lower()
+        try:
+            on_server = self.server_root.is_dir() and any(
+                e.name.lower() == lower for e in self.server_root.iterdir())
+        except OSError:
+            on_server = False  # síť nedostupná – shoda se ověří při publikování
+        if on_server:
+            raise SyncError(f"Na serveru už projekt {new_name} existuje – zvolte jiný název.")
+        if not case_only and any(e.name.lower() == lower for e in self.local_root.iterdir()):
+            raise SyncError(f"V místním úložišti už složka {new_name} existuje:\n{self.local_root}")
+        dst = self.local_dir(new_name)
+        try:
+            src.rename(dst)
+        except PermissionError:
+            raise SyncError(
+                "Složku projektu nelze přejmenovat – některý soubor nebo složka projektu je "
+                "otevřená (např. v Průzkumníku nebo jiné aplikaci)."
+            ) from None
+        return dst
+
     def local_only_projects(self, server_names: set[str]) -> list[str]:
         """Složky v místním úložišti, které na serveru nemají projekt (porovnání bez ohledu
         na velikost písmen, jako ve Windows)."""
@@ -566,6 +666,7 @@ class ProjectManager:
         owners: dict[str, LockOwner] = {}
         mirrored: dict[str, tuple[str, str]] = {}
         sources: dict = {}
+        stale: dict = {}
         targets: dict = {}
         if db_path(server).exists():
             with ProjectDB.for_project(server) as db:
@@ -573,6 +674,7 @@ class ProjectManager:
                 owners = db.lock_owners()
                 mirrored = db.mirrored()
                 sources = db.mirror_sources() if mirrored else {}
+                stale = db.mirror_stale() if mirrored else {}
                 targets = db.mirror_targets()
         result = []
         for path in paths:
@@ -584,6 +686,7 @@ class ProjectManager:
                 entry.mirror = src.label if src else mirrored[f.file_id][0]
                 entry.mirror_server_id = src.server_id if src else ""
                 entry.mirror_server_name = src.server_name if src else ""
+                entry.mirror_stale = stale.get(f.file_id)
             if f is not None:
                 entry.mirror_targets = targets.get(f.file_id, [])
             result.append(entry)
@@ -654,6 +757,205 @@ class ProjectManager:
                 raise SyncError(f"Na serveru už je soubor s tímto názvem:\n{new_path}")
         os.rename(src, dst)
         return new_path
+
+    def create_local_folder(self, name: str, parent: str, new_name: str) -> str:
+        """Vytvoří složku v mé místní kopii (parent = '' nebo 'a/b/'). Vrací její cestu.
+        Na server se dostane až se souborem, který v ní bude při odevzdání."""
+        error = validate_folder_name(new_name, self.settings.check_forbidden_chars)
+        if error:
+            raise SyncError(error)
+        parent = parent.strip("/")
+        rel = f"{parent}/{new_name}" if parent else new_name
+        if rel.split("/")[0].lower() == SPM_DIR:
+            raise SyncError("Do servisní složky .spm nelze nic přidávat.")
+        local = self.local_dir(name)
+        path = to_abs(local, rel)
+        if path.exists():
+            raise SyncError(f"Složka nebo soubor s tímto názvem už existuje:\n{rel}")
+        server = self.server_dir(name)
+        if server.exists():  # projekt na serveru – musí být aktivovaný mnou
+            _, manifest = self._manifest(name)
+            with ProjectDB.for_project(server) as db:
+                self._my_session(db, manifest.session_id)
+                files = db.active_files(include_pending=True)
+            prefix = rel.lower() + "/"
+            if any(p.lower().startswith(prefix) or p.lower() == rel.lower() for p in files):
+                raise SyncError(f"Na serveru už je složka nebo soubor s tímto názvem:\n{rel}")
+        path.mkdir(parents=True)
+        return rel
+
+    def local_empty_folders(self, name: str) -> list[str]:
+        """Prázdné složky v místní kopii (bez souborů a bez podsložek; ignorované soubory se
+        nepočítají) – strom je ukáže, i když v nich zatím nic není."""
+        local = self.local_dir(name)
+        if not local.is_dir():
+            return []
+        result: list[str] = []
+        ignore = self.settings.ignore_patterns
+        for dirpath, dirnames, filenames in os.walk(local):
+            rel_dir = Path(dirpath).relative_to(local).as_posix()
+            if rel_dir == ".":
+                dirnames[:] = [d for d in dirnames if d.lower() != SPM_DIR and not is_ignored(d, ignore)]
+                continue
+            dirnames[:] = [d for d in dirnames if not is_ignored(d, ignore)]
+            if not dirnames and not any(not is_ignored(f, ignore) for f in filenames):
+                result.append(rel_dir)
+        return sorted(result, key=str.lower)
+
+    def remove_empty_local_folder(self, name: str, folder: str) -> None:
+        """Smaže prázdnou složku z místní kopie (i prázdné podsložky; soubor v ní = chyba)."""
+        path = to_abs(self.local_dir(name), folder.strip("/"))
+        if not path.is_dir():
+            return
+        if any(p.is_file() for p in path.rglob("*")):
+            raise SyncError(f"Složka není prázdná:\n{folder}")
+        for sub in sorted((p for p in path.rglob("*") if p.is_dir()), key=lambda p: len(p.parts),
+                          reverse=True):
+            sub.rmdir()
+        path.rmdir()
+
+    def rename_local_folder(self, name: str, folder: str, new_name: str) -> str:
+        """Přejmenuje složku v mé místní kopii (ve stejné nadřazené složce). Vrací novou cestu.
+
+        Jen když mám aktivované (zamčené) všechny soubory ve složce i ve všech podsložkách
+        (nebo jde o mé nové soubory, případně o celou složku „Jen místně“). Na serveru se
+        přejmenování projeví až při odevzdání – soubory se rozpoznají jako přejmenované podle
+        obsahu (zachová se historie i zálohy)."""
+        error = validate_folder_name(new_name, self.settings.check_forbidden_chars)
+        if error:
+            raise SyncError(error)
+        folder = folder.strip("/")
+        parent, _, _old = folder.rpartition("/")
+        new_folder = f"{parent}/{new_name}" if parent else new_name
+        if new_folder == folder:
+            return folder
+        local = self.local_dir(name)
+        src, dst = to_abs(local, folder), to_abs(local, new_folder)
+        if not src.is_dir():
+            raise SyncError(f"Složka v místní kopii neexistuje:\n{src}")
+        case_only = new_folder.lower() == folder.lower()
+        if dst.exists() and not case_only:
+            raise SyncError(f"Složka s tímto názvem už existuje:\n{new_folder}")
+
+        server = self.server_dir(name)
+        if server.exists():
+            _, manifest = self._manifest(name)
+            with ProjectDB.for_project(server) as db:
+                mine = db.locked_by(self._my_session(db, manifest.session_id))
+                files = db.active_files(include_pending=True)
+            prefix = folder.lower() + "/"
+            foreign = sorted(p for p, f in files.items()
+                             if p.lower().startswith(prefix) and f.file_id not in mine)
+            if foreign:
+                raise SyncError("Složku lze přejmenovat, jen když máte aktivované všechny soubory "
+                                "v ní i ve všech podsložkách. Neaktivované:\n"
+                                + "\n".join(foreign[:15]) + ("\n…" if len(foreign) > 15 else ""))
+            new_prefix = new_folder.lower() + "/"
+            if not case_only and any(p.lower().startswith(new_prefix) for p in files):
+                raise SyncError(f"Na serveru už je složka s tímto názvem:\n{new_folder}")
+        os.rename(src, dst)
+        return new_folder
+
+    # --- kopírování přetažením ---------------------------------------------------
+
+    def plan_copy_in(self, name: str, sources: list[tuple[Path, str]]) -> list[CopyItem]:
+        """Co se stane při kopírování souborů do místní kopie projektu (přetažení do stromu).
+        sources: (zdrojový soubor, cílová cesta v projektu). Nový soubor se přidá, existující
+        se nahradí jen tehdy, když ho mám aktivovaný (nebo je to můj nový soubor); ostatní se
+        přeskočí s důvodem. U složky „Jen místně“ lze vše."""
+        local = self.local_dir(name)
+        server = self.server_dir(name)
+        on_server = server.exists()
+        files: dict[str, DbFile] = {}
+        mine: set[str] = set()
+        owners: dict = {}
+        mirrored: dict = {}
+        if on_server:
+            _, manifest = self._manifest(name)
+            with ProjectDB.for_project(server) as db:
+                mine = db.locked_by(self._my_session(db, manifest.session_id))
+                files = {p.lower(): f for p, f in db.active_files(include_pending=True).items()}
+                owners = db.lock_owners()
+                mirrored = db.mirrored()
+        items: list[CopyItem] = []
+        seen: set[str] = set()
+        for src, rel in sources:
+            rel = rel.strip("/")
+            parts = rel.split("/")
+
+            def skip(reason: str) -> None:
+                items.append(CopyItem(rel, src, COPY_SKIP, reason))
+            if not rel or parts[0].lower() == SPM_DIR:
+                skip("servisní složka")
+                continue
+            if rel.lower() in seen:
+                skip("stejný název je mezi kopírovanými soubory víckrát")
+                continue
+            seen.add(rel.lower())
+            if any(is_ignored(part, self.settings.ignore_patterns) for part in parts):
+                skip("ignorovaný soubor")
+                continue
+            if self._invalid_paths([rel]):
+                skip("nepovolené znaky v názvu")
+                continue
+            dst = to_abs(local, rel)
+            if dst.exists() and same_path(dst, src):
+                skip("kopie sama na sebe")
+                continue
+            f = files.get(rel.lower())
+            if f is None:
+                if dst.is_dir():
+                    skip("v místní kopii je složka se stejným názvem")
+                else:
+                    items.append(CopyItem(rel, src, COPY_REPLACE if dst.exists() else COPY_ADD))
+                continue
+            rel = f.path  # existující soubor – jeho cesta v projektu (velikost písmen)
+            if f.file_id in mirrored:
+                skip("spravuje ho zrcadlo")
+            elif f.file_id in mine:
+                items.append(CopyItem(rel, src, COPY_REPLACE))
+            elif f.file_id in owners:
+                skip(f"drží ho {owners[f.file_id].label}")
+            else:
+                skip("není aktivovaný")
+        return items
+
+    def copy_in(self, name: str, items: list[CopyItem], progress: Progress | None = None) -> list[str]:
+        """Provede kopírování naplánované plan_copy_in (jen do místní kopie – na server až
+        odevzdáním). Vrací cesty zkopírovaných souborů; chyba jednoho souboru = SyncError."""
+        local = self.local_dir(name)
+        todo = [i for i in items if i.action != COPY_SKIP]
+        done: list[str] = []
+        for n, item in enumerate(todo):
+            if progress:
+                progress(n, len(todo), item.rel)
+            try:
+                copy_with_hash(item.source, to_abs(local, item.rel), writable=True)
+            except OSError as e:
+                raise SyncError(f"Soubor {item.rel} se nepodařilo zkopírovat:\n{e}"
+                                + (f"\n\nZkopírováno předtím: {len(done)}" if done else "")) from None
+            done.append(item.rel)
+        return done
+
+    def file_source(self, name: str, rel: str) -> Path:
+        """Odkud soubor projektu číst: místní kopie, jinak server (nestažený soubor)."""
+        local = to_abs(self.local_dir(name), rel)
+        return local if local.is_file() else to_abs(self.server_dir(name), rel)
+
+    def export_copies(self, name: str, items: list[tuple[str, str]], dest: Path,
+                      progress: Progress | None = None) -> list[Path]:
+        """Kopie souborů projektu pro přetažení ven (např. na plochu): items = (cesta v projektu,
+        cesta v cíli). Kopie jsou vždy zapisovatelné (bez „jen pro čtení“) a nestažené soubory
+        se vezmou ze serveru. Vrací položky nejvyšší úrovně v dest (soubory a složky)."""
+        tops: dict[str, Path] = {}
+        for n, (rel, out) in enumerate(items):
+            if progress:
+                progress(n, len(items), rel)
+            target = to_abs(dest, out)
+            copy_with_hash(self.file_source(name, rel), target, writable=True)
+            top = out.split("/")[0]
+            tops.setdefault(top.lower(), dest / top)
+        return list(tops.values())
 
     def local_renames(self, name: str) -> dict[str, str]:
         """Moje zamčené soubory přejmenované v místní kopii, ještě neodevzdané: stará cesta ->
@@ -1035,12 +1337,14 @@ class ProjectManager:
             lp = to_abs(local, lpath)
             changed_locally = not lp.exists() or file_hash(lp) != entry.sha256
             if lpath != f.path:  # přejmenován jiným uživatelem
-                if changed_locally or to_abs(local, f.path).exists():
+                target = to_abs(local, f.path)
+                if changed_locally or (target.exists() and not same_path(target, lp)):
                     result.conflicts.append(f"{lpath} – na serveru přejmenován na {f.path}, "
                                             "ale místní kopie je změněná")
                     continue
                 move_file(lp, to_abs(local, f.path))
                 remove_empty_parents(local, lpath)
+                fix_case(local, f.path)
                 manifest.files[f.path] = manifest.files.pop(lpath)
                 lp = to_abs(local, f.path)
                 result.moved.append(f"{lpath} → {f.path}")
@@ -1150,6 +1454,7 @@ class ProjectManager:
                 # přejmenovaný na serveru – nejdřív přesunout místní kopii
                 move_file(lp, to_abs(local, f.path))
                 remove_empty_parents(local, lpath)
+                fix_case(local, f.path)
                 manifest.files[f.path] = manifest.files.pop(lpath)
             lp = to_abs(local, f.path)
             entry = manifest.files.get(f.path)
@@ -1198,6 +1503,11 @@ class ProjectManager:
         conflicts: list[str] = []
         unsavable: list[str] = []
         gone: set[str] = set()
+        # můj soubor přejmenovaný jen ve velikosti písmen (A/x -> a/x): chybí a je „nový“ –
+        # nesmí se brát jako kolize se sebou samým (jinak by se odevzdal jako smazaný)
+        local_lower = {p.lower() for p in local_files}
+        case_renamed = {p.lower() for p, e in manifest.files.items()
+                        if p not in local_files and p.lower() in local_lower and e.file_id in mine}
         for path, entry in manifest.files.items():
             lf = local_files.get(path)
             dbf = by_id.get(entry.file_id)
@@ -1236,7 +1546,7 @@ class ProjectManager:
             if path in manifest.files:
                 continue
             f = by_lower.get(path.lower())
-            if f is not None and not (f.file_id in mine and f.pending):
+            if f is not None and not (f.file_id in mine and f.pending) and path.lower() not in case_renamed:
                 conflicts.append(f"{path} – na serveru už je soubor se stejným názvem (nelze nahrát)")
                 unsavable.append(path)
                 continue
@@ -1366,6 +1676,8 @@ class ProjectManager:
                 src = to_abs(server, bf.path)
                 if src.exists():
                     os.replace(src, tmp_dir / bf.file_id)
+            for bf, _ in renames:  # vyprázdněné složky pryč (i kvůli změně velikosti písmen)
+                remove_empty_parents(server, bf.path)
             for bf, lf in renames:
                 tick(f"Přejmenování → {lf.path}")
                 tmp = tmp_dir / bf.file_id
@@ -1375,16 +1687,17 @@ class ProjectManager:
                         self._to_trash(server, sid, lf.path)
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(tmp, dst)
+                    fix_case(server, lf.path)
                 remove_empty_parents(server, bf.path)
                 changed = bf.sha256 != lf.sha256
                 backup = None
                 if changed or not dst.exists():
-                    backup = self._upload(server, local, lf, backup_existing=changed)
+                    backup = self._upload(server, local, lf, backup_existing=changed, file_id=bf.file_id)
                 ops.append((dbm.RENAMED_MODIFIED if changed else dbm.RENAMED, bf.file_id, bf.path, lf, backup))
 
         for bf, lf in modified:
             tick(f"Nahrávání {lf.path}")
-            backup = self._upload(server, local, lf, backup_existing=True)
+            backup = self._upload(server, local, lf, backup_existing=True, file_id=bf.file_id)
             ops.append((dbm.MODIFIED, bf.file_id, bf.path, lf, backup))
 
         for lf in added:
@@ -1403,7 +1716,7 @@ class ProjectManager:
             with ProjectDB.for_project(server) as db:
                 db_sha = {f.file_id: f.sha256 for f in db.active_files(include_pending=True).values()}
             for bf in modified_gone:
-                if not self._version_in_backups(server, bf.path, db_sha.get(bf.file_id)):
+                if not self._version_in_backups(server, bf.file_id, db_sha.get(bf.file_id)):
                     lost_versions.append(bf.path)
 
         for bf in deleted:
@@ -1522,38 +1835,78 @@ class ProjectManager:
                      for f in db.active_files().values()]
         return sorted(files, key=lambda f: f.path.lower())
 
+    def script_file_state(self, name: str, rel: str) -> tuple[str, ScriptFile | None, str]:
+        """Stav souboru projektu pro skript (ACTIVATE, zápis v BEFORE):
+        ("missing", None, "") – v projektu není (skript ho může vytvořit),
+        ("mine", soubor, "")  – mám ho zamčený,
+        ("free", soubor, "")  – existuje, nikdo ho nedrží (lze aktivovat),
+        ("other", soubor, kdo) – drží ho jiný, ("mirror", soubor, odkud) – spravuje ho zrcadlo."""
+        server = self.server_dir(name)
+        if not db_path(server).exists():
+            return "missing", None, ""
+        _, manifest = self._manifest(name)
+        with ProjectDB.for_project(server) as db:
+            sid = self._my_session(db, manifest.session_id)
+            f = next((x for p, x in db.active_files(include_pending=True).items()
+                      if p.lower() == rel.lower()), None)
+            if f is None:
+                return "missing", None, ""
+            sf = ScriptFile(f.path, UNCHANGED, f.file_id, sha256=f.sha256, size=f.size)
+            mirrored = db.mirrored()
+            if f.file_id in mirrored:
+                src = db.mirror_sources().get(mirrored[f.file_id][0])
+                return "mirror", sf, src.label if src else mirrored[f.file_id][0]
+            if f.file_id in db.locked_by(sid):
+                return "mine", sf, ""
+            owner = db.lock_owners().get(f.file_id)
+            if owner is not None:
+                return "other", sf, owner.label
+        return "free", sf, ""
+
+    def script_activate(self, name: str, rel: str, progress: Progress | None = None) -> ScriptFile:
+        """ACTIVATE ve skriptu: zamkne volný soubor projektu a stáhne jeho aktuální verzi
+        (místně změněnou verzi nepřepíše – viz take)."""
+        state, sf, who = self.script_file_state(name, rel)
+        if state == "mine":
+            return sf
+        if state != "free":
+            raise SyncError(f"Soubor {rel} nelze aktivovat"
+                            + (f" – drží ho {who}." if state == "other" else
+                               f" – spravuje ho zrcadlo z {who}." if state == "mirror" else
+                               " – v projektu není."))
+        self.take(name, [sf.path], progress)
+        _, manifest = self._manifest(name)
+        entry = manifest.files.get(sf.path)
+        return ScriptFile(sf.path, UNCHANGED, sf.file_id, sha256=entry.sha256 if entry else sf.sha256,
+                          size=sf.size)
+
     def adopt_script_outputs(self, name: str, before: UploadPlan, selected: set[str] | None,
-                             progress: Progress | None = None
+                             progress: Progress | None = None, activated: Iterable[str] = ()
                              ) -> tuple[UploadPlan, set[str] | None, list[str]]:
-        """Po bloku BEFORE: soubory, které skript v místní kopii vytvořil nebo přepsal, se přidají
-        k odevzdání. Přepsaný soubor, který nemám zamčený, se zamkne (Převzít – místní verze
-        zůstane); drží-li ho jiný nebo patří zrcadlu, odevzdání se nespustí (SyncError).
+        """Po bloku BEFORE: soubory, které skript v místní kopii vytvořil nebo přepsal, a soubory,
+        které aktivoval (activated – ACTIVATE / potvrzený zápis), se přidají k odevzdání.
+        Změněný soubor, který nemám zamčený (např. ho změnil program přes RUN), se neodevzdá –
+        odevzdání se nespustí (SyncError).
         Vrací (nový plán, výběr k odevzdání, cesty souborů od skriptu)."""
         plan = self.plan_upload(name, progress)
         old = before.local_files
         touched = sorted(p for p, lf in plan.local_files.items()
                          if p not in old or old[p].sha256 != lf.sha256)
-        if not touched:
-            return plan, selected, []
-        mine = {lf.path for _, lf in plan.modified} | {lf.path for lf in plan.new}
-        _, manifest = self._manifest(name)
-        to_take = [p for p in touched if p not in mine and p in manifest.files]
-        if to_take:
-            self.take(name, to_take, progress)
-            plan = self.plan_upload(name, progress)
         new_paths = {lf.path for lf in plan.new}
         modified = {lf.path: bf.file_id for bf, lf in plan.modified}
-        same = {bf.path for bf in plan.locked_unchanged}  # přepsán stejným obsahem, jaký je na serveru
+        same = {bf.path: bf.file_id for bf in plan.locked_unchanged}  # zamčené beze změny
         stuck = [p for p in touched if p not in new_paths and p not in modified and p not in same]
-        blocked = [p for p in stuck if any(c.startswith(p + " – ") for c in plan.conflicts)]
         if stuck:
-            raise SyncError("Soubory vytvořené skriptem (BEFORE) nelze odevzdat:\n" + "\n".join(
-                next((c for c in plan.conflicts if c.startswith(p + " – ")), p)
-                for p in (blocked or stuck)[:15]))
+            details = [next((c for c in plan.conflicts if c.startswith(p + " – ")), p) for p in stuck]
+            raise SyncError("Skript (BEFORE) změnil soubory, které nemáte aktivované – nic se "
+                            "neodevzdalo:\n" + "\n".join(details[:15])
+                            + "\n\nSoubor nejdřív aktivujte ve skriptu příkazem ACTIVATE.")
+        activated = [p for p in activated if p in same or p in modified]
         if selected is not None:
             selected = set(selected) | {new_key(p) for p in touched if p in new_paths} \
-                | {modified[p] for p in touched if p in modified}
-        return plan, selected, touched
+                | {modified[p] for p in touched if p in modified} \
+                | {modified.get(p) or same[p] for p in activated}
+        return plan, selected, sorted(set(touched) | set(activated))
 
     def record_mirror_targets(self, name: str, res, label: str, server_id: str,
                               server_name: str) -> None:
@@ -1571,27 +1924,72 @@ class ProjectManager:
                         db.remove_mirror_target(file_id, res.target_key)
 
     def clear_stale_mirror_marks(self, name: str, files: list[ScriptFile],
-                                 keep: set[tuple[str, str]]) -> int:
+                                 keep: set[tuple[str, str]],
+                                 resolve: Callable[[dbm.MirrorTarget], "ProjectManager | None"] | None = None,
+                                 warnings: list[str] | None = None) -> int:
         """Po skriptech: změněné soubory odevzdání, které se do cíle tentokrát nezrcadlily
-        (skript zastaven, MIRROR přeskočen nebo selhal), ztratí označení „zrcadleno do“ –
-        kopie v cíli už neodpovídá. keep = (file_id, cíl) zrcadlené v tomto běhu.
-        Vrací počet odebraných označení."""
-        changed = {f.file_id for f in files if f.status != UNCHANGED and f.file_id}
+        (skript je vynechal, zastaven, MIRROR přeskočen nebo selhal), ztratí označení
+        „zrcadleno do“ a jejich kopie v cíli dostanou příznak „neaktuální“.
+        keep = (file_id, cíl) zrcadlené v tomto běhu; resolve = ProjectManager záložky cíle
+        (None = cíl není mezi záložkami – jen se odebere označení); nepovedený zápis do cíle
+        se přidá do warnings. Vrací počet odebraných označení."""
+        by_id = {f.file_id: f for f in files if f.status != UNCHANGED and f.file_id}
         server = self.server_dir(name)
-        if not changed or not db_path(server).exists():
+        if not by_id or not db_path(server).exists():
             return 0
         with ProjectDB.for_project(server) as db:
             marks = db.mirror_targets()
-        stale = [(fid, t.target) for fid in changed for t in marks.get(fid, [])
+            source_keys = {db.project_id() or "", str(server)} - {""}
+        stale = [(fid, t) for fid in by_id for t in marks.get(fid, [])
                  if (fid, t.target) not in keep]
         if not stale:
             return 0
+        # příznak „neaktuální“ v cílech (každý cíl zvlášť; nedostupný cíl nebrání úklidu zdroje)
+        targets: dict[str, tuple[dbm.MirrorTarget, dict[str, str]]] = {}
+        for fid, t in stale:
+            reason = dbm.STALE_DELETED if by_id[fid].status == DELETED else dbm.STALE_CHANGED
+            targets.setdefault(t.target, (t, {}))[1][fid] = reason
+        for t, reasons in targets.values():
+            try:
+                target_pm = resolve(t) if resolve else None
+                if target_pm is not None:
+                    Mirror.mark_stale(target_pm, Path(t.label).name, t.target, source_keys,
+                                      reasons, self.user)
+                elif warnings is not None:
+                    warnings.append(f"Cíl zrcadla {t.label} není mezi vašimi záložkami – kopie "
+                                    "v něm nedostaly příznak „neaktuální“.")
+            except (OSError, sqlite3.Error) as e:
+                if warnings is not None:
+                    warnings.append(f"Příznak „neaktuální“ v cíli {t.label} se nepodařilo zapsat: {e}")
         with WriteLock(server, self.user, self.pc):
             with ProjectDB.for_project(server) as db:
                 with db.conn:
-                    for fid, target in stale:
-                        db.remove_mirror_target(fid, target)
+                    for fid, t in stale:
+                        db.remove_mirror_target(fid, t.target)
         return len(stale)
+
+    def release_mirrored(self, name: str, paths: Iterable[str]) -> int:
+        """Uvolní neaktuální zrcadlené soubory v tomto (cílovém) projektu: zrcadlo je dál
+        nespravuje, jsou to běžné soubory projektu (lze je převzít a upravit). Aktuální
+        zrcadlené soubory se neuvolňují. Vrací počet uvolněných."""
+        server = self.server_dir(name)
+        if not db_path(server).exists():
+            return 0
+        wanted = {p.lower() for p in paths}
+        with self._write(server) as db:
+            files = db.active_files(include_pending=True)
+            stale = db.mirror_stale()
+            released = sorted((f for p, f in files.items() if p.lower() in wanted and f.file_id in stale),
+                              key=lambda f: f.path.lower())
+            if not released:
+                return 0
+            for f in released:
+                db.unset_mirrored(f.file_id)
+            names = ", ".join(f.path for f in released[:10])
+            more = f" a další ({len(released) - 10})" if len(released) > 10 else ""
+            db.add_commit(None, self.user, self.pc, dbm.MIRROR,
+                          f"Uvolněno ze zrcadla (neaktuální kopie): {names}{more}")
+        return len(released)
 
     def record_script_run(self, name: str, commit_id: int | None, action: str, scripts: list[str],
                           ok: bool, log: str) -> None:
@@ -1798,7 +2196,8 @@ class ProjectManager:
         # rychlé vyloučení podle velikosti/času, rozhoduje až obsah
         return same_stat(s.st_size, s.st_mtime, l.st_size, l.st_mtime) and file_hash(dst) == sha256
 
-    def _upload(self, server: Path, local: Path, lf: FileInfo, backup_existing: bool) -> str | None:
+    def _upload(self, server: Path, local: Path, lf: FileInfo, backup_existing: bool,
+                file_id: str | None = None) -> str | None:
         """Nahraje soubor na server; původní verzi případně zazálohuje. Vrací cestu zálohy."""
         rel = lf.path
         if self._already_uploaded(server, local, rel, lf.sha256):
@@ -1806,39 +2205,69 @@ class ProjectManager:
         dst = to_abs(server, rel)
         backup = None
         if backup_existing and dst.exists() and self.settings.backup_enabled:
-            backup = self._backup(server, rel)
+            backup = self._backup(server, rel, file_id)
         copy_with_hash(to_abs(local, rel), dst)
         return backup
 
     @staticmethod
-    def _version_in_backups(server: Path, rel: str, sha256: str | None) -> bool:
-        """Je verze souboru (podle hashe) mezi zálohami projektu?"""
+    def _backups_of(server: Path, file_id: str, db: ProjectDB | None = None) -> list[Path]:
+        """Zálohy souboru podle jeho identity (z historie), od nejstarší – i ty pod dřívější
+        cestou (před přejmenováním souboru nebo složky)."""
+        def query(conn_db: ProjectDB) -> list[str]:
+            rows = conn_db.conn.execute(
+                "SELECT backup_path FROM changes WHERE file_id = ? AND backup_path IS NOT NULL "
+                "ORDER BY change_id", (file_id,)).fetchall()
+            return [r[0] for r in rows]
+        if db is not None:
+            paths = query(db)
+        elif db_path(server).exists():
+            with ProjectDB.for_project(server) as own:
+                paths = query(own)
+        else:
+            paths = []
+        prefix = f"{SPM_DIR}/backup/"
+        return [to_abs(server, p) for p in dict.fromkeys(paths) if p.startswith(prefix)]
+
+    @classmethod
+    def _version_in_backups(cls, server: Path, file_id: str, sha256: str | None) -> bool:
+        """Je verze souboru (podle hashe) mezi jeho zálohami?"""
         if not sha256:
             return False
-        backup_dir = to_abs(server / SPM_DIR / "backup", rel).parent
-        name = rel.rsplit("/", 1)[-1].lower()
-        try:
-            candidates = [p for p in backup_dir.iterdir()
-                          if p.name.lower().startswith(name + ".backup")]
-        except OSError:
-            return False
-        return any(file_hash(p) == sha256 for p in candidates)
+        for path in cls._backups_of(server, file_id):
+            try:
+                if file_hash(path) == sha256:
+                    return True
+            except OSError:
+                continue
+        return False
 
-    def _backup(self, server: Path, rel: str) -> str:
-        """Přesune soubor do .spm/backup/<cesta>.backupXY a ponechá jen posledních N záloh."""
+    def _backup(self, server: Path, rel: str, file_id: str | None = None,
+                db: ProjectDB | None = None) -> str:
+        """Přesune soubor do .spm/backup/<cesta>.backupXY a ponechá jen posledních N záloh.
+
+        Zálohy patří souboru (file_id), ne cestě: po přejmenování souboru nebo složky jdou nové
+        zálohy do složky podle nového názvu a starší zůstávají pod původní cestou; počet N platí
+        pro všechny dohromady – nejstarší se mažou i z původní cesty a prázdné složky záloh
+        zaniknou. (Bez file_id se počítají zálohy se stejným názvem ve stejné složce.)"""
+        root = server / SPM_DIR / "backup"
         src = to_abs(server, rel)
-        backup_dir = to_abs(server / SPM_DIR / "backup", rel).parent
+        backup_dir = to_abs(root, rel).parent
         backup_dir.mkdir(parents=True, exist_ok=True)
         pattern = re.compile(re.escape(src.name) + r"\.backup(\d+)$", re.IGNORECASE)
-        existing = sorted(
+        in_dir = sorted(
             (int(m.group(1)), p) for p in backup_dir.iterdir() if (m := pattern.match(p.name))
         )
-        number = existing[-1][0] + 1 if existing else 1
+        number = in_dir[-1][0] + 1 if in_dir else 1  # číslo navazuje – nic se nepřepíše
         target = backup_dir / f"{src.name}.backup{number:02d}"
         os.replace(src, target)
+        if file_id is not None:
+            previous = [p for p in self._backups_of(server, file_id, db) if p.exists()]
+        else:
+            previous = [p for _, p in in_dir]
         keep = max(1, self.settings.backup_count)
-        for _, old in (existing + [(number, target)])[:-keep]:
+        for old in (previous + [target])[:-keep]:
             old.unlink(missing_ok=True)
+            remove_empty_parents(root, to_rel(root, old))
         return to_rel(server, target)
 
     @staticmethod

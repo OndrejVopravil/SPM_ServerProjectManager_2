@@ -26,7 +26,7 @@ def files_in(root: Path) -> list[str]:
                   if p.is_file() and ".spm" not in p.parts)
 
 
-def run_now(parent, title, fn, *args, on_done=None, on_error=None, **kwargs):
+def run_now(parent, title, fn, *args, on_done=None, on_error=None, status_text=None, **kwargs):
     try:
         res = fn(*args, progress=None, **kwargs)
     except Exception as e:  # noqa: BLE001
@@ -416,6 +416,34 @@ def test_target_tree_shows_mirror_source(window):
     nc = find_item(tree, "dily/nc_codes/E01.nc")
     assert (nc.text(1), nc.text(2)) == ("", "← O")
     assert find_item(tree, "dily").text(2) == "← O (2)"
+
+
+def test_target_tree_shows_stale_mirror_and_releases_it(window, monkeypatch):
+    from conftest import settle_panel
+    from PySide6.QtWidgets import QMessageBox
+    from tests_helpers_tree import find_item
+    use_script(window, MIRROR)
+    deactivate_with_change(window)                                     # E01, E02 zrcadleny
+    use_script(window, 'MIRROR commit "*.nc;!*E01.nc" TO "{TAB:W}"\n')
+    deactivate_with_change(window, lambda l: write(l / "dily/nc_codes/E01.nc", "E01 v3"))
+    window.tabs.setCurrentIndex(1)
+    select_project(window)
+    settle_panel(window.panel)
+    tree = window.panel.tree
+    e01 = find_item(tree, "dily/nc_codes/E01.nc")
+    assert e01.text(2) == "← O · neaktuální"
+    assert "nezrcadlil" in e01.toolTip(2) and "nezrcadlil" in e01.toolTip(0)
+    assert find_item(tree, "dily/nc_codes/E02.nc").text(2) == "← O"
+    assert "neaktuální: <b>1</b>" in window.panel.summary.text()
+    actions = window.panel.context_actions
+    assert actions("dily/nc_codes/E01.nc")["release_mirror"]
+    assert not actions("dily/nc_codes/E02.nc")["release_mirror"]
+    assert actions("dily/")["release_mirror"]
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    window.panel.release_mirror(["dily/"])
+    settle_panel(window.panel)
+    assert find_item(tree, "dily/nc_codes/E01.nc").text(2) == ""
+    assert find_item(tree, "dily/nc_codes/E02.nc").text(2) == "← O"
 
 
 def test_source_tree_shows_mirror_target(window):

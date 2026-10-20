@@ -55,8 +55,13 @@ def run_task(
     *args,
     on_done: Callable[[Any], None] | None = None,
     on_error: Callable[[str], None] | None = None,
+    status_text: str | None = None,
     **kwargs,
 ) -> Task:
+    """status_text: krátký text stavu pro okno, které má metodu task_status(text, hotovo,
+    celkem) – stavový text v řádku záložek (text None = úloha skončila)."""
+    notify = getattr(parent, "task_status", None)
+    status = status_text or title
     dlg = QProgressDialog(title, None, 0, 0, parent)
     dlg.setWindowTitle(title)
     dlg.setWindowModality(Qt.WindowModality.WindowModal)
@@ -71,12 +76,16 @@ def run_task(
         dlg.setMaximum(max(total, 1))
         dlg.setValue(done)
         dlg.setLabelText(f"{title}\n{text}" if text else title)
+        if notify:
+            notify(status, done, total)
 
     def finish() -> None:
         if dlg in _active_progress:
             _active_progress.remove(dlg)
         dlg.close()
         parent._running_task = None
+        if notify:
+            notify(None, 0, 0)
         task.wait()
         task.deleteLater()
 
@@ -96,5 +105,7 @@ def run_task(
     task.failed.connect(fail)
     parent._running_task = task  # udrží referenci, dokud vlákno běží
     _active_progress.append(dlg)
+    if notify:
+        notify(status, 0, 0)
     task.start()
     return task

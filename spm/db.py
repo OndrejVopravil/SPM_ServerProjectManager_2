@@ -133,6 +133,11 @@ CREATE INDEX IF NOT EXISTS ix_script_runs_commit ON script_runs(commit_id);
 
 # sloupce mirror_sources přidané později (tabulka mohla vzniknout dřív bez nich)
 MIRROR_SOURCE_COLUMNS = ("label", "server_id", "server_name")
+# sloupce mirror_files přidané později: zrcadlená kopie je neaktuální (zdroj se změnil, ale
+# do cíle se nezrcadlil) – kdy, kdo odevzdal a proč (changed / deleted)
+MIRROR_FILE_COLUMNS = ("stale_at", "stale_by", "stale_reason")
+STALE_CHANGED = "changed"
+STALE_DELETED = "deleted"
 
 
 @dataclass
@@ -151,6 +156,14 @@ class MirrorSource:
     label: str           # cesta ke zdrojovému projektu, jak ji viděl ten, kdo zrcadlil
     server_id: str = ""
     server_name: str = ""
+
+
+@dataclass
+class MirrorStale:
+    """Zrcadlená kopie v cíli je neaktuální – zdroj se změnil, ale do cíle se nezrcadlil."""
+    at: str              # kdy (ISO)
+    by: str              # kdo odevzdal
+    reason: str          # STALE_CHANGED / STALE_DELETED
 
 # Typy změn souborů
 ADDED = "added"
@@ -427,6 +440,10 @@ class ProjectDB:
         for column in MIRROR_SOURCE_COLUMNS:
             if column not in have:
                 self.conn.execute(f"ALTER TABLE mirror_sources ADD COLUMN {column} TEXT")
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(mirror_files)")}
+        for column in MIRROR_FILE_COLUMNS:
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE mirror_files ADD COLUMN {column} TEXT")
         self.conn.commit()
 
     def mirror_sources(self) -> dict[str, MirrorSource]:
@@ -515,6 +532,29 @@ class ProjectDB:
 
     def unset_mirrored(self, file_id: str) -> None:
         self.conn.execute("DELETE FROM mirror_files WHERE file_id = ?", (file_id,))
+
+    def set_mirror_stale(self, file_id: str, by: str, reason: str) -> None:
+        """Zrcadlená kopie je neaktuální (po ensure_mirror_tables)."""
+        self.conn.execute("UPDATE mirror_files SET stale_at = ?, stale_by = ?, stale_reason = ? "
+                          "WHERE file_id = ?", (now_iso(), by, reason, file_id))
+
+    def clear_mirror_stale(self, file_id: str) -> None:
+        """Kopie je znovu aktuální (zrcadlo ji právě ověřilo / nahrálo)."""
+        try:
+            self.conn.execute("UPDATE mirror_files SET stale_at = NULL, stale_by = NULL, "
+                              "stale_reason = NULL WHERE file_id = ?", (file_id,))
+        except sqlite3.OperationalError:
+            pass  # starší tabulka bez sloupců – nic neaktuálního v ní není
+
+    def mirror_stale(self) -> dict[str, MirrorStale]:
+        """file_id -> neaktuální zrcadlená kopie (soubory, které zdroj nezrcadlil)."""
+        try:
+            rows = self.conn.execute(
+                "SELECT m.file_id, m.stale_at, m.stale_by, m.stale_reason FROM mirror_files m "
+                "JOIN files f USING(file_id) WHERE f.deleted = 0 AND m.stale_at IS NOT NULL").fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {r[0]: MirrorStale(r[1], r[2] or "", r[3] or STALE_CHANGED) for r in rows}
 
     def last_commit_id(self) -> int | None:
         return self.conn.execute("SELECT MAX(commit_id) FROM commits").fetchone()[0]

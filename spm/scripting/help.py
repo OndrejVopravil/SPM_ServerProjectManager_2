@@ -16,7 +16,8 @@ COMMANDS = [
 FUNCTIONS = [
     ("count", "COUNT"), ("first", "FIRST"), ("last", "LAST"), ("one", "ONE"), ("upper", "UPPER"),
     ("lower", "LOWER"), ("replace_f", "REPLACE"), ("match", "MATCH"), ("tab", "TAB"),
-    ("ask", "ASK"), ("input", "INPUT"), ("choose", "CHOOSE"), ("secret", "SECRET"),
+    ("activate", "ACTIVATE"), ("format", "FORMAT"), ("ask", "ASK"), ("input", "INPUT"), ("choose", "CHOOSE"),
+    ("secret", "SECRET"),
 ]
 
 
@@ -25,7 +26,8 @@ def _index() -> str:
         return " · ".join(f'<a href="#{a}">{t}</a>' for a, t in items)
     return (f'<p><b>Základy:</b> <a href="#zaklady">Jak skript běží</a> · <a href="#zapis">Zápis</a> · '
             f'<a href="#mnoziny">Množiny souborů</a> · <a href="#promenne">Vestavěné proměnné</a> · '
-            f'<a href="#vlastnosti">Vlastnosti souboru</a> · <a href="#podminky">Podmínky</a> · '
+            f'<a href="#vlastnosti">Vlastnosti souboru</a> · <a href="#pocitani">Počítání</a> · '
+            f'<a href="#podminky">Podmínky</a> · '
             f'<a href="#cesty">BASE / KEEP / FLAT</a> · <a href="#editor">Editor</a> · '
             f'<a href="#ukazky">Ukázky</a></p>'
             f'<p><b>Příkazy:</b> {links(COMMANDS)}</p><p><b>Funkce:</b> {links(FUNCTIONS)}</p>')
@@ -139,10 +141,38 @@ má vlastnosti. Příklad pro <code>Zakazka/Dily/A/1234_hridel.nc</code>:</p>
 <p>Vlastnosti name, stem, ext, folder, parent(n) a dir má i obyčejný text s cestou:
 <code>SET p = "C:\\data\\x.zip"</code> → <code>{p.stem}</code> = x.</p>
 
+<a name="pocitani"></a><h3>Počítání</h3>
+<p>Sčítání <code>+</code>, odčítání <code>-</code>, násobení <code>*</code>, dělení <code>/</code>
+a závorky. Násobení a dělení mají přednost: <code>2 + 3 * 4</code> = 14,
+<code>(2 + 3) * 4</code> = 20. Počítat lze všude, kde se zadává hodnota – v SET, v podmínkách,
+v argumentech funkcí i ve složených závorkách v textu.</p>
+<ul>
+<li>Desetinné číslo se ve skriptu píše s <b>tečkou</b>: <code>1.21</code> (čárka odděluje
+argumenty funkcí).</li>
+<li>Text, který je číslem, se při počítání převede sám – i s desetinnou čárkou: hodnota
+z <a href="#input">INPUT</a> „2,5“ nebo z <a href="#parse">PARSE</a> „015“.</li>
+<li>Celá čísla zůstávají celá (<code>7 / 2</code> = 3,5, ale <code>8 / 2</code> = 4).
+Desetinné číslo se do textu vypíše s desetinnou čárkou a nejvýš 6 místy bez koncových nul
+(10 / 3 → 3,333333); přesný tvar určí <a href="#format">FORMAT</a>.</li>
+<li>Dělení nulou a počítání s textem, který není číslem, je chyba. Text se spojuje
+v uvozovkách: <code>"{a}{b}"</code>.</li>
+<li>Formát čísla rovnou při nastavení proměnné: <code>SET x = výraz FORMAT "000.00"</code> –
+proměnná si ho pamatuje a dostane ho každé další číslo, které se do ní uloží.</li>
+</ul>
+<pre>SET kusy = COUNT(commit "*.nc")
+SET dalsi = kusy + 1
+SET cena = (kusy * 150 + 200) * 1.21 FORMAT "0.00"     # 4 kusy → 968.00
+PARSE f.name "{zakazka}_{pozice}.h"
+SET dalsi_pozice = pozice + 10 FORMAT "000"             # "015" → 025
+IF kusy * 2 > 10
+    LOG "Hodně programů: {kusy}, další číslo {dalsi}, cena {cena}"
+END
+LOG "Průměr: {FORMAT(cena / kusy, "0,00")} Kč"</pre>
+
 <a name="podminky"></a><h3>Podmínky</h3>
 <table border="1" cellspacing="0" cellpadding="3">
 <tr><td><code>a == b</code>, <code>a != b</code></td><td>rovná se / nerovná se (texty bez ohledu na velikost písmen)</td></tr>
-<tr><td><code>&lt; &gt; &lt;= &gt;=</code></td><td>porovnání – čísla číselně, texty abecedně</td></tr>
+<tr><td><code>&lt; &gt; &lt;= &gt;=</code></td><td>porovnání – čísla číselně (i texty, které jsou číslem: „015“ = 15), jiné texty abecedně</td></tr>
 <tr><td><code>a CONTAINS b</code></td><td>text a obsahuje b</td></tr>
 <tr><td><code>a STARTS b</code>, <code>a ENDS b</code></td><td>začíná / končí na</td></tr>
 <tr><td><code>a LIKE "*.nc"</code></td><td>odpovídá vzoru (* a ?)</td></tr>
@@ -176,11 +206,21 @@ END</pre>
 <h2>Příkazy</h2>
 
 <a name="set"></a><h3>SET – proměnná</h3>
-<p><code>SET název = hodnota</code> – uloží text, číslo, soubor nebo množinu. Vestavěné
-proměnné (PROJECT, DATE…) přepsat nelze.</p>
+<p><code>SET název = hodnota [FORMAT "maska"]</code> – uloží text, číslo, výsledek
+<a href="#pocitani">výpočtu</a>, soubor nebo množinu. Vestavěné proměnné (PROJECT,
+DATE…) přepsat nelze. Názvy: písmena, číslice a _, na velikosti písmen nezáleží.</p>
+<p><b>FORMAT</b> (viz funkce <a href="#format">FORMAT</a>) určí tvar čísla a proměnná si ho
+<b>pamatuje</b>: každé další číslo, které se do ní uloží (dalším SET, z INPUT, FORM…),
+dostane stejný tvar. Jiný FORMAT u stejné proměnné tvar změní; text, který není číslem,
+se uloží beze změny. Formát platí jen pro tuto proměnnou – <code>SET b = a</code> zkopíruje
+hodnotu, ne formát.</p>
 <pre>SET cil = "P:\\Predani\\{PROJECT}"
 SET prog = FIRST(commit "*.nc")
-SET pocet = COUNT(commit "*.h")</pre>
+SET pocet = COUNT(commit "*.h")
+SET dalsi = pocet + 1
+SET cislo = pocet * 10 FORMAT "0000"          # 3 → 0030
+SET a = 1 FORMAT "000"                        # 001
+SET a = a + 1                                 # 002 – formát zůstává</pre>
 
 <a name="files"></a><h3>FILES – množina souborů</h3>
 <p><code>FILES název = zdroj "maska" [STATUS stav, stav…]</code> – zdroj je <code>commit</code>
@@ -294,6 +334,11 @@ aktivovat ani převzít – mění je jen zrcadlo. Podle stavu: nové a změněn
 (stará verze do zálohy cíle), přejmenované se přejmenují, smazané se smažou (do koše projektu
 v cíli), beze změny se zkontrolují a případně doplní. Ve zdrojovém projektu se soubory
 označí „→ cíl“ (sloupec Zrcadlo ve stromu). Nelze v BEFORE.</p>
+<p>Když se změněný (nebo smazaný) soubor tentokrát do cíle nezrcadlí – skript ho vynechal
+maskou, MIRROR přeskočil, nebo skript skončil chybou – ztratí ve zdroji označení „→ cíl“
+a jeho kopie v cíli se označí „← zdroj · neaktuální“ (oranžově). Příznak zmizí při dalším
+zrcadlení souboru. V cíli lze neaktuální soubor pravým tlačítkem <i>Uvolnit ze zrcadla</i>
+– pak je to běžný soubor cílového projektu.</p>
 <pre>MIRROR nc TO "{TAB:Výroba}"                          # stejný projekt, stejné cesty
 MIRROR nc TO "{TAB:Výroba}/{PROJECT}/NCFiles" KEEP 1  # do složky NCFiles
 MIRROR nc TO "{TAB:Výroba}/CAM_{PROJECT}" FLAT        # do jiného projektu</pre>
@@ -325,8 +370,14 @@ kdo je smí měnit, určují práva ke složce na síti.</p>
 <p>Příkazy v bloku <code>BEFORE … END</code> běží <b>před nahráním</b> nad soubory vybranými
 k odevzdání. Jen tady smí skript vytvářet a přepisovat soubory v místní kopii projektu
 (<code>{LOCAL_DIR}</code>) – vytvořené a změněné soubory se <b>automaticky odevzdají</b> spolu
-s ostatními (jedno odevzdání, jeden komentář). Přepsaný soubor, který nemáte zamčený, se sám
-zamkne; drží-li ho někdo jiný, nic se neodevzdá.</p>
+s ostatními (jedno odevzdání, jeden komentář).</p>
+<p><b>Soubory, které nemáte aktivované:</b> skript nesmí potichu přepsat existující soubor
+projektu, který nemáte zamčený. Když do něj chce zapsat (WRITE, APPEND, COPY, ZIP, UNZIP),
+zeptá se, zda ho aktivovat a přepsat – <i>Ano</i> soubor zamkne, stáhne jeho aktuální verzi
+ze serveru a teprve pak do něj zapíše; <i>Ne</i> = chyba a nic se neodevzdá. Drží-li soubor
+někdo jiný (nebo ho spravuje zrcadlo), je to chyba vždy. Bez ptaní soubor aktivujete předem
+příkazem <a href="#activate">ACTIVATE</a>. Soubor změněný programem (RUN), který nemáte
+aktivovaný, se neodevzdá – odevzdání skončí chybou.</p>
 <ul>
 <li>Mazat a přejmenovávat soubory projektu ani zrcadlit (MIRROR) v BEFORE nelze.</li>
 <li>Když BEFORE selže (STOP, Storno, chyba), <b>nic se neodevzdá</b>.</li>
@@ -415,6 +466,56 @@ LOG "{FIRST(nc).name}"</pre>
 <a name="one"></a><h3>ONE(množina) – právě jeden soubor</h3>
 <p>Musí odpovídat právě jeden soubor. Žádný = chyba; víc = nabídne výběr (bez okna chyba).</p>
 <pre>SET prog = ONE(commit "*hridel*.nc")</pre>
+
+<a name="format"></a><h3>FORMAT(číslo, "maska") – tvar čísla</h3>
+<p>Maska je z nul a nepovinného oddělovače (tečka nebo čárka):</p>
+<ul>
+<li>nuly <b>před</b> oddělovačem = nejmenší počet cifer celé části (chybějící se doplní nulami
+zleva; delší číslo se nezkrátí),</li>
+<li>nuly <b>za</b> oddělovačem = přesný počet desetinných míst (zaokrouhlí se, 5 nahoru),</li>
+<li>oddělovač masky se použije i ve výsledku; bez oddělovače se zaokrouhlí na celé číslo.</li>
+</ul>
+<table border="1" cellspacing="0" cellpadding="3">
+<tr><th>Hodnota</th><th>Maska</th><th>Výsledek</th></tr>
+<tr><td>7</td><td><code>"000"</code></td><td>007</td></tr>
+<tr><td>3.14159</td><td><code>"0.00"</code></td><td>3.14</td></tr>
+<tr><td>3.05</td><td><code>"00,0"</code></td><td>03,1</td></tr>
+<tr><td>2.5</td><td><code>"0"</code></td><td>3</td></tr>
+<tr><td>1234.5</td><td><code>"00.0"</code></td><td>1234.5</td></tr>
+</table>
+<pre>LOG "Pozice {FORMAT(pozice, "000")}"
+SET soubor = "{PROJECT}_{FORMAT(COUNT(nc), "00")}.zip"
+SET cena = 1452.5 FORMAT "0,00"             # stejné jako SET cena = FORMAT(1452.5, "0,00")</pre>
+
+<a name="activate"></a><h3>ACTIVATE – aktivace souboru projektu (příkaz i funkce)</h3>
+<p><code>ACTIVATE "soubor"</code> nebo <code>IF ACTIVATE("soubor")</code> – jen v
+<a href="#before">BEFORE</a>. Soubor se zadá úplnou cestou v místní kopii
+(<code>"{LOCAL_DIR}/test.txt"</code>), na serveru, cestou v projektu (<code>"test.txt"</code>)
+nebo jako soubor z množiny.</p>
+<table border="1" cellspacing="0" cellpadding="3">
+<tr><th>Soubor</th><th>Co se stane</th><th>Funkce vrátí</th></tr>
+<tr><td>v projektu není</td><td>nic – skript pokračuje (soubor může vytvořit, odevzdá se jako nový)</td><td>0</td></tr>
+<tr><td>existuje, nikdo ho nedrží</td><td>zamkne se, stáhne se jeho aktuální verze ze serveru a přidá
+se do množiny <code>commit</code> (odevzdá se a uvolní)</td><td>1</td></tr>
+<tr><td>už ho máte aktivovaný</td><td>přidá se do <code>commit</code></td><td>1</td></tr>
+<tr><td>drží ho jiný / spravuje ho zrcadlo</td><td>nic – důvod se zapíše do záznamu</td><td>0</td></tr>
+</table>
+<pre>BEFORE
+    ACTIVATE "{LOCAL_DIR}/test.txt"
+    FILES txt = commit "test.txt"
+    IF COUNT(txt) > 0                       # existoval – připsat
+        APPEND "{LOCAL_DIR}/test.txt"
+            {DATE} {USER}: {COMMENT}
+        END
+    ELSE                                     # nový soubor
+        WRITE "{LOCAL_DIR}/test.txt"
+            {DATE} {USER}: {COMMENT}
+        END
+    END
+    IF NOT ACTIVATE("Export/seznam.csv")
+        LOG "seznam.csv se vytvoří nově"
+    END
+END</pre>
 
 <a name="upper"></a><h3>UPPER(text) – velká písmena</h3>
 <pre>SET kod = UPPER(prog.stem)          # hridel_a → HRIDEL_A</pre>

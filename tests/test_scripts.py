@@ -1,5 +1,6 @@
 """Skripty odevzdání: jazyk, příkazy, MIRROR a napojení na odevzdání."""
 import json
+import re
 import stat
 import zipfile
 from datetime import datetime
@@ -502,6 +503,75 @@ def test_skipped_mirror_removes_marks_of_changed_files(env):
     assert source_targets(env)["dily/nc_codes/E01.nc"] == [("058768", "dily/nc_codes/E01.nc")]
 
 
+def target_entries(env) -> dict:
+    return {x.path: x for x in env.bob_w.file_entries("058768")}
+
+
+def test_excluded_changed_file_is_stale_in_target(env):
+    """Změněný soubor, který skript vynechal: ve zdroji ztratí značku, v cíli je neaktuální."""
+    ok(run(env.make(), MIRROR_NC))
+    assert not any(x.mirror_stale for x in target_entries(env).values())
+
+    def edit(local):
+        write(local / "dily/nc_codes/E01.nc", "E01 v2")
+        (local / "dily/nc_codes/E02.nc").unlink()
+    e = submit(env, edit)
+    report = ok(run(e, 'MIRROR commit "dily/**/*.nc;!*E01.nc;!*E02.nc" TO "{TAB:Výroba}"'))
+    assert any("neaktuální" in l for l in report.log)
+    assert source_targets(env) == {}
+    entries = target_entries(env)
+    e01, e02 = entries["dily/nc_codes/E01.nc"], entries["dily/nc_codes/E02.nc"]
+    assert (e01.mirror_stale.reason, e01.mirror_stale.by) == ("changed", "alice")
+    assert e02.mirror_stale.reason == "deleted"                    # v cíli zůstal
+    assert (env.w / "058768/dily/nc_codes/E01.nc").read_text(encoding="utf-8") == "E01 v1"
+    # další zrcadlení souboru příznak smaže
+    ok(run(e, MIRROR_NC))
+    entries = target_entries(env)
+    assert "dily/nc_codes/E02.nc" not in entries
+    assert entries["dily/nc_codes/E01.nc"].mirror_stale is None
+    assert (env.w / "058768/dily/nc_codes/E01.nc").read_text(encoding="utf-8") == "E01 v2"
+
+
+def test_stale_mirror_cleared_when_content_already_current(env):
+    """Neaktuální kopie, kterou další MIRROR ověří beze změny obsahu (např. opakovaný běh)."""
+    ok(run(env.make(), MIRROR_NC))
+    e = submit(env, lambda local: write(local / "dily/nc_codes/E01.nc", "E01 v2"))
+    ok(run(e, MIRROR_NC))                                           # zrcadleno
+    e.ui = FakeUI(ask=False)
+    ok(run(e, MIRROR_IF_ASKED))                                     # přeskočeno – neaktuální
+    assert target_entries(env)["dily/nc_codes/E01.nc"].mirror_stale is not None
+    e.ui = FakeUI(ask=True)
+    ok(run(e, MIRROR_IF_ASKED))                                     # obsah v cíli už odpovídá
+    assert target_entries(env)["dily/nc_codes/E01.nc"].mirror_stale is None
+
+
+def test_release_stale_mirrored_file(env):
+    ok(run(env.make(), MIRROR_NC))
+    e = submit(env, lambda local: write(local / "dily/nc_codes/E01.nc", "E01 v2"))
+    ok(run(e, 'MIRROR commit "dily/**/*.nc;!*E01.nc" TO "{TAB:Výroba}"'))
+    # aktuální E02 se neuvolní, neaktuální E01 ano
+    assert env.bob_w.release_mirrored("058768", ["dily/nc_codes/E01.nc", "dily/nc_codes/E02.nc"]) == 1
+    entries = target_entries(env)
+    assert entries["dily/nc_codes/E01.nc"].mirror is None and entries["dily/nc_codes/E01.nc"].free
+    assert entries["dily/nc_codes/E02.nc"].mirror is not None
+    with ProjectDB.for_project(env.w / "058768") as db:
+        assert "Uvolněno ze zrcadla" in db.commits()[0]["comment"]
+    env.bob_w.activate("058768", lock_paths=["dily/nc_codes/E01.nc"])  # už jde převzít
+    # zdroj ho znovu zrcadlí – drží ho bob, takže konflikt (nic se nepřepíše)
+    assert not run(e, MIRROR_NC).ok
+    assert (env.w / "058768/dily/nc_codes/E01.nc").read_text(encoding="utf-8") == "E01 v1"
+
+
+def test_stale_target_not_in_tabs_only_warns(env):
+    ok(run(env.make(), MIRROR_NC))
+    e = submit(env, lambda local: write(local / "dily/nc_codes/E01.nc", "E01 v2"))
+    e.tabs = e.tabs[:1]                                             # cíl není mezi záložkami
+    report = ok(run(e, 'LOG "nic"'))
+    assert any("není mezi vašimi záložkami" in l for l in report.log)
+    assert "dily/nc_codes/E01.nc" not in source_targets(env)
+    assert target_entries(env)["dily/nc_codes/E01.nc"].mirror_stale is None
+
+
 def test_stopped_or_broken_script_removes_marks(env):
     ok(run(env.make(), MIRROR_NC))
     e = submit(env, lambda local: write(local / "dily/nc_codes/E01.nc", "E01 v2"))
@@ -872,15 +942,17 @@ def activate_and_edit(e):
     return local
 
 
-def two_phases(e, script, selected=None, end_session=True):
+def two_phases(e, script, selected=None, end_session=True, ui=None):
     """Odevzdání jako v aplikaci: BEFORE -> převzetí vytvořených souborů -> nahrání -> zbytek."""
     pm = e.alice
     plan = pm.plan_upload("058768")
     assignments = plan.default_assignments()
     env = e.make(selection_files(plan, assignments, selected), commit_id=None)
+    env.ui = ui
     session = ScriptSession(env, [("s.spm", script)])
     assert session.run_before(), session.report.text
-    plan2, selected2, added = pm.adopt_script_outputs("058768", plan, selected)
+    plan2, selected2, added = pm.adopt_script_outputs("058768", plan, selected,
+                                                      activated=session.interp.activated)
     res = pm.upload(plan2, assignments, "zmena", selected2, end_session)
     session.run_after(res.script_files, res.commit_id)
     return session.report, res, added
@@ -901,15 +973,34 @@ def test_before_creates_file_that_is_submitted_and_mirrored(env):
     assert not local.exists()                                              # deaktivace uklidila
 
 
-def test_before_overwrites_existing_file_locks_it(env):
+def before_session(e, script, ui=None):
+    plan = e.alice.plan_upload("058768")
+    env = e.make(selection_files(plan, plan.default_assignments(), None), commit_id=None)
+    env.ui = ui
+    return plan, ScriptSession(env, [("s.spm", script)])
+
+
+def test_before_overwrite_of_unlocked_file_asks(env):
     activate_and_edit(env)
     two_phases(env, ZIP_BEFORE)                                   # zip je v projektu
+    zip_on_server = (env.o / "058768" / "Export" / "058768.zip").read_bytes()
+
     # nová aktivace jen s E01 – zip mám jen pro čtení (nezamčený)
-    env.alice.activate("058768", lock_paths=["dily/nc_codes/E01.nc"])
-    local = env.alice.local_dir("058768")
-    write(local / "dily/nc_codes/E01.nc", "E01 v3")
-    report, res, added = two_phases(env, ZIP_BEFORE)
+    def reactivate():
+        env.alice.activate("058768", lock_paths=["dily/nc_codes/E01.nc"])
+        write(env.alice.local_dir("058768") / "dily/nc_codes/E01.nc", "E01 v3")
+
+    reactivate()
+    plan, session = before_session(env, ZIP_BEFORE)               # bez okna – nelze se zeptat
+    assert not session.run_before() and "neaktivovaného souboru Export/058768.zip" in session.report.error
+    assert "ACTIVATE" in session.report.error
+    plan, session = before_session(env, ZIP_BEFORE, FakeUI(ask=False))   # uživatel odmítne
+    assert not session.run_before() and "odmítnut" in session.report.error
+    assert (env.o / "058768" / "Export" / "058768.zip").read_bytes() == zip_on_server
+    ui = FakeUI(ask=True)                                         # uživatel souhlasí
+    report, res, added = two_phases(env, ZIP_BEFORE, ui=ui)
     assert report.ok, report.text
+    assert "nemáte aktivovaný" in ui.asked[0][2] and "Export/058768.zip" in ui.asked[0][2]
     assert added == ["Export/058768.zip"]
     assert {f.path: f.status for f in res.script_files}["Export/058768.zip"] == "modified"
     assert list((env.o / "058768" / ".spm" / "backup").rglob("058768.zip.backup01"))
@@ -920,15 +1011,120 @@ def test_before_cannot_overwrite_file_held_by_other(env):
                          user="bob", pc="PC-bob")
     bob.activate("058768", lock_paths=["dily/A/1234_hridel.h"])
     env.alice.activate("058768", lock_paths=["dily/nc_codes/E01.nc"])
-    local = env.alice.local_dir("058768")
-    write(local / "dily/nc_codes/E01.nc", "E01 v2")
-    plan = env.alice.plan_upload("058768")
-    session = ScriptSession(env.make(selection_files(plan, plan.default_assignments(), None)),
-                            [("s.spm", 'BEFORE\n  WRITE "{LOCAL_DIR}/dily/A/1234_hridel.h"\n  x\n  END\nEND')])
-    assert session.run_before()
-    with pytest.raises(SyncError, match="bob"):
-        env.alice.adopt_script_outputs("058768", plan, None)
+    write(env.alice.local_dir("058768") / "dily/nc_codes/E01.nc", "E01 v2")
+    plan, session = before_session(env, 'BEFORE\n  WRITE "{LOCAL_DIR}/dily/A/1234_hridel.h"\n  x\n  END\nEND',
+                                   FakeUI(ask=True))
+    assert not session.run_before() and "drží bob" in session.report.error
     assert (env.o / "058768" / "dily/A/1234_hridel.h").read_text(encoding="utf-8") == "hlavicka"
+
+
+def test_run_changing_unlocked_file_is_refused(env, tmp_path):
+    env.alice.activate("058768", lock_paths=["dily/nc_codes/E01.nc"])
+    write(env.alice.local_dir("058768") / "dily/nc_codes/E01.nc", "E01 v2")
+    target = env.alice.local_dir("058768") / "dily" / "A" / "1234_hridel.h"
+    prog = py_script(tmp_path, "import sys, os\nos.chmod(sys.argv[1], 0o666)\n"
+                               "open(sys.argv[1], 'w').write('zmeneno programem')\n")
+    plan, session = before_session(env, f'BEFORE\n  RUN "{PY}" "{prog}" "{target}"\nEND')
+    assert session.run_before(), session.report.text
+    with pytest.raises(SyncError, match="(?s)nemáte aktivované.*ACTIVATE"):
+        env.alice.adopt_script_outputs("058768", plan, None, activated=session.interp.activated)
+    assert (env.o / "058768" / "dily/A/1234_hridel.h").read_text(encoding="utf-8") == "hlavicka"
+
+
+TEST_TXT = """BEFORE
+    IF ACTIVATE("{LOCAL_DIR}/test.txt")
+        LOG "aktivován"
+    END
+    FILES txt = commit "test.txt"
+    IF COUNT(txt) > 0
+        APPEND "{LOCAL_DIR}/test.txt" LF
+            další {COMMENT}
+        END
+    ELSE
+        WRITE "{LOCAL_DIR}/test.txt" LF
+            první
+        END
+    END
+END
+"""
+
+
+def test_activate_then_append_or_write(env):
+    # 1. test.txt v projektu není – ACTIVATE vrátí 0, vytvoří se nový
+    activate_and_edit(env)
+    report, res, added = two_phases(env, TEST_TXT)
+    assert report.ok, report.text
+    assert "aktivován" not in report.log and any("v projektu není" in l for l in report.log)
+    assert (env.o / "058768" / "test.txt").read_text(encoding="utf-8") == "první\n"
+
+    # 2. test.txt existuje, nemám ho aktivovaný; mezitím ho bob změnil na serveru
+    env.alice.activate("058768", lock_paths=["dily/nc_codes/E01.nc"])
+    bob = ProjectManager(Settings(server_root=str(env.o), local_root=str(env.tmp / "l_bob")),
+                         user="bob", pc="PC-bob")
+    bob.activate("058768", lock_paths=["test.txt"])
+    write(bob.local_dir("058768") / "test.txt", "první\nbob\n")
+    bplan = bob.plan_upload("058768")
+    bob.deactivate(bplan, bplan.default_assignments(), "bob")
+    write(env.alice.local_dir("058768") / "dily/nc_codes/E01.nc", "E01 v3")
+    plan = env.alice.plan_upload("058768")
+    e01 = next(bf.file_id for bf, lf in plan.modified if lf.path.endswith("E01.nc"))
+    report, res, added = two_phases(env, TEST_TXT, selected={e01}, end_session=False)
+    assert report.ok, report.text
+    assert "aktivován" in report.log and "test.txt" in added
+    # připsáno k aktuální verzi ze serveru (bobova změna zůstala)
+    assert (env.o / "058768" / "test.txt").read_text(encoding="utf-8") == "první\nbob\ndalší komentář\n"
+    assert {f.path: f.status for f in res.script_files}["test.txt"] == "modified"
+    entries = {e.path: e for e in env.alice.file_entries("058768")}
+    assert entries["test.txt"].owner is None                      # odevzdáním se uvolnil
+
+
+def test_activate_cases(env, tmp_path):
+    bob = ProjectManager(Settings(server_root=str(env.o), local_root=str(env.tmp / "l_bob")),
+                         user="bob", pc="PC-bob")
+    bob.activate("058768", lock_paths=["dily/A/1234_hridel.h"])
+    env.alice.activate("058768", lock_paths=["dily/nc_codes/E01.nc"])
+    write(env.alice.local_dir("058768") / "dily/nc_codes/E01.nc", "E01 v2")
+    plan, session = before_session(env, """BEFORE
+    LOG "neni={ACTIVATE("neni.txt")} drzi={ACTIVATE("dily/A/1234_hridel.h")} moje={ACTIVATE("dily/nc_codes/E01.nc")}"
+    SET e02 = "{SERVER_DIR}/dily/nc_codes/E02.nc"
+    LOG "volny={ACTIVATE(e02)}"
+    ACTIVATE "{LOCAL_DIR}/stare/nc_codes/X.nc"
+    LOG "pocet={COUNT(commit STATUS unchanged)}"
+END""")
+    assert session.run_before(), session.report.text
+    log = session.report.log
+    assert "neni=0 drzi=0 moje=1" in log and "volny=1" in log and "pocet=2" in log
+    assert any("drží ho bob" in l for l in log)
+    assert sorted(session.interp.activated) == ["dily/nc_codes/E02.nc", "stare/nc_codes/X.nc"]
+    entries = {e.path: e for e in env.alice.file_entries("058768")}
+    assert entries["dily/nc_codes/E02.nc"].mine and entries["stare/nc_codes/X.nc"].mine
+
+
+@pytest.mark.parametrize("script, message", [
+    ('ACTIVATE "test.txt"', "jen v bloku BEFORE"),
+    ('BEFORE\n  ACTIVATE "C:/jinde/test.txt"\nEND', "neleží v projektu"),
+    ('BEFORE\n  ACTIVATE "../x.txt"\nEND', "neplatná cesta"),
+])
+def test_activate_errors(env, script, message):
+    activate_and_edit(env)
+    report = run(env.make(), script)
+    assert not report.ok and message in report.error
+
+
+def test_dry_run_does_not_lock_or_ask(env):
+    activate_and_edit(env)
+    two_phases(env, ZIP_BEFORE)
+    env.alice.activate("058768", lock_paths=["dily/nc_codes/E01.nc"])
+    write(env.alice.local_dir("058768") / "dily/nc_codes/E01.nc", "E01 v3")
+    ui = FakeUI(ask=True)
+    e = env.make()
+    e.ui = ui
+    report = ok(run(e, ZIP_BEFORE.replace("MIRROR", "#MIRROR") + 'BEFORE\n  ACTIVATE "stare/nc_codes/X.nc"\nEND\n',
+                    dry=True))
+    assert ui.asked == []
+    assert any("zeptá na aktivaci" in l for l in report.log) and any("nezamčeno" in l for l in report.log)
+    entries = {x.path: x for x in env.alice.file_entries("058768")}
+    assert not entries["Export/058768.zip"].mine and not entries["stare/nc_codes/X.nc"].mine
 
 
 def test_partial_submit_adds_created_file_to_selection(env):
@@ -1160,3 +1356,105 @@ def test_records_survive_pending_vars(env, tmp_path):
     again = ScriptSession(env.make(), [("s.spm", 'LOG "{r.code} {r.output}"')])
     again.import_vars(json.loads(json.dumps(session.export_vars())))
     assert again.run_after() and "0 ahoj" in again.report.log
+
+
+# --- počítání a FORMAT -------------------------------------------------------------------
+
+def test_arithmetic(env):
+    report = ok(run(env.make(), '''
+SET a = 2 + 3 * 4
+SET b = (2 + 3) * 4
+SET c = -b + 1 - -2
+SET d = 7 / 2
+SET e = 8 / 2
+SET f = 10 / 3
+SET g = 1.5 * 2
+SET n = COUNT(commit "*.nc") * 10 - 1
+LOG "{a}|{b}|{c}|{d}|{e}|{f}|{g}|{n}|{a * 2}|{(a + b) / 2}"
+'''))
+    assert "14|20|-17|3,5|4|3,333333|3|29|28|17" in report.log
+
+
+def test_numbers_from_text(env):
+    ui = FakeUI(input="2,5")
+    report = ok(run(with_ui(env, ui), '''
+SET x = INPUT("Koeficient")
+PARSE "pos_015.h" "pos_{p}.h"
+SET y = x * 2 + p
+LOG "{y}|{p + 0}"
+IF p == 15 AND p < 100 AND "9" < "10"
+    LOG "číselně"
+END
+IF "abc" < "abd"
+    LOG "abecedně"
+END
+'''))
+    assert "20|15" in report.log and "číselně" in report.log and "abecedně" in report.log
+
+
+def test_format(env):
+    report = ok(run(env.make(), '''
+SET a = 7 FORMAT "000"
+SET b = 3.14159 FORMAT "0.00"
+SET c = 3.05 FORMAT "00,0"
+SET d = 2.5 FORMAT "0"
+SET e = 1234.5 FORMAT "00.0"
+SET f = -0.001 FORMAT "0.00"
+LOG "{a}|{b}|{c}|{d}|{e}|{f}|{FORMAT(COUNT(commit), "00")}|{FORMAT("2,345", "0,00")}|{a + 1}"
+'''))
+    assert "007|3.14|03,1|3|1234.5|0.00|05|2,35|8" in report.log
+
+
+def test_format_stays_with_variable(env):
+    ui = FakeUI(input="7")
+    session = ScriptSession(with_ui(env, ui), [("s.spm", '''
+BEFORE
+    SET a = 1 FORMAT "000"
+    SET a = a + 1
+    LOG "a: {a}"
+END
+SET a = a * 10
+LOG "po: {a}"
+SET a = INPUT("Číslo")
+LOG "zadáno: {a}"
+SET a = "text"
+LOG "text: {a}"
+SET a = 2.5 FORMAT "0,0"
+SET a = a * 3
+LOG "nový formát: {a}"
+SET b = a
+LOG "jiná proměnná: {b}"
+''')])
+    assert session.run_before()
+    data = json.loads(json.dumps(session.export_vars()))       # formát přežije i opakovaný běh
+    assert session.run_after(), session.report.text
+    log = session.report.log
+    assert "a: 002" in log and "po: 020" in log and "zadáno: 007" in log
+    assert "text: text" in log and "nový formát: 7,5" in log and "jiná proměnná: 7,5" in log
+    again = ScriptSession(env.make(), [("s.spm", 'SET a = 5\nLOG "znovu: {a}"')])
+    again.import_vars({"s.spm": {k: v for k, v in data["s.spm"].items()}})
+    assert again.run_after() and "znovu: 005" in again.report.log
+
+
+@pytest.mark.parametrize("text, message", [
+    ('SET a = 1 / 0', "Dělení nulou"),
+    ('SET a = "abc" + 1', "„abc“ není číslo"),
+    ('SET a = commit + 1', "množina není číslo"),
+    ('SET a = 5 FORMAT "#.##"', "maska"),
+    ('SET a = "x" FORMAT "0"', "není číslo"),
+    ('LOG "{FORMAT(1)}"', "2 argumenty"),
+])
+def test_arithmetic_errors(env, text, message):
+    report = run(env.make(), text)
+    assert not report.ok and message in report.error
+
+
+@pytest.mark.parametrize("text, message", [
+    ("SET a = (1 + 2", "„)“"),
+    ("SET a = 1 +", "neúplný"),
+    ("SET a = * 2", "Očekává se hodnota"),
+    ('SET a = 1 FORMAT 2', "maska formátu"),
+])
+def test_arithmetic_syntax_errors(text, message):
+    with pytest.raises(ScriptSyntaxError, match=re.escape(message)):
+        lang.parse_script(text)

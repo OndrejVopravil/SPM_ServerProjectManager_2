@@ -72,3 +72,35 @@ def test_tree_shown_for_any_project(window):
     assert sorted(e.path for e in window.panel.entries) == ["Výkresy/a.dwg", "ok.txt"]
     actions = window.panel.context_actions("ok.txt")
     assert not any(actions[k] for k in ("submit", "take", "delete", "rename", "publish"))
+
+
+def test_create_project_from_context_menu(window, monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QInputDialog
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("Projekt_X", True))
+    window.create_project()
+    assert (tmp_path / "local" / "Projekt_X").is_dir()
+    p = window.selected()
+    assert p is not None and p.name == "Projekt_X" and p.local_only
+    assert window.act_rename.isEnabled()                         # neodevzdaný – lze přejmenovat
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("Projekt_Y", True))
+    window.rename_project()
+    assert (tmp_path / "local" / "Projekt_Y").is_dir() and not (tmp_path / "local" / "Projekt_X").exists()
+    p = window.selected()
+    assert p is not None and p.name == "Projekt_Y" and p.local_only
+
+
+def test_status_text_in_tab_row(window):
+    label = window.status_label
+    assert label.text().startswith("Aktualizováno")     # po načtení seznamu a kontrole názvů
+    window.task_status("Přenáším data…", 0, 0)
+    assert label.text() == "Přenáším data…"
+    window.task_status("Přenáším data…", 3, 10)
+    assert label.text() == "Přenáším data… 3/10"
+    window.set_busy("refresh", "Aktualizuji…")
+    assert label.text() == "Přenáším data… 3/10"       # akce má přednost
+    window.task_status(None, 0, 0)
+    assert label.text() == "Aktualizuji…"
+    window.set_busy("refresh", None)
+    assert label.text().startswith("Aktualizováno")
+    window._refreshed("cesta nenalezena")
+    assert label.text() == "Síť nedostupná" and label.toolTip() == "cesta nenalezena"

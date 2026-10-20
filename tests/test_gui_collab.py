@@ -274,10 +274,10 @@ def test_panel_context_actions_and_preselection(app, pms, tmp_path, monkeypatch)
     app.processEvents()
 
     ca = w.panel.context_actions
-    assert ca("sestava/elektrody/E01.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True}
-    assert ca("sestava/sestava.elt") == {"activate": False, "open": True, "submit": False, "take": False, "publish": False, "delete": False, "rename": False}  # drží alice, jen pro čtení
-    assert ca("dily/deska.elt") == {"activate": False, "open": True, "submit": False, "take": True, "publish": False, "delete": False, "rename": False}  # volný, jen pro čtení
-    assert ca("sestava/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False}
+    assert ca("sestava/elektrody/E01.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False}
+    assert ca("sestava/sestava.elt") == {"activate": False, "open": True, "submit": False, "take": False, "publish": False, "delete": False, "rename": False, "new_folder": True, "release_mirror": False}  # drží alice, jen pro čtení
+    assert ca("dily/deska.elt") == {"activate": False, "open": True, "submit": False, "take": True, "publish": False, "delete": False, "rename": False, "new_folder": True, "release_mirror": False}  # volný, jen pro čtení
+    assert ca("sestava/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False, "new_folder": True, "release_mirror": False}
 
     # menu panelu -> dialogy hlavního okna s předvýběrem
     got = []
@@ -364,8 +364,8 @@ def test_panel_shows_new_local_files(app, pms, tmp_path, monkeypatch):
     item = find(w.panel.tree, "sestava/elektrody/E03.elt")
     assert item.text(1) == "nový – neodevzdaný"
     assert item.foreground(0).color() == w.panel.palette().color(QPalette.ColorRole.PlaceholderText)
-    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True}
-    assert w.panel.context_actions("nc/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False}
+    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False}
+    assert w.panel.context_actions("nc/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False}  # jen moje nové soubory
     assert "nové neodevzdané: <b>2</b>" in w.panel.summary.text()
 
     w.panel._on_double_click(item, 0)
@@ -496,7 +496,7 @@ def test_panel_for_local_only_folder(app, pms, tmp_path, monkeypatch):
     app.processEvents()
     assert sorted(e.path for e in w.panel.entries) == ["dily/deska.elt", "dily/kolik.elt", "poznamky.txt"]
     assert w.panel.context_actions("dily/") == {"activate": False, "open": False, "submit": False, "take": False,
-                                                "publish": True, "delete": True, "rename": False}
+                                                "publish": True, "delete": True, "rename": True, "new_folder": True, "release_mirror": False}
     assert w.panel.context_actions("poznamky.txt")["open"] is True
     w.panel._on_double_click(find(w.panel.tree, "poznamky.txt"), 0)
     assert opened == [novy / "poznamky.txt"]
@@ -572,10 +572,42 @@ def test_panel_rename_with_f2(app, pms, tmp_path, monkeypatch):
     app.processEvents()
     assert (bob.local_dir("Forma") / "dily" / "deska_pevna.elt").exists()
     item = find(w.panel.tree, "dily/deska_pevna.elt")
-    assert item.text(1) == "přejmenován z dily/deska.elt – neodevzdaný"
+    assert item.text(1) == "přejmenován" and "Původně: dily/deska.elt" in item.toolTip(1)
     assert not any(e.path == "dily/deska.elt" for e in w.panel.entries)        # ne „smazán“
     keys = {a.shortcut().toString() for a in w.panel.tree.actions()}
     assert "F2" in keys
+    w.close()
+
+
+def test_panel_rename_folder_with_f2(app, pms, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+    alice, bob = pms
+    alice.activate("Forma", lock_paths=["sestava/elektrody/E01.elt"])  # E02 drží alice? ne – volný
+    bob.activate("Forma", lock_paths=["sestava/sestava.elt", "sestava/elektrody/E02.elt", "dily/deska.elt"])
+    w = _window(app, bob, tmp_path, monkeypatch)
+    acts = w.panel.context_actions
+    assert acts("dily/")["rename"] is True                       # vše uvnitř aktivované
+    assert acts("sestava/")["rename"] is False                   # E01 drží alice
+    assert acts("sestava/elektrody/")["rename"] is False
+    write = (bob.local_dir("Forma") / "dily" / "novy.elt")
+    write.write_text("novy")                                     # můj nový soubor – nevadí
+    w.panel.reload()
+    settle_panel(w.panel)
+    assert acts("dily/")["rename"] is True
+
+    shown = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: shown.append(a[2]))
+    answers = iter([("díly 2", True), ("dily2", True)])          # nejdřív nepovolené znaky
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: next(answers))
+    w.panel.tree.setCurrentItem(find(w.panel.tree, "dily"))
+    w.panel.rename_selected()                                    # = F2
+    settle_panel(w.panel)
+    app.processEvents()
+    assert shown and "nepovolené znaky" in shown[0]
+    local = bob.local_dir("Forma")
+    assert (local / "dily2" / "deska.elt").exists() and not (local / "dily").exists()
+    assert find(w.panel.tree, "dily2/deska.elt").text(1) == "cesta přejmenována"
     w.close()
 
 

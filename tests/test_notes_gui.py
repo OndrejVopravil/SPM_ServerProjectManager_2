@@ -129,7 +129,7 @@ def test_drafts_written_and_published_with_submission(qapp, pms, monkeypatch):
         # odevzdání: dialog ukáže rozepsané (zaškrtnuté) a zveřejní je
         seen = {}
 
-        def run_now(parent, title, fn, *args, on_done=None, on_error=None, **kwargs):
+        def run_now(parent, title, fn, *args, on_done=None, on_error=None, status_text=None, **kwargs):
             res = fn(*args, progress=None, **kwargs)
             if on_done:
                 on_done(res)

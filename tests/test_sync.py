@@ -358,9 +358,9 @@ def test_my_active_projects_listed_first(tmp_path):
     alice, bob = pm("alice"), pm("bob")
     alice.activate("Gama")
     alice.activate("Beta")
-    bob.activate("Alfa")    # cizí aktivace se neřadí nahoru
-    assert [p.name for p in alice.list_projects()] == ["Beta", "Gama", "Alfa", "Cizi_lokalni", "Delta"]
-    assert [p.name for p in bob.list_projects()] == ["Alfa", "Beta", "Delta", "Gama"]
+    bob.activate("Alfa")    # cizí aktivace až za místními (neodevzdanými), před volnými
+    assert [p.name for p in alice.list_projects()] == ["Beta", "Gama", "Cizi_lokalni", "Alfa", "Delta"]
+    assert [p.name for p in bob.list_projects()] == ["Alfa", "Beta", "Gama", "Delta"]
 
 
 # --- automatická deaktivace po odevzdání posledního drženého souboru -------------

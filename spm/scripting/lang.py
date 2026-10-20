@@ -26,9 +26,9 @@ class ScriptSyntaxError(Exception):
 _TOKEN_RE = re.compile(r"""
     (?P<space>\s+)
   | (?P<comment>\#.*)
-  | (?P<num>\d+)(?![^\W\d])
+  | (?P<num>\d+(?:\.\d+)?)(?![^\W\d])
   | (?P<name>[^\W\d]\w*)
-  | (?P<op>->|==|!=|<=|>=|[=<>(),.])
+  | (?P<op>->|==|!=|<=|>=|[=<>(),.+\-*/])
 """, re.X)
 
 
@@ -101,7 +101,20 @@ class Str:
 
 @dataclass
 class Num:
-    value: int
+    value: int | float
+
+
+@dataclass
+class BinOp:
+    """Počítání: + - * /."""
+    op: str
+    left: object
+    right: object
+
+
+@dataclass
+class Neg:
+    expr: object
 
 
 @dataclass
@@ -159,7 +172,7 @@ class Truthy:
 
 
 FUNCTIONS = {"FIRST", "LAST", "ONE", "COUNT", "UPPER", "LOWER", "REPLACE", "MATCH", "TAB",
-             "ASK", "INPUT", "CHOOSE", "SECRET"}
+             "ASK", "INPUT", "CHOOSE", "SECRET", "FORMAT", "ACTIVATE"}
 COMPARE_WORDS = {"CONTAINS", "STARTS", "ENDS", "LIKE"}
 STATUSES = ("added", "modified", "renamed", "deleted", "unchanged")
 # changed = vše kromě unchanged (i smazané – MIRROR je musí v cíli smazat; COPY / ZIP je přeskočí)
@@ -186,6 +199,7 @@ class Command:
 class SetCmd(Command):
     name: str
     expr: object
+    format: Str | None = None   # SET x = … FORMAT "000.00"
 
 
 @dataclass
@@ -289,6 +303,12 @@ class CallCmd(Command):
 
 
 @dataclass
+class ActivateCmd(Command):
+    """ACTIVATE "soubor" – v BEFORE aktivuje (zamkne) existující soubor projektu."""
+    path: object
+
+
+@dataclass
 class BeforeCmd(Command):
     """BEFORE … END: příkazy, které běží před nahráním odevzdání na server."""
     body: list
@@ -336,7 +356,7 @@ RESERVED = {"SET", "FILES", "PARSE", "IF", "ELSE", "END", "FOR", "IN", "COPY", "
             "STOP", "EXIT", "TO", "BASE", "KEEP", "FLAT", "NAME", "STATUS", "ENCODING", "CRLF",
             "LF", "AND", "OR", "NOT", "EXISTS", "CALL", "FORM", "ASK", "INPUT", "CHOOSE", "FROM",
             "DEFAULT", "BEFORE", "RUN", "POST", "WAIT", "NOWAIT", "HEADER", "TIMEOUT",
-            "SECRET"} | COMPARE_WORDS | PLANNED
+            "SECRET", "ACTIVATE"} | COMPARE_WORDS | PLANNED
 ENCODINGS = {"UTF-8": "utf-8", "UTF8": "utf-8", "UTF-8-BOM": "utf-8-sig", "UTF8BOM": "utf-8-sig",
              "CP1250": "cp1250", "ANSI": "cp1250", "WINDOWS-1250": "cp1250", "CP852": "cp852",
              "OEM": "cp852", "ASCII": "ascii"}
@@ -414,11 +434,41 @@ class _Line:
     # --- výrazy ---
 
     def expr(self):
+        """Výraz s počítáním: + a - , * a / (mají přednost), závorky, záporné číslo."""
+        node = self.term()
+        while True:
+            tok = self.peek()
+            if tok is None or tok.kind != "op" or tok.value not in "+-" or tok.value == "->":
+                return node
+            self.pos += 1
+            node = BinOp(tok.value, node, self.term())
+
+    def term(self):
+        node = self.factor()
+        while True:
+            tok = self.peek()
+            if tok is None or tok.kind != "op" or tok.value not in ("*", "/"):
+                return node
+            self.pos += 1
+            node = BinOp(tok.value, node, self.factor())
+
+    def factor(self):
+        if self.op("-"):
+            return Neg(self.factor())
+        if self.op("+"):
+            return self.factor()
+        if self.op("("):
+            node = self.expr()
+            self.expect_op(")")
+            return node
+        return self.primary()
+
+    def primary(self):
         tok = self.next()
         if tok.kind == "str":
             return Str(tok.value)
         if tok.kind == "num":
-            return Num(int(tok.value))
+            return Num(float(tok.value) if "." in tok.value else int(tok.value))
         if tok.kind != "name":
             raise self.error(f"Očekává se hodnota, ne „{tok.value}“.")
         upper = tok.value.upper()
@@ -758,6 +808,8 @@ def _parse_simple(keyword: str, cur: _Line, number: int):
         name = cur.name()
         cur.expect_op("=")
         cmd = SetCmd(keyword, number, name, cur.expr())
+        if cur.word("FORMAT"):
+            cmd.format = cur.string("maska formátu, např. \"000.00\"")
     elif keyword == "FILES":
         name = cur.name("název množiny")
         cur.expect_op("=")
@@ -799,6 +851,8 @@ def _parse_simple(keyword: str, cur: _Line, number: int):
         cmd = MessageCmd(keyword, number, cur.expr())
     elif keyword == "EXIT":
         cmd = ExitCmd(keyword, number)
+    elif keyword == "ACTIVATE":
+        cmd = ActivateCmd(keyword, number, cur.expr())
     elif keyword == "CALL":
         where = "server" if cur.word("SERVER") else "project" if cur.word("PROJECT") else "local"
         cmd = CallCmd(keyword, number, where, cur.expr())

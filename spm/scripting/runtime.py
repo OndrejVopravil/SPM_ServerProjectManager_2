@@ -24,6 +24,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Callable
 
@@ -42,6 +43,7 @@ RUN_TIMEOUT = 300      # s – RUN bez WAIT (program, který se zasekne, nesmí 
 POST_TIMEOUT = 30      # s – POST bez TIMEOUT
 LOG_OUTPUT_LINES = 30  # kolik posledních řádků výstupu RUN / odpovědi POST jde do záznamu
 SECRET_MASK = "•••"
+FORMAT_KEY = "#format:"  # mezi proměnnými: formát proměnné (# v názvu proměnné být nemůže)
 
 
 class Record:
@@ -68,6 +70,31 @@ def _decode(data: bytes) -> str:
 def _tail(text: str, lines: int = LOG_OUTPUT_LINES) -> list[str]:
     rows = text.strip().splitlines()
     return (["   …"] if len(rows) > lines else []) + ["   " + r for r in rows[-lines:]]
+
+
+DECIMALS_SHOWN = 6  # desetinná čísla bez FORMAT: nejvýš tolik míst (bez koncových nul)
+_FORMAT_RE = re.compile(r"(0+)(?:([.,])(0+))?")
+
+
+def number_text(value: float) -> str:
+    """Desetinné číslo jako text: desetinná čárka, bez zbytečných nul (2.50 -> 2,5)."""
+    text = f"{value:.{DECIMALS_SHOWN}f}".rstrip("0").rstrip(".")
+    return "0" if text in ("-0", "") else text.replace(".", ",")
+
+
+def format_number(value: int | float, mask: str) -> str:
+    """FORMAT: maska z nul – před oddělovačem nejmenší počet cifer (doplní se nulami),
+    za ním přesný počet desetinných míst (zaokrouhlí se, 5 nahoru). Oddělovač masky
+    (tečka / čárka) se použije i ve výsledku. "000" -> 007, "0.00" -> 3.14, "00,0" -> 03,1."""
+    m = _FORMAT_RE.fullmatch(mask.strip())
+    if m is None:
+        raise ValueError(f"FORMAT: maska „{mask}“ – použijte nuly a oddělovač, např. \"000\", "
+                         "\"0.00\", \"000,0\".")
+    digits, sep, decimals = len(m.group(1)), m.group(2) or "", len(m.group(3) or "")
+    number = Decimal(str(value)).quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
+    sign = "-" if number < 0 else ""
+    whole, _, frac = f"{abs(number):.{decimals}f}".partition(".")
+    return sign + whole.zfill(digits) + (sep + frac if decimals else "")
 
 
 def _quote(arg: str) -> str:
@@ -240,6 +267,8 @@ class Interpreter:
         self.phase = "after"  # before = blok BEFORE (před nahráním), after = po nahrání
         self.created_local: set[str] = set()  # zkušební běh: soubory, které by BEFORE vytvořil v projektu
         self.used_secrets: set[str] = set()
+        self.activated: list[str] = []  # soubory projektu aktivované skriptem v BEFORE
+        self._writable_rel: set[str] = set()  # soubory, do kterých už smí zapisovat (kontrola proběhla)
         self.mirrored: set[tuple[str, str]] = set()  # (file_id ve zdroji, cílový projekt) z MIRROR
 
     # --- běh ---
@@ -309,6 +338,8 @@ class Interpreter:
         if isinstance(value, list):
             raise self.error("Množinu souborů nelze vložit do textu – použijte např. {COUNT(množina)} "
                              "nebo FOR. (Číslo odevzdání je {COMMIT_ID}.)")
+        if isinstance(value, float):
+            return number_text(value)
         if isinstance(value, Record):
             fields = ", ".join(f"{{x.{k}}}" for k in value.fields)
             raise self.error(f"Výsledek {value.kind} nelze vložit do textu celý – použijte vlastnost: "
@@ -337,6 +368,11 @@ class Interpreter:
     def eval(self, node):
         if isinstance(node, lang.Str):
             return self.interp(node.raw)
+        if isinstance(node, lang.BinOp):
+            return self.arithmetic(node.op, self.eval(node.left), self.eval(node.right))
+        if isinstance(node, lang.Neg):
+            value = self.number(self.eval(node.expr), "-")
+            return -value
         if isinstance(node, lang.Num):
             return node.value
         if isinstance(node, lang.Var):
@@ -412,6 +448,12 @@ class Interpreter:
         if f == "TAB":
             need(1)
             return self.tab_by_name(self.text(args[0])).server_root
+        if f == "ACTIVATE":
+            need(1)
+            return 1 if self.activate(args[0]) else 0
+        if f == "FORMAT":
+            need(2)
+            return self.format(args[0], self.text(args[1]))
         if f == "SECRET":
             need(1)
             name = self.text(args[0]).strip()
@@ -512,6 +554,100 @@ class Interpreter:
         raise self.error(f"Neznámá vlastnost .{name} (možné: name, stem, ext, folder, dir, "
                          "parent(n), path, full, status, old_path, old_name, size).")
 
+    # --- aktivace souborů projektu (BEFORE) ---
+
+    def project_rel(self, value) -> str:
+        """Cesta souboru v projektu: soubor, úplná cesta v místní kopii / na serveru, nebo
+        cesta relativní k projektu."""
+        if isinstance(value, ScriptFile):
+            return value.path
+        if not isinstance(value, str) or not value.strip():
+            raise self.error("ACTIVATE: očekává se soubor projektu (např. \"{LOCAL_DIR}/test.txt\").")
+        path = Path(value.strip())
+        if not path.is_absolute():
+            parts = [p for p in path.as_posix().split("/") if p not in ("", ".")]
+            if not parts or ".." in parts or path.drive:
+                raise self.error(f"ACTIVATE: neplatná cesta „{value}“.")
+            return "/".join(parts)
+        for root in (self.local_dir(), self.env.pm.server_dir(self.env.project)):
+            if _inside(path, root) and _norm(path) != _norm(root):
+                return Path(os.path.relpath(path, root)).as_posix()
+        raise self.error(f"ACTIVATE: „{value}“ neleží v projektu {self.env.project}.")
+
+    def _file_state(self, rel: str):
+        try:
+            return self.env.pm.script_file_state(self.env.project, rel)
+        except Exception as e:  # noqa: BLE001 – např. projekt mezitím deaktivován
+            raise self.error(str(e)) from None
+
+    def _take(self, rel: str) -> ScriptFile:
+        try:
+            sf = self.env.pm.script_activate(self.env.project, rel, self.progress)
+        except Exception as e:  # noqa: BLE001
+            raise self.error(str(e)) from None
+        self.activated.append(sf.path)
+        return sf
+
+    def _add_to_commit(self, sf: ScriptFile) -> None:
+        if all(f.path.lower() != sf.path.lower() for f in self.env.files):
+            self.env.files = self.env.files + [sf]
+
+    def activate(self, value) -> bool:
+        """ACTIVATE: soubor v projektu není -> False (skript může pokračovat a vytvořit ho);
+        existuje -> zamkne se (stáhne se aktuální verze), přidá do commit -> True; drží ho jiný
+        nebo je zrcadlený -> False (důvod v záznamu)."""
+        if self.phase != "before":
+            raise self.error("ACTIVATE lze použít jen v bloku BEFORE (před odevzdáním).")
+        rel = self.project_rel(value)
+        state, sf, who = self._file_state(rel)
+        if state == "missing":
+            self.log(f"ACTIVATE {rel}: v projektu není")
+            return False
+        if state in ("other", "mirror"):
+            self.log(f"ACTIVATE {rel}: nelze – " + (f"drží ho {who}" if state == "other"
+                                                    else f"spravuje ho zrcadlo z {who}"))
+            return False
+        if state == "free":
+            if self.dry:
+                self.log(f"ACTIVATE {rel}: aktivoval by se (zkušební běh – nezamčeno)")
+            else:
+                sf = self._take(rel)
+                self.log(f"ACTIVATE {rel}: aktivován (stažena aktuální verze)")
+        else:
+            self.log(f"ACTIVATE {rel}: už je aktivovaný")
+        self._add_to_commit(sf)
+        self._writable_rel.add(sf.path.lower())
+        return True
+
+    def guard(self, path: Path) -> None:
+        """V BEFORE: zápis do existujícího souboru projektu, který nemám aktivovaný, se nesmí
+        stát potichu – zeptá se, zda soubor aktivovat (a přepsat), jinak chyba."""
+        local = self.local_dir()
+        if self.phase != "before" or not _inside(path, local) or _norm(path) == _norm(local):
+            return
+        rel = Path(os.path.relpath(path, local)).as_posix()
+        if rel.lower() in self._writable_rel:
+            return
+        state, sf, who = self._file_state(rel)
+        if state == "other":
+            raise self.error(f"Soubor {rel} drží {who} – skript do něj nesmí zapisovat.")
+        if state == "mirror":
+            raise self.error(f"Soubor {rel} spravuje zrcadlo z {who} – skript do něj nesmí zapisovat.")
+        if state == "free":
+            question = (f"Skript chce zapsat do souboru {rel}, který nemáte aktivovaný.\n\n"
+                        "Aktivovat ho (zamknout) a přepsat? Původní obsah na serveru se při "
+                        "odevzdání nahradí.")
+            if self.dry:
+                self.log(f"   {rel} není aktivovaný – při odevzdání se skript zeptá na aktivaci")
+            elif self.env.ui is None or not self.env.ui.ask(self.dialog_title(), question):
+                raise self.error(f"Zápis do neaktivovaného souboru {rel} byl odmítnut – nic se "
+                                 "neodevzdá. (Soubor aktivujte ve skriptu příkazem ACTIVATE.)")
+            else:
+                sf = self._take(rel)
+                self._add_to_commit(sf)
+                self.log(f"   {rel} aktivován na žádost (bude přepsán)")
+        self._writable_rel.add(rel.lower())
+
     def record_prop(self, value: Record, name: str, args: list):
         if value.kind == "POST" and name == "json":
             return self.json_get(value.fields["body"], self.text(args[0]) if args else "")
@@ -548,7 +684,7 @@ class Interpreter:
             return bool(value)
         if isinstance(value, ScriptFile):
             return True
-        if isinstance(value, int):
+        if isinstance(value, (int, float)):
             return value != 0
         return bool(value)
 
@@ -569,14 +705,66 @@ class Interpreter:
             return self.compare(self.eval(node.left), node.op, self.eval(node.right))
         raise self.error("Neplatná podmínka.")
 
+    # --- počítání ---
+
+    @staticmethod
+    def to_number(value) -> int | float | None:
+        """Číslo, nebo text, který je číslem („15“, „2,5“, „-3.0“); jinak None."""
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return value
+        if not isinstance(value, str):
+            return None
+        text = value.strip().replace(",", ".")
+        try:
+            return int(text)
+        except ValueError:
+            pass
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        return number if number == number and number not in (float("inf"), float("-inf")) else None
+
+    def number(self, value, op: str) -> int | float:
+        number = self.to_number(value)
+        if number is None:
+            shown = "množina" if isinstance(value, list) else f"„{self.text(value)}“" \
+                if not isinstance(value, Record) else "výsledek " + value.kind
+            raise self.error(f"Počítání ({op}): {shown} není číslo. (Text se spojuje v uvozovkách: "
+                             "\"{a}{b}\".)")
+        return number
+
+    def arithmetic(self, op: str, left, right) -> int | float:
+        a, b = self.number(left, op), self.number(right, op)
+        if op == "+":
+            return a + b
+        if op == "-":
+            return a - b
+        if op == "*":
+            return a * b
+        if b == 0:
+            raise self.error("Dělení nulou.")
+        result = a / b
+        return int(result) if isinstance(a, int) and isinstance(b, int) and a % b == 0 else result
+
+    def format(self, value, mask: str) -> str:
+        number = self.to_number(value)
+        if number is None:
+            raise self.error(f"FORMAT: „{self.text(value)}“ není číslo.")
+        try:
+            return format_number(number, mask)
+        except (ValueError, InvalidOperation) as e:
+            raise self.error(str(e)) from None
+
     def compare(self, left, op: str, right) -> bool:
         if isinstance(left, list) or isinstance(right, list):
             raise self.error("Množinu nelze porovnávat – použijte COUNT(množina).")
         a, b = self.text(left), self.text(right)
         if op in ("==", "!=", "<", ">", "<=", ">="):
-            try:
-                x, y = int(a), int(b)
-            except ValueError:
+            x, y = self.to_number(left), self.to_number(right)
+            if x is None or y is None:
                 x, y = a.casefold(), b.casefold()
             return {"==": x == y, "!=": x != y, "<": x < y, ">": x > y,
                     "<=": x <= y, ">=": x >= y}[op]
@@ -692,12 +880,26 @@ class Interpreter:
     # --- příkazy ---
 
     def cmd_SetCmd(self, cmd: lang.SetCmd) -> None:
-        self.assign(cmd.name, self.eval(cmd.expr))
+        value = self.eval(cmd.expr)
+        if cmd.format is not None:
+            mask = self.interp(cmd.format.raw)
+            value = self.format(value, mask)
+            self._check_name(cmd.name)
+            self.vars[FORMAT_KEY + cmd.name.lower()] = mask  # proměnná si formát pamatuje
+        self.assign(cmd.name, value)
 
-    def assign(self, name: str, value) -> None:
+    def _check_name(self, name: str) -> None:
         key = name.lower()
         if key in self.builtins or key in (COMMIT_SET, "project_id"):
             raise self.error(f"„{name}“ je vestavěná proměnná – zvolte jiný název.")
+
+    def assign(self, name: str, value) -> None:
+        """Uloží hodnotu; proměnná s formátem (SET … FORMAT) dostane každé číslo v tom tvaru."""
+        self._check_name(name)
+        key = name.lower()
+        mask = self.vars.get(FORMAT_KEY + key)
+        if mask is not None and self.to_number(value) is not None:
+            value = self.format(value, mask)
         self.vars[key] = value
 
     def cmd_FilesCmd(self, cmd: lang.FilesCmd) -> None:
@@ -747,11 +949,12 @@ class Interpreter:
                     raise self.error(f"COPY NAME: neplatný název „{new_name}“.")
                 rel = posixpath.join(posixpath.dirname(rel), new_name)
             target = dest.joinpath(*rel.split("/"))
+            self.guard(target)
             self.log(f"   {f.path if f else src} → {target}")
             if self.dry:
                 self.created(target)
                 continue
-            copy_with_hash(src, target)
+            copy_with_hash(src, target, writable=True)  # kopie nikdy jen pro čtení
 
     def cmd_ZipCmd(self, cmd: lang.ZipCmd) -> None:
         dest = self.out_path(self.eval(cmd.dest))
@@ -765,6 +968,7 @@ class Interpreter:
         if not items:
             self.log(f"ZIP: nic k zabalení – archiv {dest} se nevytvořil.")
             return
+        self.guard(dest)
         self.log(f"ZIP: {_count(len(items), 'soubor', 'soubory', 'souborů')} → {dest}")
         for src, rel, f in items:
             self.log(f"   {f.path if f else src} → {rel}")
@@ -799,6 +1003,7 @@ class Interpreter:
                 for n in names:
                     if not _inside(dest / n, dest):
                         raise self.error(f"UNZIP: archiv obsahuje nebezpečnou cestu {n}.")
+                    self.guard(dest / n)
                     self.writable(dest / n)
                 zf.extractall(dest)
         except zipfile.BadZipFile:
@@ -874,6 +1079,7 @@ class Interpreter:
 
     def cmd_WriteCmd(self, cmd: lang.WriteCmd) -> None:
         path = self.out_path(self.eval(cmd.path))
+        self.guard(path)
         lines = [self.interp(line) for line in cmd.lines]
         text = cmd.newline.join(lines) + cmd.newline
         try:
@@ -941,6 +1147,9 @@ class Interpreter:
             self.log(f"Označení zrcadlených souborů ve zdroji se nepodařilo: {e}")
         if res.conflicts:
             raise self.error("MIRROR neproběhl celý:\n" + "\n".join(res.conflicts))
+
+    def cmd_ActivateCmd(self, cmd: lang.ActivateCmd) -> None:
+        self.activate(self.eval(cmd.path))
 
     def cmd_RunCmd(self, cmd: lang.RunCmd) -> None:
         args: list[str] = []
@@ -1262,13 +1471,38 @@ def run_scripts(env: ScriptEnv, scripts: list[tuple[str, str]], dry: bool = Fals
     return session.report
 
 
+def target_resolver(env: ScriptEnv) -> Callable[[object], object | None]:
+    """Cíl zrcadla (db.MirrorTarget) -> ProjectManager záložky s jeho síťovou složkou
+    (podle identity síťové složky, jinak podle cesty); None = cíl není mezi záložkami."""
+    def resolve(target):
+        if env.pm_for_tab is None:
+            return None
+        tabs = [t for t in env.tabs or [] if t.server_root]
+        if target.server_id:
+            for tab in tabs:
+                try:
+                    pm = env.pm_for_tab(tab)
+                except Exception:  # noqa: BLE001 – nedostupná záložka
+                    continue
+                if pm is not None and pm.settings.server_id == target.server_id:
+                    return pm
+        parent = Path(target.label).parent
+        tab = next((t for t in tabs if _norm(t.server_root).rstrip("\\/") == _norm(parent)), None)
+        return env.pm_for_tab(tab) if tab is not None else None
+    return resolve
+
+
 def clear_stale_marks(env: ScriptEnv, report: RunReport, mirrored: set[tuple[str, str]]) -> None:
-    """Odebere označení „zrcadleno do“ u změněných souborů, které se v tomto běhu nezrcadlily."""
+    """Odebere označení „zrcadleno do“ u změněných souborů, které se v tomto běhu nezrcadlily,
+    a jejich kopie v cíli označí jako neaktuální."""
+    warnings: list[str] = []
     try:
-        removed = env.pm.clear_stale_mirror_marks(env.project, env.files, mirrored)
+        removed = env.pm.clear_stale_mirror_marks(env.project, env.files, mirrored,
+                                                  target_resolver(env), warnings)
     except OSError as e:
         report.log.append(f"Označení zrcadlených souborů se nepodařilo aktualizovat: {e}")
         return
     if removed:
         report.log.append(f"Zrcadlo nebylo aktualizováno – u {removed} změněných souborů odebráno "
-                          "označení „zrcadleno do“.")
+                          "označení „zrcadleno do“, kopie v cíli jsou označené jako neaktuální.")
+    report.log.extend(warnings)

@@ -159,7 +159,7 @@ def test_restore_refreshes_project_list(history, monkeypatch, tmp_path):
         def deleteLater(self): pass
     monkeypatch.setattr(main_window, "RestoreDialog", FakeDialog)
 
-    def run_now(parent, title, fn, *args, on_done=None, on_error=None, **kwargs):
+    def run_now(parent, title, fn, *args, on_done=None, on_error=None, status_text=None, **kwargs):
         res = fn(*args, progress=None, **kwargs)
         if on_done:
             on_done(res)

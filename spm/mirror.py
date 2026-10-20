@@ -16,6 +16,10 @@ Postup:
    dlouhé kopírování neblokuje ostatní uživatele cíle),
 3. pod zámkem zápisu cíle se plán znovu ověří a provede (záloha, nahrazení, přejmenování,
    smazání do koše projektu) a zapíše do historie cíle jako „Zrcadlení“.
+
+Když se změněný soubor zdroje do cíle nezrcadlí (skript ho vynechal, MIRROR přeskočil nebo
+selhal), dostane jeho kopie v cíli příznak „neaktuální“ (Mirror.mark_stale). Zmizí při dalším
+zrcadlení souboru; v cíli lze takovou kopii uvolnit ze zrcadla (ProjectManager.release_mirrored).
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from .scanner import (
     copy_with_hash,
     file_hash,
     is_ignored,
+    fix_case,
     move_file,
     remove_empty_parents,
     to_abs,
@@ -284,12 +289,14 @@ class Mirror:
                                     continue
                                 move_file(to_abs(target, old), to_abs(target, rel))
                                 remove_empty_parents(target, old)
+                                fix_case(target, rel)
                                 res.renamed.append(f"{old} -> {rel}")
                                 files.pop(old, None)
                                 files[rel] = cur
                             res.mirrored[sfid] = rel
+                            db.clear_mirror_stale(fid)  # kopie odpovídá zdroji
                             if sfid in staged:
-                                backup = self._replace(target, staged.pop(sfid), rel)
+                                backup = self._replace(target, staged.pop(sfid), rel, fid, db)
                                 res.modified.append(rel)
                                 kind = dbm.RENAMED_MODIFIED if old != rel else dbm.MODIFIED
                             elif old != rel:
@@ -320,7 +327,8 @@ class Mirror:
                             res.adopted.append(rel)
                             res.mirrored[sfid] = rel
                             continue
-                        backup = self._replace(target, staged.pop(sfid), rel)
+                        backup = self._replace(target, staged.pop(sfid), rel,
+                                               existing.file_id if existing else None, db)
                         st = to_abs(target, rel).stat()
                         if existing is None:
                             fid = db.add_file(rel, st.st_size, st.st_mtime, item.sha256)
@@ -340,12 +348,36 @@ class Mirror:
                     if not db.changes(commit_id):
                         db.conn.execute("DELETE FROM commits WHERE commit_id = ?", (commit_id,))
 
-    def _replace(self, target: Path, stage: Path, rel: str) -> str | None:
-        """Nasadí ověřenou dočasnou kopii; původní soubor v cíli zazálohuje."""
+    @staticmethod
+    def mark_stale(target_pm, project: str, target_key: str, source_keys: set[str],
+                   reasons: dict[str, str], by: str) -> int:
+        """Označí v cíli kopie souborů zdroje (file_id ve zdroji -> důvod) jako neaktuální.
+        target_key = identita cílového projektu (ověří se – jiný projekt téhož názvu nic
+        nedostane). Vrací počet označených kopií."""
+        target = target_pm.server_dir(project)
+        if not db_path(target).exists():
+            return 0
+        with WriteLock(target, target_pm.user, target_pm.pc):
+            with ProjectDB.for_project(target) as db:
+                if db.project_id() != target_key:
+                    return 0
+                db.ensure_mirror_tables()
+                count = 0
+                with db.conn:
+                    for fid, (src, sfid) in db.mirrored().items():
+                        if src in source_keys and sfid in reasons:
+                            db.set_mirror_stale(fid, by, reasons[sfid])
+                            count += 1
+                return count
+
+    def _replace(self, target: Path, stage: Path, rel: str, file_id: str | None = None,
+                 db: ProjectDB | None = None) -> str | None:
+        """Nasadí ověřenou dočasnou kopii; původní soubor v cíli zazálohuje (zálohy podle
+        identity souboru v cíli – viz ProjectManager._backup)."""
         dst = to_abs(target, rel)
         backup = None
         if dst.exists() and self.target_pm.settings.backup_enabled:
-            backup = self.target_pm._backup(target, rel)
+            backup = self.target_pm._backup(target, rel, file_id, db)
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.replace(stage, dst)
         return backup

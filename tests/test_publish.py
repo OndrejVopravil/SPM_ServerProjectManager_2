@@ -133,3 +133,60 @@ def test_delete_in_local_only_folder(pm, monkeypatch, tmp_path):
     assert (kos / "zprava.docx").exists()
     with pytest.raises(SyncError):
         pm.delete_local_only("Existujici", ["x"])          # projekt na serveru – jinou cestou
+
+
+def test_create_local_project(pm, tmp_path):
+    path = pm.create_local_project("Novy_2")
+    assert path == tmp_path / "local" / "Novy_2" and path.is_dir()
+    assert statuses(pm)["Novy_2"].local_only
+    with pytest.raises(SyncError, match="místním úložišti už"):
+        pm.create_local_project("NOVY_2")                       # jen jiná velikost písmen
+    with pytest.raises(SyncError, match="Na serveru už"):
+        (tmp_path / "server" / "JenServer").mkdir()
+        pm.create_local_project("jenserver")
+    with pytest.raises(SyncError, match="nepovolené"):
+        pm.create_local_project("Nový projekt")
+    (path / "a.txt").write_text("a", encoding="utf-8")         # publikuje se jako ruční složka
+    pm.publish("Novy_2", "první verze")
+    assert (tmp_path / "server" / "Novy_2" / "a.txt").exists()
+
+
+def test_rename_local_project(pm, tmp_path):
+    local = tmp_path / "local"
+    (local / "Stary").mkdir(parents=True)
+    (local / "Stary" / "a.txt").write_text("a", encoding="utf-8")
+    assert pm.rename_local_project("Stary", "Novy") == local / "Novy"
+    assert (local / "Novy" / "a.txt").exists() and not (local / "Stary").exists()
+    assert statuses(pm)["Novy"].local_only
+    assert pm.rename_local_project("Novy", "NOVY") == local / "NOVY"   # jen velikost písmen
+    (local / "Jiny").mkdir()
+    with pytest.raises(SyncError, match="místním úložišti už"):
+        pm.rename_local_project("NOVY", "jiny")
+    (tmp_path / "server" / "NaServeru").mkdir()
+    with pytest.raises(SyncError, match="Na serveru už"):
+        pm.rename_local_project("NOVY", "naserveru")
+    with pytest.raises(SyncError, match="nepovolené"):
+        pm.rename_local_project("NOVY", "Nový projekt")
+    assert (local / "NOVY" / "a.txt").exists()
+
+
+def test_project_list_order():
+    from spm.lock import LockInfo
+    from spm.sync import ProjectStatus, project_rank
+    other = [LockInfo("bob", "PC2", "2026-01-01T00:00:00")]
+    projects = [
+        ProjectStatus("A_volny", [], False, False),
+        ProjectStatus("B_jiny", other, False, False, others=other),
+        ProjectStatus("C_mistni", [], True, False, local_only=True),
+        ProjectStatus("D_poznamka", [], False, False, notes_for_me=1),
+        ProjectStatus("E_skript", other, True, False, others=other, script_pending=True),
+        ProjectStatus("F_muj", other, True, True, notes_for_me=2),
+    ]
+    projects.sort(key=lambda p: (project_rank(p), p.name.lower()))
+    assert [p.name for p in projects] == ["F_muj", "D_poznamka", "E_skript", "C_mistni", "B_jiny", "A_volny"]
+
+
+def test_list_projects_sorted_by_group(pm):
+    pm.create_local_project("Aaa")
+    names = [p.name for p in pm.list_projects()]
+    assert names[0] == "Aaa" and names[-1] == "Existujici"         # místní před volnými

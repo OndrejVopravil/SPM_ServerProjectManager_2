@@ -76,6 +76,9 @@ HEADER_KEY = "main.v3"  # změna sloupců -> neobnovovat šířky uložené pro 
 COMMENT_COLUMN_MAX = 300  # výchozí šířka sloupce Komentář nejvýše (zbytek je v tooltipu)
 LOCAL_NOT_DELETED = "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
 FOCUS_REFRESH_MIN_GAP = 5.0  # s – při rychlém přepínání oken (Alt+Tab) neobnovovat pokaždé
+# stavový text v řádku záložek: při souběhu více činností se ukáže ta nejdůležitější
+BUSY_ORDER = ("task", "refresh", "names")
+COLOR_STATUS_ERROR = QColor("#c0392b")
 
 
 class ProjectListThread(QThread):
@@ -300,6 +303,13 @@ class MainWindow(QMainWindow):
         tabs_row.addWidget(self.tabs)
         tabs_row.addWidget(self.btn_add_tab)
         tabs_row.addStretch()
+        # stav aplikace vpravo v řádku záložek (aktualizuji…, přenáším data…, aktualizováno)
+        self.status_label = QLabel()
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.status_label.setContentsMargins(8, 0, 4, 0)
+        self._busy: dict[str, str] = {}       # druh činnosti -> text (viz BUSY_ORDER)
+        self._idle_status = ("", "", False)  # text, tooltip, chyba
+        tabs_row.addWidget(self.status_label)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -349,6 +359,53 @@ class MainWindow(QMainWindow):
             f"    |    Místní: {self.settings.local_root or '—'}"
         )
         self._update_config_label()
+
+    # --- stavový text v řádku záložek ------------------------------------------
+
+    def set_busy(self, kind: str, text: str | None) -> None:
+        """Probíhající činnost (text) nebo její konec (None)."""
+        if text:
+            self._busy[kind] = text
+        else:
+            self._busy.pop(kind, None)
+        self._show_status()
+
+    def set_idle_status(self, text: str, tip: str = "", error: bool = False) -> None:
+        """Stav, když nic neprobíhá (aktualizováno / síť nedostupná)."""
+        self._idle_status = (text, tip, error)
+        self._show_status()
+
+    def task_status(self, text: str | None, done: int, total: int) -> None:
+        """Průběh akce spuštěné přes run_task."""
+        if text and total > 1:
+            text = f"{text} {done}/{total}"
+        self.set_busy("task", text)
+
+    def _show_status(self) -> None:
+        busy = next((self._busy[k] for k in BUSY_ORDER if k in self._busy), None)
+        if busy:
+            text, tip, error = busy, "", False
+        else:
+            text, tip, error = self._idle_status
+        self.status_label.setText(text)
+        self.status_label.setToolTip(tip)
+        palette = self.status_label.palette()
+        role = self.status_label.foregroundRole()
+        if error:
+            palette.setColor(role, COLOR_STATUS_ERROR)
+        elif busy:
+            palette.setColor(role, self.palette().color(QPalette.ColorRole.WindowText))
+        else:
+            palette.setColor(role, self.palette().color(QPalette.ColorRole.PlaceholderText))
+        self.status_label.setPalette(palette)
+
+    def _refreshed(self, error: str = "") -> None:
+        """Výsledek načtení seznamu projektů do stavového textu."""
+        if error:
+            self.set_idle_status("Síť nedostupná", error, error=True)
+        else:
+            self.set_idle_status(f"Aktualizováno {time.strftime('%H:%M')}",
+                                 f"Seznam projektů načten {time.strftime('%d.%m.%Y %H:%M:%S')}")
 
     def _update_config_label(self) -> None:
         if not hasattr(self, "config_label"):
@@ -606,7 +663,10 @@ class MainWindow(QMainWindow):
             return
         self._last_refresh = time.monotonic()
         current = self.selected().name if self.selected() else self.settings.ui.get(self._ui_key("last_project"))
+        self.set_busy("refresh", "Aktualizuji…")
+        self.status_label.repaint()  # načítá se v hlavním vlákně – vykreslit hned
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        error = ""
         try:
             if self._sync_shared() and not check_names:
                 check_names = True  # změnila se kontrola znaků / ignorované soubory
@@ -617,10 +677,13 @@ class MainWindow(QMainWindow):
             self.projects = self.pm.list_projects()
         except Exception as e:  # noqa: BLE001
             self.projects = []
+            error = str(e) or type(e).__name__
             if not silent:
                 QMessageBox.critical(self, "Chyba", str(e))
         finally:
             QApplication.restoreOverrideCursor()
+            self.set_busy("refresh", None)
+        self._refreshed(error)
 
         self._render(current)
         self._update_tab_label()
@@ -635,15 +698,24 @@ class MainWindow(QMainWindow):
         if self._sync_shared():  # společná konfigurace – jen pár malých souborů
             check_names = True
         thread = ProjectListThread(self.pm)
-        thread.done.connect(lambda projects, error, t=thread: self._on_background_list(t, projects, check_names))
+        thread.done.connect(lambda projects, error, t=thread:
+                            self._on_background_list(t, projects, check_names, error))
         self._bg_refresh = thread
+        self.set_busy("refresh", "Aktualizuji…")
         thread.start()
 
-    def _on_background_list(self, thread: ProjectListThread, projects, check_names: bool) -> None:
-        if self._closing or thread.pm is not self.pm or getattr(self, "_running_task", None):
-            return  # okno se zavírá / jiná záložka / mezitím běží akce (ta seznam obnoví sama)
+    def _on_background_list(self, thread: ProjectListThread, projects, check_names: bool,
+                            error: str = "") -> None:
+        if self._closing:
+            return
+        self.set_busy("refresh", None)
+        if thread.pm is not self.pm or getattr(self, "_running_task", None):
+            return  # jiná záložka / mezitím běží akce (ta seznam obnoví sama)
         if projects is None:
-            return  # síť nedostupná – tiché obnovení nic nehlásí, seznam zůstane
+            # síť nedostupná – tiché obnovení nic nehlásí, seznam zůstane; jen stavový text
+            self._refreshed(error or "Seznam projektů se nepodařilo načíst.")
+            return
+        self._refreshed()
         current = self.selected().name if self.selected() else self.settings.ui.get(self._ui_key("last_project"))
         self.projects = projects
         self._render(current)
@@ -663,11 +735,13 @@ class MainWindow(QMainWindow):
         projects = [p for p in self.projects if not p.mine]
         self._name_check = NameCheckThread(self.pm, projects)
         self._name_check.done.connect(self._on_name_check)
+        self.set_busy("names", "Kontroluji názvy souborů…")
         self._name_check.start()
 
     def _on_name_check(self, issues: dict) -> None:
         if self._closing:
             return
+        self.set_busy("names", None)
         if self._name_check is None or self._name_check.pm is self.pm:  # ne výsledek jiné záložky
             self.name_issues = issues
             current = self.selected().name if self.selected() else None
@@ -895,7 +969,7 @@ class MainWindow(QMainWindow):
         self.act_history.setEnabled(bool(p and not p.local_only))
         self.act_notes.setEnabled(bool(p and not p.local_only))
         self.act_restore.setEnabled(bool(p and not p.local_only))
-        self.act_rename.setEnabled(bool(p and not p.active and not p.local_only))
+        self.act_rename.setEnabled(bool(p and not p.active))
         self.act_comment.setEnabled(bool(p and not p.local_only))
         self.act_unlock.setEnabled(bool(p and p.others))
         self.act_rerun_scripts.setEnabled(bool(p and p.script_pending))
@@ -903,15 +977,19 @@ class MainWindow(QMainWindow):
 
     def _context_menu(self, pos) -> None:
         row = self.table.rowAt(pos.y())
-        if row < 0:
+        menu = QMenu(self)
+        act_create = QAction("Vytvořit projekt…", menu)
+        act_create.triggered.connect(self.create_project)
+        if row < 0:  # prázdné místo seznamu
+            menu.addAction(act_create)
+            menu.exec(self.table.viewport().mapToGlobal(pos))
             return
         self.table.selectRow(row)
-        menu = QMenu(self)
         actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
                    self.act_deactivate, self.act_publish, None, self.act_open, self.act_history, self.act_notes,
                    self.act_restore, None, self.act_comment, self.act_rename, None,
                    self.act_cancel, self.act_unlock,
-                   None, self.act_refresh]
+                   None, act_create, self.act_refresh]
         if self.act_invalid.isEnabled():
             actions[:0] = [self.act_invalid, None]
         if self.act_rerun_scripts.isEnabled():
@@ -974,7 +1052,8 @@ class MainWindow(QMainWindow):
             self._open_notes_if_new(p.name, only_for_me=False, after_activation=True)
 
         run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
-                 only_locked=only_locked, on_done=done, on_error=lambda _: self.refresh())
+                 only_locked=only_locked, status_text="Přenáším data…",
+                 on_done=done, on_error=lambda _: self.refresh())
 
     def take(self, preselect: str | list[str] | None = None) -> None:
         """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
@@ -1007,7 +1086,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Převzít", msg)
 
         run_task(self, f"Převzetí souborů – {p.name}", self.pm.take, p.name, paths,
-                 on_done=done, on_error=lambda _: self.refresh())
+                 status_text="Přenáším data…", on_done=done, on_error=lambda _: self.refresh())
 
     def update_from_server(self) -> None:
         p = self.selected()
@@ -1024,7 +1103,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Aktualizovat", format_refresh(res))
 
         run_task(self, f"Aktualizace ze serveru – {p.name}", self.pm.refresh, p.name,
-                 on_done=done, on_error=lambda _: self.refresh())
+                 status_text="Přenáším data…", on_done=done, on_error=lambda _: self.refresh())
 
     def toggle_activation(self) -> None:
         """F3: můj aktivovaný projekt deaktivuje, jinak (lze-li) aktivuje."""
@@ -1045,6 +1124,7 @@ class MainWindow(QMainWindow):
         if not p or not p.mine:
             return
         run_task(self, "Porovnávání souborů", self.pm.plan_upload, p.name,
+                 status_text="Porovnávám soubory…",
                  on_done=lambda plan: self._confirm_upload(plan, end_session, preselect))
 
     def _confirm_upload(self, plan: UploadPlan, end_session: bool,
@@ -1073,8 +1153,8 @@ class MainWindow(QMainWindow):
                 if not session.run_before():
                     session.abort()
                     return None, []
-                cur_plan, cur_selected, added = self.pm.adopt_script_outputs(plan.name, plan, selected,
-                                                                             progress)
+                cur_plan, cur_selected, added = self.pm.adopt_script_outputs(
+                    plan.name, plan, selected, progress, activated=session.interp.activated)
             res = self.pm.upload(cur_plan, assignments, comment, cur_selected, end_session,
                                  progress=progress, notes=notes, keep_local=bool(self.settings.scripts))
             return res, added
@@ -1127,7 +1207,8 @@ class MainWindow(QMainWindow):
                                     comment, res.commit_id, res.cleanup_pending, title, msg,
                                     session=session)
 
-        run_task(self, f"{title} – nahrávání projektu {plan.name}", work, on_done=done, on_error=failed)
+        run_task(self, f"{title} – nahrávání projektu {plan.name}", work,
+                 status_text="Přenáším data…", on_done=done, on_error=failed)
 
     def _before_session(self, name: str, action: str, files: list[ScriptFile], comment: str,
                         title: str):
@@ -1158,14 +1239,16 @@ class MainWindow(QMainWindow):
 
     def rename_project(self) -> None:
         p = self.selected()
-        if not p or p.active or p.local_only:
+        if not p or p.active:
             return
         new_name = p.name
+        hint = ("(Přejmenuje se složka v místním úložišti – projekt ještě nebyl odevzdán.)"
+                if p.local_only else
+                "(Přejmenuje se složka na síťovém úložišti, změna se zapíše do historie.)")
         while True:
             new_name, ok = QInputDialog.getText(
                 self, "Přejmenovat projekt",
-                f"Nový název projektu „{p.name}“:\n"
-                "(Přejmenuje se složka na síťovém úložišti, změna se zapíše do historie.)",
+                f"Nový název projektu „{p.name}“:\n" + hint,
                 QLineEdit.EchoMode.Normal, new_name,
             )
             new_name = new_name.strip()
@@ -1179,7 +1262,10 @@ class MainWindow(QMainWindow):
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
-                self.pm.rename_project(p.name, new_name)
+                if p.local_only:
+                    self.pm.rename_local_project(p.name, new_name)
+                else:
+                    self.pm.rename_project(p.name, new_name)
             finally:
                 QApplication.restoreOverrideCursor()
         except Exception as e:  # noqa: BLE001
@@ -1189,11 +1275,38 @@ class MainWindow(QMainWindow):
         self.settings.ui[self._ui_key("last_project")] = new_name
         self.table.clearSelection()
         self.refresh()
+        if p.local_only:
+            return
         msg = f"Projekt „{p.name}“ byl přejmenován na „{new_name}“."
         if p.local_exists:
             msg += (f"\n\nV místním úložišti zůstala složka se starým názvem „{p.name}“. "
                     "Nyní se zobrazuje jako „Jen místně“ – pokud ji nepotřebujete, smažte ji.")
         QMessageBox.information(self, "Přejmenovat projekt", msg)
+
+    def create_project(self) -> None:
+        """Nový projekt v místním úložišti (prázdná složka) – zobrazí se jako „Jen místně“
+        a publikuje se na síť jako ručně vytvořená složka."""
+        title = "Vytvořit projekt"
+        name = ""
+        while True:
+            name, ok = QInputDialog.getText(
+                self, title, "Název nového projektu:\n(Vytvoří se složka v místním úložišti "
+                f"{self.pm.local_root}; na síť ji pak publikujete.)", QLineEdit.EchoMode.Normal, name)
+            name = name.strip()
+            if not ok or not name:
+                return
+            error = validate_project_name(name)
+            if not error:
+                break
+            QMessageBox.warning(self, title, error)
+        try:
+            self.pm.create_local_project(name)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, title, str(e))
+            return
+        self.settings.ui[self._ui_key("last_project")] = name
+        self.table.clearSelection()
+        self.refresh(check_names=False)
 
     def publish(self, preselect: str | list[str] | None = None) -> None:
         """preselect: soubor / složka ('/' na konci) předvybraná (z panelu stavu projektu)."""
@@ -1254,7 +1367,8 @@ class MainWindow(QMainWindow):
             self.run_commit_scripts(p.name, PUBLISH, res.script_files, comment, res.commit_id,
                                     False, "Publikovat", msg, session=session)
 
-        run_task(self, f"Publikování projektu {p.name}", work, on_done=done, on_error=failed)
+        run_task(self, f"Publikování projektu {p.name}", work, status_text="Přenáším data…",
+                 on_done=done, on_error=failed)
 
     # --- skripty po odevzdání ---------------------------------------------------------
 
@@ -1330,10 +1444,8 @@ class MainWindow(QMainWindow):
         znovu z nabídky projektu) a místní kopie se neuklidí."""
         names = list(self.settings.scripts)
         if session is None and (not names or not files):
-            try:  # bez skriptů se nic nezrcadlí – označení změněných souborů už neplatí
-                self.pm.clear_stale_mirror_marks(name, files, set())
-            except OSError:
-                pass
+            # bez skriptů se nic nezrcadlí – označení změněných souborů už neplatí
+            clear_stale_marks(self.script_env(name, action, files, comment, commit_id), RunReport(), set())
             if cleanup:
                 if not self.pm.finish_local(name):
                     summary += LOCAL_NOT_DELETED
@@ -1401,7 +1513,8 @@ class MainWindow(QMainWindow):
                 pass
             self.refresh()
 
-        run_task(self, f"Skripty – projekt {name}", work, on_done=done, on_error=failed)
+        run_task(self, f"Skripty – projekt {name}", work, status_text="Spouštím skripty…",
+                 on_done=done, on_error=failed)
 
     def rerun_scripts(self) -> None:
         p = self.selected()
@@ -1500,6 +1613,7 @@ class MainWindow(QMainWindow):
             if not accepted or point is None:
                 return
             run_task(self, f"Obnovení projektu {p.name}", self.pm.restore, catalog, point,
+                     status_text="Obnovuji soubory…",
                      on_done=done)
 
         def done(res: RestoreResult) -> None:
@@ -1521,6 +1635,7 @@ class MainWindow(QMainWindow):
                 os.startfile(res.folder)
 
         run_task(self, f"Výpočet obnovitelných stavů – {p.name}", self.pm.restore_points, p.name,
+                 status_text="Procházím historii…",
                  on_done=chosen)
 
     def history(self) -> None:

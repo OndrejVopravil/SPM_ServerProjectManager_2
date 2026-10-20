@@ -96,8 +96,9 @@ def scan(root: Path, ignore: Iterable[str] = (), progress: Progress | None = Non
     return result
 
 
-def copy_with_hash(src: Path, dst: Path) -> str:
-    """Zkopíruje soubor včetně času změny a vrátí SHA-256 obsahu.
+def copy_with_hash(src: Path, dst: Path, writable: bool = False) -> str:
+    """Zkopíruje soubor včetně času změny a vrátí SHA-256 obsahu. writable = kopie nikdy
+    nebude jen pro čtení (atributy se jinak přenesou ze zdroje).
 
     Zapisuje se nejdřív do dočasného souboru, který se pak atomicky přejmenuje,
     aby přerušené kopírování nezanechalo poškozený cílový soubor.
@@ -113,6 +114,8 @@ def copy_with_hash(src: Path, dst: Path) -> str:
                 h.update(chunk)
                 fout.write(chunk)
         shutil.copystat(src, tmp)
+        if writable:
+            set_readonly(tmp, False)
         os.replace(tmp, dst)
     except PermissionError:
         tmp.unlink(missing_ok=True)
@@ -154,6 +157,30 @@ def move_file(src: Path, dst: Path) -> None:
 
 def same_stat(a_size: int, a_mtime: float, b_size: int, b_mtime: float) -> bool:
     return a_size == b_size and abs(a_mtime - b_mtime) <= MTIME_TOLERANCE
+
+
+def fix_case(root: Path, rel: str) -> None:
+    """Disk bez rozlišení velikosti písmen (Windows): po přesunu dostanou složky i soubor cesty
+    velikost písmen podle rel (přejmenování „A“ -> „a“ by jinak ponechalo starou složku „A“)."""
+    current = root
+    for part in rel.split("/"):
+        try:
+            actual = next((n for n in os.listdir(current) if n.lower() == part.lower()), None)
+        except OSError:
+            return
+        if actual is None:
+            return
+        if actual != part:
+            try:
+                os.rename(current / actual, current / part)
+            except OSError:
+                return
+        current = current / part
+
+
+def same_path(a: Path, b: Path) -> bool:
+    """Stejný soubor bez ohledu na velikost písmen (Windows)."""
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def remove_empty_parents(root: Path, rel: str) -> None:

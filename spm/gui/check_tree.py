@@ -39,6 +39,7 @@ class TreeEntry:
     color_name: bool = False                # obarvit barvou i název souboru
     file_path: str | None = None            # skutečný soubor na disku – pro jeho vlastní ikonu
     tooltip: str = ""
+    folder: bool = False                    # položka je (prázdná) složka – path končí '/' 
 
 
 class CheckTree(QTreeWidget):
@@ -96,6 +97,16 @@ class CheckTree(QTreeWidget):
             return folders[path]
 
         for e in sorted(entries, key=lambda e: e.path.lower()):
+            if e.folder:  # složka bez souborů (např. nově vytvořená)
+                item = folder(e.path.rstrip("/"))
+                for i, text in enumerate(e.columns[:extra]):
+                    item.setText(i + 1, text)
+                    if e.color is not None:
+                        item.setForeground(i + 1, e.color)
+                if e.tooltip:
+                    for c in range(extra + 1):
+                        item.setToolTip(c, e.tooltip)
+                continue
             parent_path, _, name = e.path.rpartition("/")
             parent = folder(parent_path)
             item = QTreeWidgetItem([name] + (e.columns + [""] * extra)[:extra])
@@ -103,6 +114,9 @@ class CheckTree(QTreeWidget):
             item.setData(0, PATH_ROLE, e.path)
             if e.tooltip:
                 item.setToolTip(0, e.tooltip)
+                for i, text in enumerate(e.columns[:extra]):  # i u krátkého textu ve sloupci
+                    if text:
+                        item.setToolTip(i + 1, e.tooltip)
             icon = None
             if e.file_path and self._shell_icons and icons.has_per_file_icon(name):
                 icon = icons.loader().cached(e.file_path)
@@ -127,18 +141,20 @@ class CheckTree(QTreeWidget):
         if to_load:
             icons.loader().request(to_load)
 
-    def set_column_texts(self, column: int, texts: dict[str, tuple[str, str]],
+    def set_column_texts(self, column: int, texts: dict[str, tuple],
                          color: QColor | None = None) -> None:
-        """Doplní text (a tooltip) sloupce podle cesty – soubor 'a/b.nc', složka 'a/'."""
+        """Doplní text (a tooltip) sloupce podle cesty – soubor 'a/b.nc', složka 'a/'.
+        Hodnota (text, tooltip) nebo (text, tooltip, barva) – barva místo výchozí color."""
         self.blockSignals(True)
         it = QTreeWidgetItemIterator(self)
         while it.value():
             item = it.value()
-            text, tip = texts.get(item.data(0, PATH_ROLE), ("", ""))
+            text, tip, *own = texts.get(item.data(0, PATH_ROLE), ("", ""))
             item.setText(column, text)
             item.setToolTip(column, tip)
-            if color is not None and text:
-                item.setForeground(column, color)
+            use = own[0] if own and own[0] is not None else color
+            if use is not None and text:
+                item.setForeground(column, use)
             it += 1
         self.blockSignals(False)
 
@@ -188,6 +204,10 @@ class CheckTree(QTreeWidget):
             if not item.data(0, KEY_ROLE):
                 yield item
             it += 1
+
+    def find_folder(self, path: str) -> QTreeWidgetItem | None:
+        """Položka složky podle cesty ('a/b/')."""
+        return next((item for item in self._folder_items() if item.data(0, PATH_ROLE) == path), None)
 
     def leaf_items(self):
         it = QTreeWidgetItemIterator(self)
