@@ -41,6 +41,7 @@ from .restore import RESTORE_DIR_RE, RestoreCatalog, RestorePoint, RestoreResult
 from .scripting import store as script_store
 from .scripting.model import ADDED, DELETED, MODIFIED, RENAMED, UNCHANGED, ScriptFile
 from .scanner import (
+    TEMP_SUFFIX,
     FileInfo,
     Progress,
     copy_with_hash,
@@ -343,6 +344,14 @@ class CopyItem:
 
 
 COPY_ADD, COPY_REPLACE, COPY_SKIP = "add", "replace", "skip"
+
+# dočasná kopie při nahrávání na server (vedle cíle; scanner ji ignoruje – končí TEMP_SUFFIX)
+UPLOAD_SUFFIX = ".upload" + TEMP_SUFFIX
+
+
+def changed_during_upload(rel: str) -> str:
+    return (f"Soubor {rel} se změnil po porovnání se serverem (pravděpodobně je otevřený a "
+            "ukládá se). Nic z něj se nenahrálo – uložte a zavřete ho a odevzdejte znovu.")
 
 
 @dataclass
@@ -936,6 +945,55 @@ class ProjectManager:
                                 + (f"\n\nZkopírováno předtím: {len(done)}" if done else "")) from None
             done.append(item.rel)
         return done
+
+    def move_local(self, name: str, moves: list[tuple[str, str]]) -> tuple[list[str], list[tuple[str, str]]]:
+        """Přesune soubory v mé místní kopii (Vyjmout + Vložit): moves = (cesta, nová cesta).
+        Jen moje soubory – zamčené mnou nebo nové (u složky „Jen místně“ všechny). Na serveru
+        se přesun projeví až odevzdáním (rozpozná se podle obsahu jako přejmenování).
+        Existující cíl se nepřepisuje. Vrací (přesunuté nové cesty, přeskočené (cesta, důvod))."""
+        local = self.local_dir(name)
+        server = self.server_dir(name)
+        manifest = None
+        mine: set[str] = set()
+        taken: dict = {}
+        if server.exists():
+            _, manifest = self._manifest(name)
+            with ProjectDB.for_project(server) as db:
+                mine = db.locked_by(self._my_session(db, manifest.session_id))
+                taken = {p.lower(): f for p, f in db.active_files(include_pending=True).items()}
+        moved: list[str] = []
+        skipped: list[tuple[str, str]] = []
+        for rel, new_rel in moves:
+            new_rel = new_rel.strip("/")
+            src, dst = to_abs(local, rel), to_abs(local, new_rel)
+            entry = manifest.files.get(rel) if manifest else None
+            if new_rel == rel:
+                continue
+            if not src.is_file():
+                skipped.append((rel, "v místní kopii není"))
+            elif entry is not None and entry.file_id not in mine:
+                skipped.append((rel, "nemáte ho zamčený"))
+            elif new_rel.split("/")[0].lower() == SPM_DIR:
+                skipped.append((rel, "servisní složka"))
+            elif any(is_ignored(part, self.settings.ignore_patterns) for part in new_rel.split("/")):
+                skipped.append((rel, "ignorovaný název"))
+            elif self._invalid_paths([new_rel]):
+                skipped.append((rel, "nepovolené znaky v cílové cestě"))
+            elif dst.exists() and not same_path(src, dst):
+                skipped.append((rel, f"v cíli už je {new_rel}"))
+            elif (other := taken.get(new_rel.lower())) is not None and (
+                    entry is None or other.file_id != entry.file_id):
+                skipped.append((rel, f"na serveru už je {new_rel}"))
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.rename(src, dst)
+                except OSError as e:
+                    skipped.append((rel, f"nelze přesunout ({e.strerror or e})"))
+                    continue
+                remove_empty_parents(local, rel)
+                moved.append(new_rel)
+        return moved, skipped
 
     def file_source(self, name: str, rel: str) -> Path:
         """Odkud soubor projektu číst: místní kopie, jinak server (nestažený soubor)."""
@@ -1631,6 +1689,15 @@ class ProjectManager:
         server = self.server_dir(plan.name)
         local = self.local_dir(plan.name)
         sid = plan.session_id
+        # soubor změněný po porovnání (velikost / čas změny) – zjistit dřív, než se na serveru
+        # cokoliv změní; obsah se při nahrání ještě ověří hashem (viz _upload)
+        for lf in [lf for _, lf in renames + modified + restored] + added:
+            try:
+                st = to_abs(local, lf.path).stat()
+            except OSError:
+                raise SyncError(f"Soubor {lf.path} v místní kopii chybí nebo ho nelze přečíst.") from None
+            if st.st_size != lf.size or st.st_mtime != lf.mtime:
+                raise SyncError(changed_during_upload(lf.path))
 
         # 1) Rezervace: nové názvy a soubory, které se budou měnit, se označí jako „nahrávají se“
         #    (ostatní uživatelé je zatím nestahují a nikdo jiný si stejný název nezabere).
@@ -2198,15 +2265,30 @@ class ProjectManager:
 
     def _upload(self, server: Path, local: Path, lf: FileInfo, backup_existing: bool,
                 file_id: str | None = None) -> str | None:
-        """Nahraje soubor na server; původní verzi případně zazálohuje. Vrací cestu zálohy."""
+        """Nahraje soubor na server; původní verzi případně zazálohuje. Vrací cestu zálohy.
+
+        Nejdřív do dočasného souboru vedle cíle a ověří hash proti porovnání (plánu): soubor,
+        který se mezitím změnil, se nenahraje (evidence by neodpovídala obsahu). Záloha
+        a nahrazení až potom – při výpadku sítě během kopírování zůstane na serveru původní
+        soubor."""
         rel = lf.path
         if self._already_uploaded(server, local, rel, lf.sha256):
             return None
         dst = to_abs(server, rel)
+        stage = dst.with_name(dst.name + UPLOAD_SUFFIX)
+        sha = copy_with_hash(to_abs(local, rel), stage)
+        if sha != lf.sha256:
+            stage.unlink(missing_ok=True)
+            raise SyncError(changed_during_upload(rel))
         backup = None
-        if backup_existing and dst.exists() and self.settings.backup_enabled:
-            backup = self._backup(server, rel, file_id)
-        copy_with_hash(to_abs(local, rel), dst)
+        try:
+            if backup_existing and dst.exists() and self.settings.backup_enabled:
+                backup = self._backup(server, rel, file_id)
+            if dst.exists():
+                set_readonly(dst, False)  # soubor jen pro čtení nejde ve Windows nahradit
+            os.replace(stage, dst)
+        finally:
+            stage.unlink(missing_ok=True)
         return backup
 
     @staticmethod

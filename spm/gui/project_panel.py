@@ -8,8 +8,10 @@ odevzdané (šedě).
 
 from __future__ import annotations
 
+import json
 import os
 from collections import Counter
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QPointF, QThread, QTimer, Qt, Signal
@@ -30,6 +32,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import recycle
 from ..scanner import to_abs
 from ..sync import (
     COPY_ADD,
@@ -43,7 +46,15 @@ from ..sync import (
     validate_folder_name,
 )
 from .check_tree import KEY_ROLE, PATH_ROLE, CheckTree, TreeEntry, in_scope
-from .project_tree import ProjectTree, files_mime, new_staging_dir
+from .project_tree import (
+    CLIPBOARD_KEEP_S,
+    CLIPBOARD_ROOT,
+    MIME_CLIPBOARD,
+    ProjectTree,
+    clipboard_info,
+    files_mime,
+    new_staging_dir,
+)
 from .notes_window import fmt_time
 from .search import wildcard_matcher
 
@@ -130,10 +141,13 @@ class ProjectPanel(QWidget):
     activate_requested = Signal(object)  # projekt, který nemám aktivovaný
     note_requested = Signal(object)      # přidat poznámku k označeným souborům / složkám
     publish_requested = Signal(object)   # složka „Jen místně“
+    modified = Signal()                  # změna souborů z tohoto panelu (kopie, přesun, mazání…)
 
     def __init__(self, pm: ProjectManager, parent: QWidget | None = None):
         super().__init__(parent)
         self.pm = pm
+        # ProjectManager jiné záložky (vložení souborů vyjmutých v jiné záložce) – nastaví okno
+        self.pm_for: Callable[[str], ProjectManager] = lambda ws_id: self.pm
         self.project: ProjectStatus | None = None
         self.entries: list[FileEntry] = []
         self.open_notes: list = []  # otevřené poznámky projektu (sloupec Poznámky)
@@ -202,18 +216,38 @@ class ProjectPanel(QWidget):
         delete.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         delete.triggered.connect(lambda: self.delete_selected())
         self.tree.addAction(delete)
+        note = QAction(self.tree)  # Ctrl+N – nová poznámka k označeným souborům
+        note.setShortcut(QKeySequence("Ctrl+N"))
+        note.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        note.triggered.connect(lambda: self.project and not self.project.local_only
+                               and self.note_requested.emit(self.selected_scopes()))
+        self.tree.addAction(note)
+        # schránka: Ctrl+C / Ctrl+X / Ctrl+V (jako v Průzkumníku)
+        for key, slot in ((QKeySequence.StandardKey.Copy, lambda: self.copy_selected()),
+                          (QKeySequence.StandardKey.Cut, lambda: self.copy_selected(cut=True)),
+                          (QKeySequence.StandardKey.Paste, lambda: self.paste_into(self.paste_target()))):
+            act = QAction(self.tree)
+            act.setShortcut(QKeySequence(key))
+            act.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+            act.triggered.connect(slot)
+            self.tree.addAction(act)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 4, 0, 0)
         layout.addLayout(head)
         layout.addWidget(self.summary)
         layout.addWidget(self.tree)
 
+    def _changed(self) -> None:
+        """Po změně souborů: znovu načíst strom a ohlásit to (druhý panel se obnoví také)."""
+        self.reload()
+        self.modified.emit()
+
     def show_project(self, project: ProjectStatus | None) -> None:
         """Zobrazí strom vybraného projektu (jakéhokoliv – volného, aktivovaného i složky
-        „Jen místně“); bez vybraného projektu se panel skryje."""
+        „Jen místně“). Viditelnost panelu řídí okno (záložky Soubory / Poznámky) – panel ji sám
+        nemění, jinak by se strom ukázal přes záložku Poznámky."""
         if project is None:
             self.project = None
-            self.hide()
             return
         same = (self.project is not None and self.project.name == project.name
                 and self.project.local_only == project.local_only
@@ -227,7 +261,6 @@ class ProjectPanel(QWidget):
             self.entries = []
             self.tree.set_entries([])
             self.summary.setText("Načítám…")
-        self.show()
         self.reload()
 
     def reload(self) -> None:
@@ -347,7 +380,7 @@ class ProjectPanel(QWidget):
                 by_path.setdefault(path, []).append(note)
         for path, notes in by_path.items():
             tip = "\n\n".join(f"{n.author}: {n.text.strip()[:300]}" for n in notes)
-            texts[path] = (f"📝 {len(notes)}", tip + "\n\n(celé poznámky: okno Poznámky)")
+            texts[path] = (f"📝 {len(notes)}", tip + "\n\n(klepnutím zobrazíte poznámky k tomuto souboru)")
         self.tree.set_column_texts(3, texts, COLOR_NOTE)
 
     def select_path(self, path: str) -> bool:
@@ -533,7 +566,7 @@ class ProjectPanel(QWidget):
             self.pm.release_mirrored(self.project.name, paths)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, title, str(e))
-        self.reload()
+        self._changed()
 
     def is_empty_folder(self, scope: str) -> bool:
         """Složka (i nadřazená) prázdných složek místní kopie – bez jediného souboru."""
@@ -567,7 +600,7 @@ class ProjectPanel(QWidget):
             item = self.tree.find_folder(parent)
             if item is not None:
                 item.setExpanded(True)
-        self.reload()
+        self._changed()
 
     def rename_selected(self) -> None:
         """F2 – přejmenovat vybraný soubor (jen když je označený jediný)."""
@@ -608,7 +641,7 @@ class ProjectPanel(QWidget):
             self.pm.rename_local(self.project.name, path, new_name)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Přejmenovat soubor", str(e))
-        self.reload()
+        self._changed()
 
     def _rename_folder(self, path: str) -> None:
         folder = path.rstrip("/")
@@ -634,7 +667,7 @@ class ProjectPanel(QWidget):
             self.pm.rename_local_folder(self.project.name, folder, new_name)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, title, str(e))
-        self.reload()
+        self._changed()
 
     # --- přetahování myší ---------------------------------------------------------
 
@@ -670,7 +703,9 @@ class ProjectPanel(QWidget):
         """Data pro tažení ven: přímo soubory místní kopie, pokud jsou to jen zapisovatelné
         soubory; jinak (složky, neaktivované = jen pro čtení, nestažené) jejich kopie
         v dočasné složce – v cíli tak nikdy nebudou jen pro čtení."""
-        items = self.drag_items(scopes)
+        return self._export_mime(self.drag_items(scopes), "Přetažení", new_staging_dir)
+
+    def _export_mime(self, items: list[tuple[str, str]], title: str, staging):
         if not items or self.project is None:
             return None
         local = self.pm.local_dir(self.project.name)
@@ -680,13 +715,140 @@ class ProjectPanel(QWidget):
             return files_mime(items, direct)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            tops = self.pm.export_copies(self.project.name, items, new_staging_dir())
+            tops = self.pm.export_copies(self.project.name, items, staging())
         except Exception as e:  # noqa: BLE001
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Přetažení", f"Soubory se nepodařilo připravit:\n{e}")
+            QMessageBox.critical(self, title, f"Soubory se nepodařilo připravit:\n{e}")
             return None
         QApplication.restoreOverrideCursor()
         return files_mime(items, tops)
+
+    # --- schránka (Kopírovat / Vyjmout / Vložit) ------------------------------------
+
+    def can_cut(self, scopes: list[str]) -> bool:
+        """Vyjmout (přesunout) lze jen moje soubory – zamčené mnou nebo nové – v místní kopii
+        aktivovaného projektu; ve složce „Jen místně“ všechny."""
+        if self.project is None or not (self.project.mine or self.project.local_only):
+            return False
+        inside = [e for e in self.entries if in_scope(e.path, scopes) and not e.local_deleted]
+        return bool(inside) and all(e.in_local and (self.project.local_only or e.mine or e.local_new)
+                                    for e in inside)
+
+    def can_paste(self) -> bool:
+        mime = QApplication.clipboard().mimeData()
+        return bool(self.tree.can_drop() and mime is not None
+                    and (mime.hasUrls() or mime.hasFormat(MIME_CLIPBOARD)))
+
+    def paste_target(self) -> str:
+        """Kam vložit: označená složka, složka označeného souboru, jinak kořen projektu."""
+        item = self.tree.currentItem()
+        if item is None or not item.isSelected():
+            return ""
+        path = item.data(0, PATH_ROLE)
+        return path if path.endswith("/") else (path.rpartition("/")[0] + "/" if "/" in path else "")
+
+    def copy_selected(self, scopes: list[str] | None = None, cut: bool = False) -> bool:
+        """Kopírovat (Ctrl+C) / Vyjmout (Ctrl+X) označené soubory a složky do schránky.
+        Ostatní programy (Průzkumník) dostanou vždy jen kopii – přesun soubor z projektu
+        nikdy nesmaže mimo SPM; vyjmuté se přesunou až vložením v SPM."""
+        scopes = self.selected_scopes() if scopes is None else scopes
+        if self.project is None or not scopes:
+            return False
+        title = "Vyjmout" if cut else "Kopírovat"
+        if cut and not self.can_cut(scopes):
+            QMessageBox.information(self, title, "Vyjmout lze jen soubory, které máte aktivované "
+                                                 "(zamčené) nebo nové, v místní kopii.")
+            return False
+        items = self.drag_items(scopes)
+        mime = self._export_mime(items, title,
+                                 lambda: new_staging_dir(CLIPBOARD_ROOT, CLIPBOARD_KEEP_S))
+        if mime is None:
+            return False
+        info = {"ws": self.pm.settings.workspace_id, "project": self.project.name,
+                "local_only": self.project.local_only, "items": items, "cut": cut}
+        mime.setData(MIME_CLIPBOARD, json.dumps(info).encode("utf-8"))
+        QApplication.clipboard().setMimeData(mime)
+        return True
+
+    def paste_into(self, target: str) -> None:
+        """Vložit (Ctrl+V) do složky target: soubory zkopírované v SPM nebo v Průzkumníku;
+        vyjmuté v SPM se přesunou (ze stejného projektu přímo, z jiného kopií a smazáním)."""
+        if self.project is None:
+            return
+        if not self.tree.can_drop():
+            QMessageBox.information(self, "Vložit", "Vložit lze jen do aktivovaného projektu "
+                                                    "nebo do složky „Jen místně“.")
+            return
+        mime = QApplication.clipboard().mimeData()
+        info = clipboard_info(mime)
+        if info and info["cut"]:
+            self._paste_cut(info, target)
+            return
+        urls = [Path(u.toLocalFile()) for u in mime.urls() if u.isLocalFile()] if mime else []
+        same = bool(info and info["ws"] == self.pm.settings.workspace_id
+                    and info.get("project") == self.project.name)
+        # ze stejného projektu se čte aktuální obsah souborů, odjinud kopie ze schránky
+        if urls or same:
+            self.drop_files(urls, info["items"] if same else None, target)
+
+    def _paste_cut(self, info: dict, target: str) -> None:
+        title = "Vložit"
+        name = self.project.name
+        if info.get("folder"):  # vyjmuté v záložce Složka: zkopírovat sem, originály do Koše
+            self._paste_cut_folder([Path(x) for x in info["paths"]], target)
+            return
+        moves = [(rel, target + out) for rel, out in info["items"]]
+        if info["ws"] == self.pm.settings.workspace_id and info["project"] == name:
+            try:
+                moved, skipped = self.pm.move_local(name, moves)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.critical(self, title, str(e))
+                self._changed()
+                return
+            if skipped:
+                box = QMessageBox(QMessageBox.Icon.Warning, title,
+                                  f"Přesunuto: {len(moved)}, nepřesunuto: {len(skipped)}.", parent=self)
+                box.setDetailedText("\n".join(f"{rel} – {reason}" for rel, reason in skipped))
+                box.exec()
+            QApplication.clipboard().clear()
+            self._changed()
+            return
+        # z jiného projektu: zkopírovat sem a ve zdrojovém projektu smazat (do Koše)
+        source_pm = self.pm_for(info["ws"])
+        src_name = info["project"]
+        sources = {target + out: rel for rel, out in info["items"]}
+        try:
+            plan = self.pm.plan_copy_in(name, [(source_pm.file_source(src_name, rel), dst)
+                                               for dst, rel in sources.items()])
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, title, str(e))
+            return
+        copied = self.copy_into(plan, target)
+        if not copied:
+            return
+        by_target = {dst.lower(): rel for dst, rel in sources.items()}
+        done = [by_target[c.lower()] for c in copied if c.lower() in by_target]
+        try:
+            if info.get("local_only"):
+                source_pm.delete_local_only(src_name, done)
+            else:
+                source_pm.delete_local(src_name, done)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, title, f"Soubory se zkopírovaly, ale v projektu {src_name} "
+                                             f"se nepodařilo smazat originály:\n{e}")
+        QApplication.clipboard().clear()
+
+    @staticmethod
+    def url_sources(urls: list[Path], target: str) -> list[tuple[Path, str]]:
+        """Soubory a složky ze systému -> (soubor, cílová cesta v projektu)."""
+        sources = []
+        for path in urls:
+            if path.is_dir():
+                sources += [(f, f"{target}{path.name}/{f.relative_to(path).as_posix()}")
+                            for f in sorted(path.rglob("*")) if f.is_file()]
+            elif path.is_file():
+                sources.append((path, target + path.name))
+        return sources
 
     def drop_files(self, urls: list[Path], internal: list[tuple[str, str]] | None, target: str) -> None:
         """Puštění do stromu: soubory a složky ze systému (urls), nebo položky z tohoto stromu
@@ -697,13 +859,7 @@ class ProjectPanel(QWidget):
         if internal is not None:
             sources = [(self.pm.file_source(name, rel), target + out) for rel, out in internal]
         else:
-            sources = []
-            for path in urls:
-                if path.is_dir():
-                    sources += [(f, f"{target}{path.name}/{f.relative_to(path).as_posix()}")
-                                for f in sorted(path.rglob("*")) if f.is_file()]
-                elif path.is_file():
-                    sources.append((path, target + path.name))
+            sources = self.url_sources(urls, target)
         try:
             plan = self.pm.plan_copy_in(name, sources)
         except Exception as e:  # noqa: BLE001
@@ -711,8 +867,31 @@ class ProjectPanel(QWidget):
             return
         self.copy_into(plan, target)
 
-    def copy_into(self, plan: list[CopyItem], target: str) -> None:
-        """Potvrzení (když se něco nahrazuje nebo přeskakuje) a kopírování do místní kopie."""
+    def _paste_cut_folder(self, paths: list[Path], target: str) -> None:
+        sources = self.url_sources(paths, target)
+        try:
+            plan = self.pm.plan_copy_in(self.project.name, sources)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Vložit", str(e))
+            return
+        copied = self.copy_into(plan, target)
+        if not copied:
+            return
+        done = {c.lower() for c in copied}
+        originals = [src for src, rel in sources if rel.strip("/").lower() in done]
+        try:
+            recycle.to_recycle_bin(originals)
+            for folder in (p for p in paths if p.is_dir()):  # vyprázdněné složky
+                if not any(f.is_file() for f in folder.rglob("*")):
+                    recycle.to_recycle_bin([folder])
+        except OSError as e:
+            QMessageBox.warning(self, "Vložit", f"Soubory se zkopírovaly, ale originály se "
+                                                f"nepodařilo přesunout do Koše:\n{e}")
+        QApplication.clipboard().clear()
+
+    def copy_into(self, plan: list[CopyItem], target: str) -> list[str] | None:
+        """Potvrzení (když se něco nahrazuje nebo přeskakuje) a kopírování do místní kopie.
+        Vrací zkopírované cesty (None = zrušeno nebo chyba)."""
         adds = [i for i in plan if i.action == COPY_ADD]
         replaces = [i for i in plan if i.action == COPY_REPLACE]
         skips = [i for i in plan if i.action == COPY_SKIP]
@@ -725,7 +904,7 @@ class ProjectPanel(QWidget):
                               "(nahradit lze jen soubory, které máte aktivované).", parent=self)
             box.setDetailedText(details)
             box.exec()
-            return
+            return None
         if replaces or skips:
             text = (f"Kopírování {where}:\n\nnové soubory: {len(adds)}\n"
                     f"nahradí se (máte je aktivované): {len(replaces)}\n"
@@ -736,16 +915,18 @@ class ProjectPanel(QWidget):
                               QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
             box.setDetailedText(details)
             if box.exec() != QMessageBox.StandardButton.Yes:
-                return
+                return None
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        copied = None
         try:
-            self.pm.copy_in(self.project.name, plan)
+            copied = self.pm.copy_in(self.project.name, plan)
         except Exception as e:  # noqa: BLE001
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Kopírování", str(e))
         else:
             QApplication.restoreOverrideCursor()
-        self.reload()
+        self._changed()
+        return copied
 
     def deletable(self, scope: str | list[str]) -> list[str]:
         """Soubory v rozsahu, které smím smazat: zamčené mnou nebo moje nové (a ještě nesmazané);
@@ -766,7 +947,7 @@ class ProjectPanel(QWidget):
                     self.pm.remove_empty_local_folder(self.project.name, s)
             except Exception as e:  # noqa: BLE001
                 QMessageBox.critical(self, "Smazat", str(e))
-            self.reload()
+            self._changed()
             return
         paths = self.deletable(scope)
         others = [e.path for e in self.entries if in_scope(e.path, scope)
@@ -791,7 +972,7 @@ class ProjectPanel(QWidget):
                 self.pm.delete_local(self.project.name, paths)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Smazat", str(e))
-        self.reload()
+        self._changed()
 
     def _context_menu(self, pos) -> None:
         item = self.tree.itemAt(pos)
@@ -801,8 +982,13 @@ class ProjectPanel(QWidget):
             menu = QMenu(self)
             act = menu.addAction("Nová složka…")
             act.setEnabled(self.context_actions([])["new_folder"])
-            if menu.exec(self.tree.viewport().mapToGlobal(pos)) is act:
+            act_paste = menu.addAction("Vložit\tCtrl+V")
+            act_paste.setEnabled(self.can_paste())
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if chosen is act:
                 self.create_folder("")
+            elif chosen is act_paste:
+                self.paste_into("")
             return
         # akce platí pro všechny označené položky (Ctrl / Shift); klepnutí mimo výběr = jen tato
         scopes = self.selected_scopes() if item.isSelected() else [item.data(0, PATH_ROLE)]
@@ -825,6 +1011,12 @@ class ProjectPanel(QWidget):
             act_take = menu.addAction("Převzít…" + many)
             act_take.setEnabled(enabled["take"])
         menu.addSeparator()
+        act_copy = menu.addAction("Kopírovat" + many + "\tCtrl+C")
+        act_cut = menu.addAction("Vyjmout" + many + "\tCtrl+X")
+        act_cut.setEnabled(self.can_cut(scopes))
+        act_paste = menu.addAction("Vložit\tCtrl+V")
+        act_paste.setEnabled(self.can_paste())
+        menu.addSeparator()
         act_new_folder = menu.addAction("Nová složka…")
         act_new_folder.setEnabled(enabled["new_folder"])
         act_rename = menu.addAction("Přejmenovat…\tF2")
@@ -837,7 +1029,7 @@ class ProjectPanel(QWidget):
             act_release = menu.addAction("Uvolnit ze zrcadla…" + many)
         if not self.project.local_only:
             menu.addSeparator()
-            act_note = menu.addAction("Přidat poznámku…" + many)
+            act_note = menu.addAction("Přidat poznámku…" + many + "\tCtrl+N")
         if not self.project.mine and not self.project.local_only:
             menu.addSeparator()
             note = menu.addAction("Odevzdat a převzít lze až u aktivovaného projektu")
@@ -855,6 +1047,14 @@ class ProjectPanel(QWidget):
             clicked = item.data(0, PATH_ROLE)  # složka -> podsložka, soubor -> vedle něj
             self.create_folder(clicked if clicked.endswith("/") else
                                (clicked.rpartition("/")[0] + "/" if "/" in clicked else ""))
+        elif chosen is act_copy:
+            self.copy_selected(scopes)
+        elif chosen is act_cut:
+            self.copy_selected(scopes, cut=True)
+        elif chosen is act_paste:
+            clicked = item.data(0, PATH_ROLE)  # do složky, na soubor = vedle něj
+            self.paste_into(clicked if clicked.endswith("/") else
+                            (clicked.rpartition("/")[0] + "/" if "/" in clicked else ""))
         elif chosen is act_rename:
             self._rename(scopes[0])
         elif chosen is act_submit:

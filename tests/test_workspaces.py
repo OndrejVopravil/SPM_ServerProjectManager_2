@@ -171,6 +171,7 @@ def test_add_tab_cancelled_settings_removes_it(window, monkeypatch):
     from PySide6.QtWidgets import QInputDialog
     w = window
     monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("Třetí", True))
+    monkeypatch.setattr(QInputDialog, "getItem", lambda _p, _t, _l, items, *a, **k: (items[0], True))
     monkeypatch.setattr(w, "open_settings", lambda: False)
     before = w.settings.workspace_id
     w.add_workspace()
@@ -182,6 +183,7 @@ def test_add_tab_suggests_local_folder(window, monkeypatch, tmp_path):
     from PySide6.QtWidgets import QInputDialog
     w = window
     monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("Treti", True))
+    monkeypatch.setattr(QInputDialog, "getItem", lambda _p, _t, _l, items, *a, **k: (items[0], True))
     seen = {}
 
     def fake_settings():

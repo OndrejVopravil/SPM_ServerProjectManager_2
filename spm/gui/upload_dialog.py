@@ -39,6 +39,7 @@ from ..notes import Draft
 from ..scanner import to_abs
 from ..sync import UploadPlan, auto_deactivation, new_key
 from .check_tree import CheckTree, TreeEntry, in_scope
+from .notes_panel import MentionEdit, mention, recipient_combo
 
 DELETED_LABEL = "— smazán —"
 KEY_ROLE = Qt.ItemDataRole.UserRole
@@ -56,10 +57,11 @@ TABS = [
 class UploadDialog(QDialog):
     def __init__(self, plan: UploadPlan, end_session: bool, parent: QWidget | None = None,
                  local: Path | None = None, preselect: str | list[str] | None = None,
-                 drafts: list[Draft] | None = None):
+                 drafts: list[Draft] | None = None, users: list | None = None):
         """local: místní kopie projektu (pro ikony souborů).
         preselect: soubor nebo složka (zakončená '/'), jejíž změny budou předem zaškrtnuté.
-        drafts: rozepsané poznámky – zaškrtnuté se zveřejní s odevzdáním."""
+        drafts: rozepsané poznámky (ze starších verzí) – zaškrtnuté se zveřejní s odevzdáním.
+        users: známí uživatelé (adresát předávací poznámky)."""
         super().__init__(parent)
         self.plan = plan
         self.local = local
@@ -130,7 +132,30 @@ class UploadDialog(QDialog):
         self.comment.textChanged.connect(self._validate)
         layout.addWidget(self.comment)
 
-        # rozepsané poznámky (plovoucí okno Poznámky) – zaškrtnuté se zveřejní s odevzdáním
+        # předávací poznámka – zveřejní se s odevzdáním (nepovinná)
+        self.users = list(users or [])
+        note_box = QGroupBox("Poznámka pro další uživatele (nepovinná) – zveřejní se s odevzdáním")
+        note_lay = QVBoxLayout(note_box)
+        self.handover = MentionEdit()
+        self.handover.users = self.users
+        self.handover.setPlaceholderText("Co je rozpracované, na co si dát pozor…  (@jméno = pro koho)")
+        self.handover.setMaximumHeight(70)
+        note_lay.addWidget(self.handover)
+        note_row = QHBoxLayout()
+        note_row.addWidget(QLabel("Pro:"))
+        self.handover_to = recipient_combo(self.users)
+        self.handover.mentioned.connect(
+            lambda login: self.handover_to.setCurrentIndex(max(self.handover_to.findData(login.lower()), 0)))
+        note_row.addWidget(self.handover_to)
+        self.handover_files = QCheckBox("Týká se odevzdávaných souborů")
+        self.handover_files.setToolTip("Poznámka se zobrazí u souborů, které odevzdáváte "
+                                       "(ve stromu ve sloupci Poznámky)")
+        note_row.addWidget(self.handover_files)
+        note_row.addStretch()
+        note_lay.addLayout(note_row)
+        layout.addWidget(note_box)
+
+        # rozepsané poznámky (ze starších verzí SPM) – zaškrtnuté se zveřejní s odevzdáním
         self.drafts = list(drafts or [])
         self.draft_checks: list[QCheckBox] = []
         if self.drafts:
@@ -239,8 +264,21 @@ class UploadDialog(QDialog):
         return {fid: combo.currentData() for fid, combo in self.combos.items()}
 
     def selected_notes(self) -> list[Draft]:
-        """Rozepsané poznámky zaškrtnuté ke zveřejnění."""
-        return [d for d, check in zip(self.drafts, self.draft_checks) if check.isChecked()]
+        """Poznámky ke zveřejnění s odevzdáním: předávací poznámka a zaškrtnuté rozepsané."""
+        notes = [d for d, check in zip(self.drafts, self.draft_checks) if check.isChecked()]
+        text = self.handover.toPlainText().strip()
+        if text:
+            login = self.handover_to.currentData() or ""
+            name = self.handover_to.currentText() if login else ""
+            if not login:
+                login, name = mention(text, self.users)
+            targets = []
+            if self.handover_files.isChecked():
+                keys = self.selected_keys()
+                targets = sorted({e.path for kind, e in self._entries()
+                                  if kind != "deleted" and (keys is None or e.key in keys)}, key=str.lower)
+            notes.insert(0, Draft(text, login, name, targets))
+        return notes
 
     def comment_text(self) -> str:
         return self.comment.toPlainText().strip()

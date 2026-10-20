@@ -9,7 +9,11 @@ if not exist ".venv\Scripts\python.exe" (
 )
 ".venv\Scripts\python.exe" -m pip install --quiet pyinstaller || goto :error
 
+rem Ikona SPM.exe (kresba: spm/gui/app_icon.py)
+".venv\Scripts\python.exe" tools\make_icon.py || goto :error
+
 ".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed --name SPM ^
+    --icon tools\spm.ico ^
     --distpath dist --workpath build ^
     --exclude-module pytest ^
     run_spm.py || goto :error

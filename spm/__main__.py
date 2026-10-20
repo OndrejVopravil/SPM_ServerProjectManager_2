@@ -4,6 +4,7 @@ import traceback
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .config import AppSettings
+from .gui.app_icon import app_icon
 from .gui.main_window import MainWindow
 from .gui.style import AppStyle
 
@@ -17,9 +18,22 @@ def _show_unhandled(exc_type, exc, tb) -> None:
     box.exec()
 
 
+def _set_app_id() -> None:
+    """Windows: vlastní identita procesu – hlavní panel pak ukazuje ikonu SPM, ne Pythonu
+    (při spuštění přes python / pythonw)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SPM.ServerProjectManager")
+        except (AttributeError, OSError):
+            pass
+
+
 def main() -> int:
+    _set_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("SPM")
+    app.setWindowIcon(app_icon())  # všechna okna aplikace
     app.setStyle(AppStyle(app.style().name()))
     sys.excepthook = _show_unhandled
     window = MainWindow(AppSettings.load())

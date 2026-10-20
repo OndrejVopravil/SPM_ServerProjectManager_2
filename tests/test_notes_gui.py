@@ -1,4 +1,5 @@
-"""Předávací poznámky v rozhraní: okno, rozepsané, odevzdání, strom, seznam, zrušení aktivace."""
+"""Poznámky v rozhraní: panel vedle stromu (karty, psaní, filtry, odpojení), seznam projektů,
+rozepsané poznámky ze starších verzí (odevzdání, zrušení aktivace)."""
 import os
 import stat
 from pathlib import Path
@@ -64,6 +65,17 @@ def select_forma(w):
     settle_panel(w.panel)
 
 
+def cards_text(panel) -> str:
+    return "\n".join(c.head.text() + "\n" + c.body.text() for c in panel.card_widgets())
+
+
+def make_panel(pm, name="Forma"):
+    from spm.gui.notes_panel import NotesPanel
+    panel = NotesPanel(pm)
+    panel.set_project(pm, name)
+    return panel
+
+
 def test_recipient_from_text():
     from spm.gui.notes_window import recipient_from_text
     known = {"Alča (alice)": "alice"}
@@ -73,8 +85,19 @@ def test_recipient_from_text():
     assert recipient_from_text("", known) == ("", "")
 
 
-def test_note_for_me_marked_in_list_and_opens_window(qapp, pms):
-    from PySide6.QtCore import QUrl
+def test_mention_and_touches():
+    from spm.gui.notes_panel import mention, touches
+    from spm.users import UserInfo
+    users = [UserInfo("bob", nickname="Bobík"), UserInfo("alice")]
+    assert mention("Ahoj @bob, koukni", users) == ("bob", "Bobík (bob)")
+    assert mention("pro @Bobík.", users) == ("bob", "Bobík (bob)")
+    assert mention("pro @novak", users) == ("novak", "")             # ještě nespustil SPM
+    assert mention("mail jan@firma.cz", users) == ("", "")            # e-mail není zmínka
+    assert touches(["dily/deska.elt"], ["dily/"]) and touches(["dily/"], ["dily/deska.elt"])
+    assert touches(["Dily/Deska.elt"], ["dily/deska.elt"]) and not touches(["sestava.elt"], ["dily/"])
+
+
+def test_note_for_me_marked_in_list_and_shown_in_panel(qapp, pms):
     alice, bob = pms
     alice.add_notes("Forma", [Draft("**Pozor** na desku", recipient="bob", targets=["dily/deska.elt"])])
     w = make_window(qapp, bob)
@@ -82,51 +105,263 @@ def test_note_for_me_marked_in_list_and_opens_window(qapp, pms):
         row = [p.name for p in w.projects].index("Forma")
         item = w.table.item(row, 0)
         assert not item.icon().isNull() and "Čeká na vás 1 poznámka" in item.toolTip()
-        select_forma(w)                                          # klepnutí -> okno se otevře samo
-        window = w._notes_windows[(w.settings.workspace_id, "Forma")]
-        assert window.isVisible()
-        text = window.view.toPlainText()
-        assert "Pozor na desku" in text and "pro vás" in text and "NOVÁ" in text
-        assert not window.editable and window.drafts_box.isHidden()   # neaktivovaný – bez rozepsaných
-        # sloupec Poznámky ve stromu
+        select_forma(w)                                   # nová pro mě -> přepne na záložku Poznámky
+        assert w.side.currentWidget() is w.notes
+        assert w.side.tabText(w.side.indexOf(w.notes)) == "Poznámky (1 · pro vás 1)"
+        text = cards_text(w.notes)
+        assert "Pozor" in text and "pro vás" in text and "●" in text
+        assert w.notes.card_widgets()[0].news == "nová"
         assert find_item(w.panel.tree, "dily/deska.elt").text(3) == "📝 1"
-        # odkaz na soubor -> označí ve stromu
-        window._on_link(QUrl("spmfile:dily/deska.elt"))
-        assert w.panel.tree.currentItem().text(0) == "deska.elt"
-        # vyřízení
-        note_id = bob.notes("Forma")[0].note_id
-        window._on_link(QUrl(f"spmresolve:{note_id}"))
+        # odkaz na soubor -> označí ve stromu (a přepne na Soubory)
+        (card,) = w.notes.card_widgets()
+        card.targets.linkActivated.emit("dily/deska.elt")
+        assert w.panel.tree.currentItem().text(0) == "deska.elt" and w.side.currentWidget() is w.panel
+        # vyřízení zaškrtnutím
+        card.resolved.setChecked(True)
+        qapp.processEvents()
         assert bob.notes("Forma")[0].resolved
-        assert "Projekt nemá žádné otevřené poznámky" in window.view.toPlainText()
-        window.show_resolved.setChecked(True)
-        assert "vyřízeno" in window.view.toPlainText()
-        # znovu klepnutí – už viděná, okno se samo neotevírá
-        window.close()
+        assert w.notes.card_widgets() == [] and "Žádné otevřené" in w.notes.empty.text()
+        w.notes.set_filter("all")
+        assert "vyřízeno" in cards_text(w.notes)
+        # znovu klepnutí – už viděná, záložka se sama nepřepíná
+        w.side.setCurrentWidget(w.panel)
         w.table.clearSelection()
         select_forma(w)
-        assert not window.isVisible()
+        assert w.side.currentWidget() is w.panel
     finally:
         close(w, qapp)
 
 
-def test_drafts_written_and_published_with_submission(qapp, pms, monkeypatch):
-    from spm.gui import main_window
+def test_write_note_from_tree_publishes_immediately(qapp, pms):
     alice, bob = pms
-    alice.activate("Forma", lock_paths=["dily/deska.elt", "sestava.elt"])
+    alice.activate("Forma", lock_paths=["dily/deska.elt"])
     w = make_window(qapp, alice)
     try:
         select_forma(w)
-        w.add_note(["dily/deska.elt"])                           # z nabídky stromu
-        window = w._notes_windows[(w.settings.workspace_id, "Forma")]
-        assert window.editable and window.isVisible()
-        window.editor.setPlainText("# Deska\nje předběžná")
-        window.recipient.setEditText("bob")
-        window.flush()
-        drafts = alice.drafts("Forma")
-        assert [(d.title, d.recipient, d.targets) for d in drafts] == [("Deska", "bob", ["dily/deska.elt"])]
-        assert bob.notes("Forma") == []                          # ostatní rozepsané nevidí
+        w.panel.select_path("dily/deska.elt")             # výběr ve stromu -> „týká se“
+        assert "deska.elt" in w.notes.about.text() and w.notes.about.isChecked()
+        w.add_note(w.panel.selected_scopes())             # nabídka stromu / Ctrl+N
+        assert w.side.currentWidget() is w.notes
+        w.notes.editor.setPlainText("Deska je předběžná, @bob prosím zkontroluj")
+        w.notes.send()
+        (note,) = bob.notes("Forma")                       # zveřejněná hned, bez odevzdání
+        assert (note.recipient, note.targets) == ("bob", ["dily/deska.elt"])
+        assert w.notes.editor.toPlainText() == ""
+        settle_panel(w.panel)
+        assert find_item(w.panel.tree, "dily/deska.elt").text(3) == "📝 1"
+        # bez vazby na soubory a adresát výběrem
+        w.notes.about.setChecked(False)
+        w.notes.recipient.addItem("Bob", "bob")
+        w.notes.recipient.setCurrentIndex(w.notes.recipient.count() - 1)
+        w.notes.editor.setPlainText("Pro celý projekt")
+        w.notes.send()
+        note = bob.notes("Forma")[0]
+        assert (note.text, note.recipient, note.targets) == ("Pro celý projekt", "bob", [])
+    finally:
+        close(w, qapp)
 
-        # odevzdání: dialog ukáže rozepsané (zaškrtnuté) a zveřejní je
+
+def test_note_on_project_not_activated(qapp, pms):
+    alice, bob = pms
+    w = make_window(qapp, bob)
+    try:
+        select_forma(w)
+        w.add_note(["sestava.elt"])
+        w.notes.editor.setPlainText("hned zveřejněná")
+        w.notes.send()
+        assert [(n.text, n.targets) for n in alice.notes("Forma")] == [("hned zveřejněná", ["sestava.elt"])]
+        settle_panel(w.panel)
+        assert find_item(w.panel.tree, "sestava.elt").text(3) == "📝 1"
+    finally:
+        close(w, qapp)
+
+
+def test_filters(qapp, pms):
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("k desce", targets=["dily/deska.elt"]), Draft("pro Boba", recipient="bob"),
+                              Draft("obecná")])
+    alice.resolve_note("Forma", [n for n in alice.notes("Forma") if n.text == "obecná"][0].note_id)
+    panel = make_panel(bob)
+
+    def texts():
+        return sorted(c.note.text for c in panel.card_widgets())
+    assert texts() == ["k desce", "pro Boba"]                         # otevřené
+    panel.set_filter("mine")
+    assert texts() == ["pro Boba"]
+    panel.set_filter("selected")
+    assert texts() == [] and "Vyberte ve stromu" in panel.empty.text()
+    panel.set_selection(["dily/"])
+    assert texts() == ["k desce"]
+    panel.set_filter("all")
+    assert texts() == ["k desce", "obecná", "pro Boba"]
+
+
+def test_tree_note_column_click_filters_notes(qapp, pms):
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("k desce", targets=["dily/deska.elt"]), Draft("jiná")])
+    w = make_window(qapp, bob)
+    try:
+        select_forma(w)
+        item = find_item(w.panel.tree, "dily/deska.elt")
+        w.panel.select_path("dily/deska.elt")
+        w._on_tree_click(item, 3)
+        assert w.side.currentWidget() is w.notes and w.notes.current_filter() == "selected"
+        assert [c.note.text for c in w.notes.card_widgets()] == ["k desce"]
+    finally:
+        close(w, qapp)
+
+
+def test_reply_and_edit_inline(qapp, pms, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Deska hotová", recipient="bob")])
+    bob_panel = make_panel(bob)
+    (card,) = bob_panel.card_widgets()
+    assert card.btn_edit is None                                       # cizí poznámku neupraví
+    card.btn_reply.click()
+    assert card.editor_box.isVisibleTo(card)
+    card.editor.setPlainText("Ano, rozumím.")
+    card.btn_send.click()
+    assert [r.text for r in bob.notes("Forma")[0].replies] == ["Ano, rozumím."]
+    assert "Ano, rozumím." in "\n".join(lbl.text() for lbl in bob_panel.card_widgets()[0].findChildren(type(card.body)))
+
+    alice_panel = make_panel(alice)
+    (card,) = alice_panel.card_widgets()
+    card.btn_edit.click()
+    assert card.editor.toPlainText() == "Deska hotová" and card.body.isHidden()
+    card.editor.setPlainText("Deska hotová, **díry posunuty**")
+    card.btn_send.click()
+    note = bob.notes("Forma")[0]
+    assert note.text == "Deska hotová, **díry posunuty**" and note.recipient == "bob" and len(note.versions) == 1
+    bob_panel.reload()
+    assert bob_panel.card_widgets()[0].news == "upravená"
+    shown = []
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: shown.append(box.detailedText()) or 0)
+    bob_panel.show_versions(note)
+    assert "Deska hotová" in shown[0]
+
+
+def test_new_reply_to_my_note_shows_notes(qapp, pms):
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Otázka pro všechny")])
+    w = make_window(qapp, alice)
+    try:
+        select_forma(w)
+        assert w.side.currentWidget() is w.panel                       # vlastní, bez odpovědi
+        w.open_notes("Forma")                                           # Alice poznámky viděla
+        w.side.setCurrentWidget(w.panel)
+        bob.reply_note("Forma", bob.notes("Forma")[0].note_id, "Odpověď od Boba")
+        w.refresh(check_names=False)
+        w.table.clearSelection()
+        select_forma(w)
+        assert w.side.currentWidget() is w.notes and w.notes.card_widgets()[0].news == "nová odpověď"
+    finally:
+        close(w, qapp)
+
+
+def test_own_changes_are_not_new(qapp, pms):
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Otázka", recipient="bob")])
+    note_id = alice.notes("Forma")[0].note_id
+    seen = alice.notes("Forma")[0].seq
+    alice.reply_note("Forma", note_id, "Moje doplnění")
+    alice.edit_note("Forma", note_id, "Otázka upravená")
+    panel = make_panel(alice)
+    panel._seen_shown = seen
+    panel._render()
+    (card,) = panel.card_widgets()
+    assert card.news == "" and "●" not in cards_text(panel)          # pro autorku nic nového
+    panel = make_panel(bob)
+    panel._seen_shown = seen
+    panel._render()
+    (card,) = panel.card_widgets()
+    assert card.news == "upravená" and card.body.font().bold() and "upravena" in card.head.toolTip()
+
+
+def test_for_me_card_colors_follow_dark_mode(qapp, pms):
+    from PySide6.QtGui import QColor, QPalette
+
+    from spm.gui.notes_window import FOR_ME_DARK, FOR_ME_LIGHT
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("pro Boba", recipient="bob"), Draft("pro všechny")])
+    panel = make_panel(bob)
+    styles = {c.note.text: c.styleSheet() for c in panel.card_widgets()}
+    assert FOR_ME_LIGHT.background in styles["pro Boba"] and FOR_ME_LIGHT.background not in styles["pro všechny"]
+    dark = QPalette(panel.palette())
+    dark.setColor(QPalette.ColorRole.Base, QColor("#1e1e1e"))
+    panel.setPalette(dark)                                              # změna palety -> překreslení
+    styles = {c.note.text: c.styleSheet() for c in panel.card_widgets()}
+    assert FOR_ME_DARK.background in styles["pro Boba"] and FOR_ME_DARK.text in styles["pro Boba"]
+
+
+def test_note_text_larger_than_meta(qapp, pms):
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Hlavní text", recipient="bob")])
+    (card,) = make_panel(bob).card_widgets()
+    assert card.body.font().pointSizeF() > card.head.font().pointSizeF()
+
+
+def test_export_markdown(qapp, pms, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QFileDialog
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("Text **poznámky**", targets=["sestava.elt"])])
+    target = tmp_path / "export.md"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
+    make_panel(bob).export_md()
+    text = target.read_text(encoding="utf-8")
+    assert text.startswith("# Poznámky – projekt Forma") and "Text **poznámky**" in text
+    assert "`sestava.elt`" in text
+
+
+def test_detach_and_attach(qapp, pms):
+    alice, bob = pms
+    alice.add_notes("Forma", [Draft("poznámka")])
+    w = make_window(qapp, bob)
+    try:
+        select_forma(w)
+        w.toggle_notes_detached()
+        assert w._notes_window is not None and w.side.indexOf(w.notes) < 0
+        assert w.notes.window() is w._notes_window and "Forma" in w._notes_window.windowTitle()
+        assert w.settings.ui["notes.detached"] == "1"
+        assert w.open_notes() is w.notes                                # vyzvedne okno
+        w._notes_window.close()                                          # zavření = zpět do záložky
+        assert w._notes_window is None and w.side.indexOf(w.notes) >= 0
+        assert w.settings.ui["notes.detached"] == ""
+    finally:
+        close(w, qapp)
+
+
+def test_local_only_project_has_no_notes(qapp, pms):
+    alice, bob = pms
+    (bob.local_root / "Mistni").mkdir(parents=True)
+    w = make_window(qapp, bob)
+    try:
+        w.table.selectRow([p.name for p in w.projects].index("Mistni"))
+        settle_panel(w.panel)
+        assert not w.side.isTabEnabled(w.side.indexOf(w.notes)) and w.notes.name is None
+        assert w.open_notes() is None
+    finally:
+        close(w, qapp)
+
+
+def test_nickname_in_settings(qapp, pms):
+    from spm.gui.settings_dialog import SettingsDialog
+    alice, bob = pms
+    dlg = SettingsDialog(alice.settings)
+    dlg.nickname.setText("  Alča ")
+    dlg._accept()
+    assert alice.settings.nickname == "Alča" and alice.display_name == "Alča"
+
+
+# --- rozepsané poznámky ze starších verzí ---------------------------------------------------
+
+def test_old_drafts_published_with_submission(qapp, pms, monkeypatch):
+    from spm.gui import main_window
+    alice, bob = pms
+    alice.activate("Forma", lock_paths=["dily/deska.elt"])
+    alice.save_drafts("Forma", [Draft("# Deska\nje předběžná", "bob", "", ["dily/deska.elt"])])
+    w = make_window(qapp, alice)
+    try:
         seen = {}
 
         def run_now(parent, title, fn, *args, on_done=None, on_error=None, status_text=None, **kwargs):
@@ -144,37 +379,10 @@ def test_drafts_written_and_published_with_submission(qapp, pms, monkeypatch):
             return True
         monkeypatch.setattr(w, "_exec_dialog", accept)
         write(alice.local_dir("Forma") / "dily" / "deska.elt", "deska v2")
-        plan = alice.plan_upload("Forma")
-        w._confirm_upload(plan, end_session=False)
+        w._confirm_upload(alice.plan_upload("Forma"), end_session=False)
         assert seen["checks"] == ["Deska → pro bob  (1 souborů / složek)"]
         assert "Zveřejněné poznámky: 1" in seen["msg"]
-        note = bob.notes("Forma")[0]
-        assert (note.text, note.recipient, note.targets) == ("# Deska\nje předběžná", "bob", ["dily/deska.elt"])
-        assert alice.drafts("Forma") == []
-    finally:
-        close(w, qapp)
-
-
-def test_quick_note_on_project_not_activated(qapp, pms, monkeypatch):
-    from spm.gui import main_window
-    alice, bob = pms
-
-    class FakeQuick:
-        def __init__(self, name, targets, users, parent):
-            self.targets = targets
-        def draft(self):
-            return Draft("hned zveřejněná", recipient="alice", targets=self.targets)
-        def deleteLater(self):
-            pass
-    monkeypatch.setattr(main_window, "QuickNoteDialog", FakeQuick)
-    w = make_window(qapp, bob)
-    try:
-        monkeypatch.setattr(w, "_exec_dialog", lambda dlg, key: True)
-        select_forma(w)
-        w.add_note(["sestava.elt"])
-        assert [(n.text, n.targets) for n in alice.notes("Forma")] == [("hned zveřejněná", ["sestava.elt"])]
-        settle_panel(w.panel)
-        assert find_item(w.panel.tree, "sestava.elt").text(3) == "📝 1"
+        assert bob.notes("Forma")[0].targets == ["dily/deska.elt"] and alice.drafts("Forma") == []
     finally:
         close(w, qapp)
 
@@ -211,162 +419,61 @@ def test_upload_dialog_lists_drafts(qapp, pms):
     assert [d.text for d in dlg.selected_notes()] == ["Hotovo"]
 
 
-def test_export_markdown(qapp, pms, tmp_path, monkeypatch):
-    from PySide6.QtWidgets import QFileDialog
-
-    from spm.gui.notes_window import NotesWindow
+def test_handover_note_in_upload_dialog(qapp, pms):
+    from spm.gui.upload_dialog import UploadDialog
+    from spm.users import UserInfo
     alice, bob = pms
-    alice.add_notes("Forma", [Draft("Text **poznámky**", targets=["sestava.elt"])])
-    target = tmp_path / "export.md"
-    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
-    window = NotesWindow(bob, "Forma")
-    window.export_md()
-    text = target.read_text(encoding="utf-8")
-    assert text.startswith("# Poznámky – projekt Forma") and "Text **poznámky**" in text
-    assert "`sestava.elt`" in text and "spmresolve" not in text
+    alice.activate("Forma", lock_paths=["dily/deska.elt", "sestava.elt"])
+    write(alice.local_dir("Forma") / "dily" / "deska.elt", "deska v2")
+    plan = alice.plan_upload("Forma")
+    dlg = UploadDialog(plan, True, users=[UserInfo("bob", nickname="Bob")])
+    assert dlg.selected_notes() == []                                   # nepovinná
+    dlg.handover.setPlainText("Deska je hotová, @bob zkontroluj díry")
+    dlg.handover_files.setChecked(True)
+    (note,) = dlg.selected_notes()
+    assert (note.recipient, note.targets) == ("bob", ["dily/deska.elt", "sestava.elt"])
+    alice.upload(plan, plan.default_assignments(), "deska v2", end_session=True, notes=dlg.selected_notes())
+    (published,) = bob.notes("Forma")
+    assert published.text.startswith("Deska je hotová") and published.commit_id is not None
 
 
-def test_nickname_in_settings(qapp, pms):
-    from spm.gui.settings_dialog import SettingsDialog
+def test_for_me_counter_in_tab_row(qapp, pms):
     alice, bob = pms
-    dlg = SettingsDialog(alice.settings)
-    dlg.nickname.setText("  Alča ")
-    dlg._accept()
-    assert alice.settings.nickname == "Alča" and alice.display_name == "Alča"
-
-
-def test_note_for_me_is_highlighted(qapp, pms):
-    from spm.gui.notes_window import FOR_ME_BACKGROUND, NotesWindow, notes_html
-    alice, bob = pms
-    alice.add_notes("Forma", [Draft("pro Boba", recipient="bob"), Draft("pro všechny"),
-                              Draft("pro Alici", recipient="alice")])
-    notes = bob.notes("Forma")
-    html = notes_html(notes, "bob", seen=0, show_resolved=False)
-    cards = html.split("<hr>")
-    by_text = {n.text: card for n, card in zip(notes, cards)}
-    assert FOR_ME_BACKGROUND in by_text["pro Boba"] and "PRO VÁS" in by_text["pro Boba"]
-    assert FOR_ME_BACKGROUND not in by_text["pro všechny"]
-    assert FOR_ME_BACKGROUND not in by_text["pro Alici"] and "pro alice" in by_text["pro Alici"]
-    window = NotesWindow(bob, "Forma")
-    assert "PRO VÁS" in window.view.toPlainText()
-    assert window.view.toPlainText().count("PRO VÁS") == 1
-
-
-def test_edit_and_reply_in_window(qapp, pms, monkeypatch):
-    from PySide6.QtCore import QUrl
-    from PySide6.QtWidgets import QMessageBox
-
-    from spm.gui import notes_window
-    from spm.gui.notes_window import NotesWindow, notes_html
-    alice, bob = pms
-    alice.add_notes("Forma", [Draft("Deska hotová", recipient="bob")])
-    note_id = bob.notes("Forma")[0].note_id
-    # odkaz Upravit jen u autora, Doplnit u všech
-    assert f"spmedit:{note_id}" in notes_html(alice.notes("Forma"), "alice", 0, False)
-    bob_html = notes_html(bob.notes("Forma"), "bob", 0, False)
-    assert f"spmedit:{note_id}" not in bob_html and f"spmreply:{note_id}" in bob_html
-
-    answers = {}
-
-    class FakeEdit:
-        def __init__(self, title, text, recipient, users, parent, hint="", ok_text=""):
-            answers["prefill"] = text
-        def exec(self):
-            return True
-        def text_value(self):
-            return answers["text"]
-        def recipient_value(self):
-            return ("bob", "Bob")
-    monkeypatch.setattr(notes_window, "NoteEditDialog", FakeEdit)
-
-    seen = {"bob": 0}
-    bob_window = NotesWindow(bob, "Forma", seen_get=lambda: seen["bob"],
-                             seen_set=lambda v: seen.__setitem__("bob", v))
-    assert "NOVÁ" in bob_window.view.toPlainText()
-    answers["text"] = "Ano, rozumím."
-    bob_window._on_link(QUrl(f"spmreply:{note_id}"))                 # Bob doplní
-    assert [r.text for r in bob.notes("Forma")[0].replies] == ["Ano, rozumím."]
-    assert "Ano, rozumím." in bob_window.view.toPlainText()
-
-    alice_window = NotesWindow(alice, "Forma")
-    answers["text"] = "Deska hotová, **díry posunuty**"
-    alice_window._on_link(QUrl(f"spmedit:{note_id}"))               # Alice upraví
-    assert answers["prefill"] == "Deska hotová"
-    bob_window.reload()
-    text = bob_window.view.toPlainText()
-    assert "UPRAVENÁ" in text and "díry posunuty" in text and "Předchozí znění (1)" in text
-    shown = []
-    monkeypatch.setattr(QMessageBox, "exec", lambda box: shown.append(box.detailedText()) or 0)
-    bob_window._on_link(QUrl(f"spmversions:{note_id}"))
-    assert "Deska hotová" in shown[0]
-    # Bob upravit cizí poznámku nemůže (ani podvrženým odkazem)
-    errors = []
-    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: errors.append(a[2]))
-    bob_window._on_link(QUrl(f"spmedit:{note_id}"))
-    assert errors and "autor" in errors[0]
-
-
-def test_new_reply_to_my_note_opens_window(qapp, pms):
-    alice, bob = pms
-    alice.add_notes("Forma", [Draft("Otázka pro všechny")])
-    w = make_window(qapp, alice)
+    alice.add_notes("Forma", [Draft("pro Boba", recipient="bob"), Draft("taky pro Boba", recipient="bob"),
+                              Draft("pro všechny")])
+    w = make_window(qapp, bob)
     try:
-        select_forma(w)
-        assert (w.settings.workspace_id, "Forma") not in w._notes_windows   # vlastní, bez doplnění
-        w.open_notes("Forma").close()                              # Alice poznámky viděla
-        bob.reply_note("Forma", bob.notes("Forma")[0].note_id, "Odpověď od Boba")
-        w.refresh(check_names=False)
-        w.table.clearSelection()
-        select_forma(w)
-        window = w._notes_windows[(w.settings.workspace_id, "Forma")]
-        assert window.isVisible() and "nové doplnění" in window.view.toPlainText()
+        assert w.btn_for_me.isVisibleTo(w) and w.btn_for_me.text() == "📝 2 pro vás"
+        w.show_notes_for_me("Forma")
+        assert w.selected().name == "Forma" and w.side.currentWidget() is w.notes
+        assert w.notes.current_filter() == "mine" and len(w.notes.card_widgets()) == 2
+        for card in w.notes.card_widgets():
+            card.resolved.setChecked(True)
+            qapp.processEvents()
+        assert not w.btn_for_me.isVisibleTo(w)                          # vše vyřízeno
     finally:
         close(w, qapp)
 
 
-def test_own_changes_are_not_new(qapp, pms):
-    from spm.gui.notes_window import notes_html
+def test_switching_project_keeps_notes_tab_on_top(qapp, pms, tmp_path):
     alice, bob = pms
-    alice.add_notes("Forma", [Draft("Otázka", recipient="bob")])
-    note_id = alice.notes("Forma")[0].note_id
-    seen = alice.notes("Forma")[0].seq
-    alice.reply_note("Forma", note_id, "Moje doplnění")
-    alice.edit_note("Forma", note_id, "Otázka upravená")
-    html = notes_html(alice.notes("Forma"), "alice", seen, False)
-    assert "NOV" not in html and "UPRAVENÁ" not in html            # pro autorku nic nového
-    html = notes_html(bob.notes("Forma"), "bob", seen, False)
-    assert "UPRAVENÁ" in html and "NOVÉ" in html                    # pro Boba ano
-
-
-def test_for_me_card_colors_follow_dark_mode(qapp, pms):
-    from PySide6.QtGui import QColor, QPalette
-
-    from spm.gui.notes_window import FOR_ME_DARK, FOR_ME_LIGHT, NotesWindow
-    alice, bob = pms
-    alice.add_notes("Forma", [Draft("pro Boba", recipient="bob")])
-    window = NotesWindow(bob, "Forma")
-    html = window.view.toHtml().lower()
-    assert FOR_ME_LIGHT.background in html                          # světlý režim (výchozí paleta)
-    dark = QPalette(window.palette())
-    dark.setColor(QPalette.ColorRole.Base, QColor("#1e1e1e"))
-    dark.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
-    window.view.setPalette(dark)
-    window.setPalette(dark)                                          # změna palety -> překreslení
-    html = window.view.toHtml().lower()
-    assert FOR_ME_DARK.background in html and FOR_ME_LIGHT.background not in html
-    assert FOR_ME_DARK.text in html                                 # bílý text
-
-
-def test_note_text_larger_than_meta(qapp, pms):
-    from spm.gui.notes_window import NotesWindow, TextSizes, notes_html
-    alice, bob = pms
-    alice.add_notes("Forma", [Draft("Hlavní text", recipient="bob")])
-    sizes = TextSizes.from_base(9)
-    assert sizes.text > 9 > sizes.meta
-    html = notes_html(bob.notes("Forma"), "bob", 0, False, sizes=sizes)
-    assert f"font-size:{sizes.text}pt" in html and f"font-size:{sizes.meta}pt" in html
-    window = NotesWindow(bob, "Forma")
-    doc = window.view.document()
-    text_block = doc.find("Hlavní text")
-    meta_block = doc.find("Označit jako vyřízené")
-    assert text_block.charFormat().fontPointSize() > meta_block.charFormat().fontPointSize()
+    write(tmp_path / "server" / "Druhy" / "a.txt", "a")
+    alice.add_notes("Forma", [Draft("poznámka")])
+    w = make_window(qapp, bob)
+    try:
+        w.show()
+        select_forma(w)
+        w.open_notes()
+        assert w.notes.isVisible() and not w.panel.isVisible()
+        w.table.selectRow([p.name for p in w.projects].index("Druhy"))   # jiný projekt
+        settle_panel(w.panel)
+        qapp.processEvents()
+        assert w.side.currentWidget() is w.notes
+        assert w.notes.isVisible() and not w.panel.isVisible()           # strom nesmí překrýt poznámky
+        w.side.setCurrentWidget(w.panel)
+        assert w.panel.isVisible() and not w.notes.isVisible()
+        w.table.selectRow([p.name for p in w.projects].index("Forma"))
+        settle_panel(w.panel)
+        assert w.panel.isVisible() and not w.notes.isVisible()
+    finally:
+        close(w, qapp)

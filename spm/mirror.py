@@ -287,9 +287,14 @@ class Mirror:
                                 if occupant is not None and occupant.file_id != fid:
                                     res.conflicts.append(f"{rel} – v cíli už existuje jiný soubor")
                                     continue
-                                move_file(to_abs(target, old), to_abs(target, rel))
-                                remove_empty_parents(target, old)
-                                fix_case(target, rel)
+                                if to_abs(target, old).exists():
+                                    move_file(to_abs(target, old), to_abs(target, rel))
+                                    remove_empty_parents(target, old)
+                                    fix_case(target, rel)
+                                elif sfid not in staged:  # kopie v cíli zmizela a nová není
+                                    res.conflicts.append(f"{rel} – kopie v cíli chybí")
+                                    continue
+                                # jinak se ověřená dočasná kopie nasadí rovnou pod novým názvem
                                 res.renamed.append(f"{old} -> {rel}")
                                 files.pop(old, None)
                                 files[rel] = cur

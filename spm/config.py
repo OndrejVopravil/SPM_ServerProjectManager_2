@@ -61,6 +61,8 @@ def legacy_settings_path() -> Path:
 class Settings:
     server_root: str = ""
     local_root: str = ""
+    # záložka „Složka“: obyčejná složka mimo spolupráci (např. Data); prázdné = záložka projektů
+    folder_root: str = ""
     # Záloha přepisovaných souborů na serveru (.spm/backup/<cesta>.backupXY)
     backup_enabled: bool = True
     backup_count: int = 3
@@ -151,12 +153,18 @@ class Settings:
         path.write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
 
     def is_complete(self) -> bool:
-        return bool(self.server_root and self.local_root)
+        """Záložka projektů má nastavenou síťovou i místní složku."""
+        return bool(self.server_root and self.local_root) and not self.is_folder
+
+    @property
+    def is_folder(self) -> bool:
+        """Záložka „Složka“ (obyčejná složka, ne projekty)."""
+        return bool(self.folder_root)
 
 
 INTERNAL_FIELDS = ("workspace_id", "_app")
 # Nastavení, která má každá záložka vlastní; ostatní (kromě ui) jsou osobní – pro všechny záložky
-WORKSPACE_FIELDS = ("server_root", "local_root", "backup_enabled", "backup_count",
+WORKSPACE_FIELDS = ("server_root", "local_root", "folder_root", "backup_enabled", "backup_count",
                     "check_forbidden_chars", "ignore_patterns", "known_default_ignore",
                     "server_id", "server_name", "tab_color", "scripts")
 PERSONAL_FIELDS = tuple(f.name for f in fields(Settings)
@@ -176,6 +184,29 @@ def _inside(child: str, parent: str) -> bool:
         return Path(child).resolve().is_relative_to(Path(parent).resolve())
     except OSError:
         return False
+
+
+def _overlap(a: str, b: str) -> bool:
+    """Stejné složky, nebo jedna leží v druhé."""
+    return _same_dir(a, b) or _inside(a, b) or _inside(b, a)
+
+
+def project_folder_inside(folder: str) -> str | None:
+    """Je složka projektem SPM, leží v projektu, nebo obsahuje projekty (servisní složka .spm)?
+    Zachytí i složky pro spolupráci, které nejsou v žádné záložce tohoto počítače."""
+    from . import SPM_DIR
+    path = Path(folder)
+    try:
+        for p in [path, *path.parents]:
+            if (p / SPM_DIR).is_dir():
+                return f"Složka je součástí projektu SPM ({p}) – vyberte složku mimo projekty."
+        for child in path.iterdir():
+            if child.is_dir() and (child / SPM_DIR).is_dir():
+                return (f"Složka obsahuje projekt SPM ({child.name}) – je to složka pro spolupráci, "
+                        "ne obyčejná složka.")
+    except OSError:
+        return None
+    return None
 
 
 class AppSettings:
@@ -251,9 +282,18 @@ class AppSettings:
         self.workspace(ws_id)["name"] = name
 
     def folder_conflict(self, ws_id: str, server_root: str, local_root: str) -> str | None:
-        """Kolize složek s jinou záložkou (stejný server, stejná nebo vnořená místní složka)."""
+        """Kolize složek s jinou záložkou (stejný server, stejná nebo vnořená místní složka;
+        překrytí se záložkou „Složka“)."""
         for w in self.workspaces:
             if w["id"] == ws_id:
+                continue
+            folder = w.get("folder_root")
+            if folder:
+                for root, label in ((server_root, "Síťová"), (local_root, "Místní")):
+                    if root and _overlap(root, folder):
+                        return (f"{label} složka se kryje se záložkou „{w['name']}“ typu Složka "
+                                f"({folder}).\nSložky pro spolupráci a obyčejné složky se nesmí "
+                                "překrývat (ani jedna nesmí ležet v druhé).")
                 continue
             if w.get("server_root") and server_root and _same_dir(w["server_root"], server_root):
                 return f"Síťovou složku už používá záložka „{w['name']}“."
@@ -264,6 +304,19 @@ class AppSettings:
                         "Každá záložka musí mít vlastní místní složku (projekty se stejným názvem "
                         "na různých serverech by se jinak srazily).")
         return None
+
+    def folder_tab_conflict(self, ws_id: str, folder: str) -> str | None:
+        """Záložka „Složka“: nesmí obsahovat žádnou složku pro spolupráci (síťovou ani místní)
+        a nesmí v žádné ležet – jinak by šlo měnit soubory projektů mimo SPM."""
+        for w in self.workspaces:
+            if w["id"] == ws_id or w.get("folder_root"):
+                continue
+            for key, label in (("server_root", "síťovou"), ("local_root", "místní")):
+                root = w.get(key)
+                if root and _overlap(root, folder):
+                    return (f"Složka se kryje s {label} složkou záložky „{w['name']}“ ({root}).\n"
+                            "Obyčejná složka nesmí obsahovat složku pro spolupráci ani v ní ležet.")
+        return project_folder_inside(folder)
 
     # --- načtení a uložení ------------------------------------------------------
 

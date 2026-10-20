@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -120,18 +121,37 @@ class WriteLock:
                     ) from None
                 time.sleep(0.2)
                 continue
+            self.token = uuid.uuid4().hex
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"user": self.user, "pc": self.pc, "since": now_iso()}, f)
+                json.dump({"user": self.user, "pc": self.pc, "since": now_iso(), "token": self.token}, f)
             return self
+
+    def _server_now(self) -> float:
+        """Aktuální čas podle hodin serveru: čas změny čerstvě zapsaného souboru ve stejné
+        složce. Hodiny PC se od serveru můžou lišit o minuty – PC s hodinami napřed by jinak
+        bral cizí platný zámek za starý (a zapisovali by dva najednou)."""
+        probe = self.path.with_name(f"clock.{_safe(self.user)}@{_safe(self.pc)}.probe".lower())
+        try:
+            probe.write_bytes(b"")
+            return probe.stat().st_mtime
+        except OSError:
+            return time.time()
 
     def _is_stale(self) -> bool:
         try:
-            return time.time() - self.path.stat().st_mtime > self.stale
+            mtime = self.path.stat().st_mtime
         except FileNotFoundError:
             return False
+        return self._server_now() - mtime > self.stale
 
     def __exit__(self, *exc) -> None:
-        self.path.unlink(missing_ok=True)
+        # jen vlastní zámek (kdyby ho jiný uživatel mezitím převzal jako starý, nemazat mu ho)
+        try:
+            owner = json.loads(self.path.read_text(encoding="utf-8")).get("token")
+        except (OSError, ValueError, AttributeError):
+            owner = None
+        if owner in (None, getattr(self, "token", None)):
+            self.path.unlink(missing_ok=True)
 
     def moved_to(self, project_dir: Path) -> None:
         """Projektová složka byla přejmenována – zámek je teď na nové cestě."""

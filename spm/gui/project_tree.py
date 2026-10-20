@@ -24,22 +24,40 @@ from PySide6.QtWidgets import QAbstractItemView, QTreeWidgetItem, QWidget
 from .check_tree import PATH_ROLE, CheckTree
 
 MIME_FILES = "application/x-spm-files"   # (cesta v projektu, cesta v cíli) – tažení uvnitř stromu
+# schránka (Kopírovat / Vyjmout): odkud soubory jsou – záložka, projekt, položky, vyjmuto
+MIME_CLIPBOARD = "application/x-spm-clipboard"
 STAGING_ROOT = Path(tempfile.gettempdir()) / "spm_drag"
 STAGING_KEEP_S = 600  # dočasné kopie pro tažení ven se mažou až po 10 min (Průzkumník je kopíruje)
+CLIPBOARD_ROOT = Path(tempfile.gettempdir()) / "spm_clip"
+CLIPBOARD_KEEP_S = 24 * 3600  # schránka se může vložit i mnohem později než tažení
 
 
-def new_staging_dir() -> Path:
-    """Nová dočasná složka pro tažení ven; staré (dávno přetažené) se smažou."""
+def new_staging_dir(root: Path | None = None, keep_s: float = STAGING_KEEP_S) -> Path:
+    """Nová dočasná složka pro tažení ven (nebo schránku – jiný root); staré se smažou."""
+    root = root or STAGING_ROOT
     now = time.time()
     try:
-        for old in STAGING_ROOT.iterdir():
-            if now - old.stat().st_mtime > STAGING_KEEP_S:
+        for old in root.iterdir():
+            if now - old.stat().st_mtime > keep_s:
                 shutil.rmtree(old, ignore_errors=True)
     except OSError:
         pass
-    path = STAGING_ROOT / uuid.uuid4().hex[:12]
+    path = root / uuid.uuid4().hex[:12]
     path.mkdir(parents=True)
     return path
+
+
+def clipboard_info(mime: QMimeData | None) -> dict | None:
+    """Údaje SPM ve schránce: z projektu {"ws", "project", "items": [(cesta, cesta v cíli)],
+    "cut"}, ze záložky Složka {"ws", "folder": True, "paths": [...], "cut"}."""
+    if mime is None or not mime.hasFormat(MIME_CLIPBOARD):
+        return None
+    try:
+        data = json.loads(bytes(mime.data(MIME_CLIPBOARD)).decode("utf-8"))
+        data["items"] = [tuple(x) for x in data.get("items", [])]
+        return data
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 def files_mime(items: list[tuple[str, str]], urls: list[Path]) -> QMimeData:

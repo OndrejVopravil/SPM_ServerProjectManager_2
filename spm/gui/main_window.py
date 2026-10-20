@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPalette, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPainter, QPalette, QPen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -18,7 +21,9 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSplitter,
+    QStackedWidget,
     QStyle,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
@@ -51,7 +56,8 @@ from ..scripting.runtime import ScriptEnv, ScriptSession, clear_stale_marks
 from .comment_dialog import CommentDialog
 from .script_ui import GuiScriptUI
 from .scripts_dialog import ScriptsDialog
-from .notes_window import NotesWindow, QuickNoteDialog
+from .folder_panel import FolderPanel
+from .notes_panel import FILTER_MINE, FILTER_SELECTED, DetachedNotes, NotesPanel
 from .tab_bar import TAB_COLORS, ColorTabBar, is_dark
 from .. import notes as notes_mod
 from .file_select_dialog import FileSelectDialog
@@ -139,49 +145,94 @@ def format_external(items: list[str]) -> str:
             + "\n\nZměna je zapsaná v historii projektu jako „Změněn mimo aplikaci“.")
 
 
-class MainWindow(QMainWindow):
-    def __init__(self, settings: Settings | AppSettings):
-        super().__init__()
-        # celé nastavení se záložkami; samotné Settings (testy) = jedna záložka
-        self.app_settings = settings if isinstance(settings, AppSettings) else AppSettings.from_settings(settings)
-        settings = self.settings = self.app_settings.view(self.app_settings.active)
-        self.pm = ProjectManager(settings)
-        # společná konfigurace na síti (spm_config.json) – každá záložka má svou
-        self._shared: dict[str, SharedConfig] = {}
-        self.shared = self._shared.setdefault(settings.workspace_id, SharedConfig())
+class Pane:
+    """Jeden panel okna (jako v Total Commanderu): vlastní záložka, seznam projektů, strom
+    souborů a stav načítání. Okno pracuje vždy s „aktuálním“ panelem (MainWindow.pane) – mimo
+    obsluhu událostí konkrétního panelu je to panel aktivní (zvýrazněný, na něj míří lišta)."""
+
+    def __init__(self, index: int):
+        self.index = index
+        self.settings: Settings | None = None
+        self.pm: ProjectManager | None = None
+        self.shared: SharedConfig | None = None
         self.projects: list[ProjectStatus] = []
         self.name_issues: dict[str, list[str]] = {}  # projekt -> názvy s nepovolenými znaky
         self._name_check: NameCheckThread | None = None
         self._bg_refresh: ProjectListThread | None = None  # tiché obnovení seznamu na pozadí
         self._name_check_again = False
         self._rendering = False
-        self._closing = False
+        self._columns_sized = False
         self._last_refresh = 0.0  # time.monotonic() posledního obnovení seznamu
+        self._notes_window: DetachedNotes | None = None  # odpojené poznámky panelu
+
+    @property
+    def key(self) -> str:
+        """Přípona klíčů uloženého vzhledu (levý panel bez přípony – jako dřív)."""
+        return "" if self.index == 0 else ".2"
+
+
+class PaneFrame(QFrame):
+    """Rámeček panelu – aktivní panel (v režimu dvou panelů) má zvýrazněný okraj. Kreslí se
+    sám, bez stylu (styl by bránil předávání palety – tmavý režim záložek)."""
+
+    def __init__(self):
+        super().__init__()
+        self.active = False
+
+    def set_active(self, active: bool) -> None:
+        if active != self.active:
+            self.active = active
+            self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 – Qt
+        super().paintEvent(event)
+        if self.active:
+            painter = QPainter(self)
+            pen = QPen(self.palette().color(QPalette.ColorRole.Highlight))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawRect(self.rect().adjusted(1, 1, -1, -1))
+            painter.end()
+
+
+# stav a ovládací prvky, které má každý panel svoje (MainWindow.<název> = aktuální panel)
+PANE_ATTRS = ("settings", "pm", "shared", "projects", "name_issues", "_name_check", "_bg_refresh",
+              "_name_check_again", "_rendering", "_columns_sized", "_last_refresh", "table",
+              "search", "panel", "side", "splitter", "tabs", "btn_add_tab", "tabs_row",
+              "projects_page", "folder_panel", "pages", "frame", "notes", "_notes_window")
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, settings: Settings | AppSettings):
+        super().__init__()
+        # celé nastavení se záložkami; samotné Settings (testy) = jedna záložka
+        self.app_settings = settings if isinstance(settings, AppSettings) else AppSettings.from_settings(settings)
+        # dva panely (druhý jen v režimu „Dva panely“); okno pracuje s aktuálním panelem
+        self.panes = [Pane(0), Pane(1)]
+        self.pane = self.active_pane = self.panes[0]
+        self.dual = False
+        # společná konfigurace na síti (spm_config.json) – každá záložka má svou
+        self._shared: dict[str, SharedConfig] = {}
+        for pane in self.panes:
+            with self.on_pane(pane):
+                ws_id = self.app_settings.active if pane.index == 0 else self._pane_workspace()
+                self.settings = self.app_settings.view(ws_id)
+                self.pm = ProjectManager(self.settings)
+                self.shared = self._shared.setdefault(ws_id, SharedConfig())
+        settings = self.settings
+        self._closing = False
+        self._finished_checks: list[NameCheckThread] = []  # dokončené kontroly názvů (viz _start_name_check)
         # návrat do aplikace z jiné (klepnutí, Alt+Tab, hlavní panel) -> obnovit seznam
         QGuiApplication.instance().applicationStateChanged.connect(self._on_app_state)
         self.setWindowTitle(f"SPM – Server Project Manager {__version__}")
         self.resize(1000, 560)
         restore_geometry(settings, "main", self)
 
-        self.table = QTableWidget(0, len(COLUMNS))
-        self.table.setHorizontalHeaderLabels(COLUMNS)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setWordWrap(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        # šířky sloupců: uložené od minula, jinak se jednou nastaví podle obsahu
-        self._columns_sized = restore_header(settings, HEADER_KEY, self.table.horizontalHeader())
-        self.table.itemSelectionChanged.connect(self._on_selection)
-        # dvojklik: název = aktivovat / deaktivovat, komentář = upravit, jinak místní složka projektu
-        self.table.doubleClicked.connect(self._on_double_click)
-
         tb = QToolBar("Akce")
         tb.setMovable(False)
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.addToolBar(tb)
-        self.act_refresh = self._action(tb, "Obnovit", self.refresh, QKeySequence(Qt.Key.Key_F5),
+        self.act_refresh = self._action(tb, "Obnovit", self.refresh_all, QKeySequence(Qt.Key.Key_F5),
                                         tip="Obnoví seznam projektů (F5)")
         tb.addSeparator()
         self.act_activate = self._action(tb, "Aktivovat…", self.activate,
@@ -199,10 +250,16 @@ class MainWindow(QMainWindow):
         self.act_open = self._action(tb, "Otevřít místní složku", self.open_local)
         self.act_history = self._action(tb, "Historie", self.history)
         self.act_notes = self._action(tb, "Poznámky", self.open_notes,
-                                      tip="Předávací poznámky k projektu (plovoucí okno)")
+                                      tip="Poznámky k projektu – záložka vedle stromu souborů")
         tb.addSeparator()
         self.act_scripts = self._action(tb, "Skripty", self.open_scripts,
                                         tip="Skripty spouštěné po odevzdání (zrcadlení, kopie, archivy…)")
+        self.act_dual = QAction("Dva panely", self)
+        self.act_dual.setCheckable(True)
+        self.act_dual.setToolTip("Dva panely vedle sebe (jako v Total Commanderu) – v každém jiná "
+                                 "záložka; soubory mezi nimi lze kopírovat a přetahovat")
+        self.act_dual.toggled.connect(lambda on: self.set_dual(on))
+        tb.addAction(self.act_dual)
         self._action(tb, "Nastavení", self.open_settings)
 
         # Popisky zkratek: v liště „Obnovit (F5)“, v kontextové nabídce zarovnaně vpravo.
@@ -229,7 +286,6 @@ class MainWindow(QMainWindow):
         self.act_rename.setShortcut(QKeySequence(Qt.Key.Key_F2))
         self.act_rename.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         self.act_rename.triggered.connect(lambda: self.rename_project())
-        self.table.addAction(self.act_rename)
         self.act_comment = QAction("Upravit komentář…", self)
         self.act_comment.setToolTip("Komentář projektu vidí všichni; změny se zapisují do historie")
         self.act_comment.triggered.connect(lambda: self.edit_comment())
@@ -244,42 +300,220 @@ class MainWindow(QMainWindow):
         self.act_rerun_scripts.triggered.connect(lambda: self.rerun_scripts())
         self.act_discard_scripts = QAction("Zahodit nedokončený skript…", self)
         self.act_discard_scripts.triggered.connect(lambda: self.discard_scripts())
+
+        self.script_ui = GuiScriptUI(self)  # dialogy skriptů (ASK, INPUT, CHOOSE, FORM)
+        # vpravo v řádku záložek: poznámky pro mě a stav aplikace (aktualizuji…, přenáším data…)
+        self.btn_for_me = QToolButton()
+        self.btn_for_me.setAutoRaise(True)
+        self.btn_for_me.setToolTip("Otevřené poznámky pro vás – klepnutím vyberte projekt")
+        self.btn_for_me.clicked.connect(lambda: self._for_me_menu())
+        self.btn_for_me.hide()
+        self.status_label = QLabel()
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.status_label.setContentsMargins(8, 0, 4, 0)
+        self._busy: dict[str, str] = {}       # druh činnosti -> text (viz BUSY_ORDER)
+        self._idle_status = ("", "", False)  # text, tooltip, chyba
+        self.status_box = QWidget()
+        status_lay = QHBoxLayout(self.status_box)
+        status_lay.setContentsMargins(0, 0, 0, 0)
+        status_lay.addWidget(self.btn_for_me)
+        status_lay.addWidget(self.status_label)
+
+        for pane in self.panes:
+            with self.on_pane(pane):
+                self._build_pane()
+        self.panes_split = QSplitter(Qt.Orientation.Horizontal)
+        self.panes_split.setChildrenCollapsible(False)
+        for pane in self.panes:
+            self.panes_split.addWidget(pane.frame)
+        state = settings.ui.get("main.panes")
+        if state:
+            self.panes_split.restoreState(QByteArray.fromBase64(state.encode("ascii")))
+
+        central = QWidget()
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(4, 4, 4, 0)
+        layout.addWidget(self.panes_split)
+        self.setCentralWidget(central)
+        for pane in self.panes:
+            with self.on_pane(pane):
+                self._show_page()
+        focus = QAction(self)
+        focus.setShortcut(QKeySequence.StandardKey.Find)
+        focus.triggered.connect(lambda: (self.search.setFocus(), self.search.selectAll()))
+        self.addAction(focus)
+        # klepnutí do panelu (fokus) = aktivní panel
+        QApplication.instance().focusChanged.connect(self._on_focus_changed)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(lambda: self._each_pane(
+            lambda: self.refresh(silent=True, check_names=False, background=True, propagate=False)))
+        self._apply_refresh_timer()
+
+        self.act_dual.blockSignals(True)  # set_dual by hned načítal druhý panel
+        self.act_dual.setChecked(settings.ui.get("main.dual") == "1")
+        self.act_dual.blockSignals(False)
+        self._apply_dual()
+        self._activate_pane(self.panes[0])
+        self._update_status_bar()
+        QTimer.singleShot(0, self._startup)
+
+    # --- panely ---------------------------------------------------------------------
+
+    @contextmanager
+    def on_pane(self, pane: Pane):
+        """Okno dočasně pracuje s panelem pane (self.table, self.pm… patří jemu)."""
+        previous, self.pane = self.pane, pane
+        try:
+            yield pane
+        finally:
+            self.pane = previous
+
+    def _in(self, pane: Pane, fn):
+        """Obsluha události z panelu pane – proběhne v jeho kontextu."""
+        def run(*args):
+            with self.on_pane(pane):
+                return fn(*args)
+        return run
+
+    def visible_panes(self) -> list[Pane]:
+        return self.panes if self.dual else self.panes[:1]
+
+    def _each_pane(self, fn) -> None:
+        for pane in self.visible_panes():
+            with self.on_pane(pane):
+                fn()
+
+    def _other_panes(self) -> list[Pane]:
+        return [p for p in self.visible_panes() if p is not self.pane]
+
+    def _same_workspace_panes(self) -> list[Pane]:
+        """Ostatní zobrazené panely se stejnou záložkou jako aktuální panel."""
+        return [p for p in self._other_panes()
+                if p.settings.workspace_id == self.settings.workspace_id and not p.settings.is_folder]
+
+    def _sync_other_panes(self) -> None:
+        """Seznam aktuálního panelu se obnovil (po akci nebo ručně): druhý panel se stejnou
+        záložkou převezme stejná data (bez sítě), s jinou záložkou se obnoví na pozadí – akce
+        mohla změnit i jinou záložku (zrcadlení, kopie mezi projekty)."""
+        source = self.pane
+        for pane in self._other_panes():
+            with self.on_pane(pane):
+                if pane.settings.is_folder:
+                    continue  # strom složky se obnovuje sám
+                if pane.settings.workspace_id == source.settings.workspace_id:
+                    current = self.selected().name if self.selected() else None
+                    self.projects = list(source.projects)
+                    self.name_issues = dict(source.name_issues)
+                    self._render(current)
+                    self._show_project(self.selected())
+                else:
+                    self.refresh(silent=True, check_names=False, background=True, propagate=False)
+
+    def _sync_row(self, status: ProjectStatus) -> None:
+        """Aktuální stav jednoho projektu (po klepnutí, poznámkách…) i ve druhém panelu."""
+        for pane in self._same_workspace_panes():
+            with self.on_pane(pane):
+                names = [p.name for p in self.projects]
+                if status.name not in names:
+                    continue
+                r = names.index(status.name)
+                self.projects[r] = status
+                self._render_row(r, status)
+                if self.panel.project is not None and self.panel.project.name == status.name:
+                    self.panel.reload()
+                if self.notes.name == status.name:
+                    self.notes.reload()
+
+    def _on_panel_modified(self) -> None:
+        """Soubory změněné ve stromu jednoho panelu: stromy ostatních panelů znovu načíst
+        (stejný projekt, nebo zdroj přesunu z jiného projektu)."""
+        for pane in self._other_panes():
+            if pane.panel.project is not None and not pane.settings.is_folder:
+                pane.panel.reload()
+
+    def refresh_all(self) -> None:
+        """F5: obnoví seznam ve všech zobrazených panelech."""
+        self._each_pane(lambda: self.refresh(propagate=False))
+
+    def _pane_workspace(self) -> str:
+        """Záložka druhého panelu (uložená), jinak stejná jako v prvním."""
+        ws_id = self.app_settings.base.ui.get("pane2.workspace", "")
+        return ws_id if any(w["id"] == ws_id for w in self.app_settings.workspaces) else self.app_settings.active
+
+    def _build_pane(self) -> None:
+        """Ovládací prvky aktuálního panelu: záložky, hledání, seznam projektů, strom, složka."""
+        pane = self.pane
+        settings = self.settings
+        self.table = QTableWidget(0, len(COLUMNS))
+        self.table.setHorizontalHeaderLabels(COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setWordWrap(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        # šířky sloupců: uložené od minula, jinak se jednou nastaví podle obsahu
+        self._columns_sized = restore_header(settings, HEADER_KEY + pane.key, self.table.horizontalHeader())
+        self.table.itemSelectionChanged.connect(self._in(pane, self._on_selection))
+        # dvojklik: název = aktivovat / deaktivovat, komentář = upravit, jinak místní složka projektu
+        self.table.doubleClicked.connect(self._in(pane, self._on_double_click))
+        self.table.addAction(self.act_rename)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self._context_menu)
+        self.table.customContextMenuRequested.connect(self._in(pane, self._context_menu))
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Hledat projekt…  (Ctrl+F)")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(320)
-        self.search.textChanged.connect(self._apply_filter)
-        self.search.returnPressed.connect(self._select_first_visible)
-        # pod seznamem: stav vybraného aktivovaného projektu (kdo drží které soubory)
-        self.script_ui = GuiScriptUI(self)  # dialogy skriptů (ASK, INPUT, CHOOSE, FORM)
+        self.search.textChanged.connect(self._in(pane, lambda _text: self._apply_filter()))
+        self.search.returnPressed.connect(self._in(pane, self._select_first_visible))
+        clear = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.search)
+        # jen v poli hledání projektů – Esc v panelu stromu ruší hledání souborů
+        clear.setContext(Qt.ShortcutContext.WidgetShortcut)
+        clear.activated.connect(self.search.clear)
+
+        # pod seznamem: stav vybraného projektu (kdo drží které soubory)
         self.panel = ProjectPanel(self.pm)
-        self.panel.hide()
-        self.panel.submit_requested.connect(self.submit)
-        self.panel.publish_requested.connect(self.publish)
-        self.panel.take_requested.connect(self.take)
-        self.panel.activate_requested.connect(self.activate)
-        self.panel.note_requested.connect(self.add_note)
-        self._notes_windows: dict[tuple[str, str], NotesWindow] = {}  # (záložka, projekt) -> okno
+        self.panel.submit_requested.connect(self._in(pane, self.submit))
+        self.panel.publish_requested.connect(self._in(pane, self.publish))
+        self.panel.take_requested.connect(self._in(pane, self.take))
+        self.panel.activate_requested.connect(self._in(pane, self.activate))
+        self.panel.note_requested.connect(self._in(pane, self.add_note))
+        self.panel.pm_for = self.pm_for
+        self.panel.modified.connect(self._in(pane, self._on_panel_modified))
+        self.panel.tree.itemSelectionChanged.connect(self._in(pane, self._on_tree_selection))
+        self.panel.tree.itemClicked.connect(self._in(pane, self._on_tree_click))
         self.panel.can_activate = lambda: self.act_activate.isEnabled()
         self.panel.mirror_source_label = self.mirror_source_label
         self.panel.mirror_target_label = self.mirror_target_label
         self.panel.tree.default_expanded = settings.tree_expanded  # výchozí stav složek ve stromu
         self.splitter = QSplitter(Qt.Orientation.Vertical)
+        # poznámky vybraného projektu tohoto panelu – záložka vedle stromu, lze odpojit
+        self.notes = NotesPanel(self.pm)
+        self.notes.seen_get = lambda name: int(self.settings.ui.get(self._notes_seen_key(name)) or 0)
+        self.notes.seen_set = lambda name, seq: self.settings.ui.__setitem__(self._notes_seen_key(name), str(seq))
+        self.notes.file_clicked.connect(self._in(pane, lambda path: self._show_in_tree(self.notes.name, path)))
+        self.notes.changed.connect(self._in(pane, self._on_notes_changed))
+        self.notes.counts_changed.connect(self._in(pane, self._update_notes_tab))
+        self.notes.detach_toggled.connect(self._in(pane, self.toggle_notes_detached))
+        self.side = QTabWidget()
+        self.side.setDocumentMode(True)
+        self.side.addTab(self.panel, "Soubory")
+        self.side.addTab(self.notes, "Poznámky")
+        self.side.hide()
         self.splitter.addWidget(self.table)
-        self.splitter.addWidget(self.panel)
+        self.splitter.addWidget(self.side)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 2)
         self.splitter.setChildrenCollapsible(False)
-        state = settings.ui.get("main.splitter")
+        state = settings.ui.get("main.splitter" + pane.key)
         if state:
             self.splitter.restoreState(QByteArray.fromBase64(state.encode("ascii")))
         # záložky = pracovní prostory (každá má vlastní síťovou a místní složku)
         self.tabs = ColorTabBar()
         self.tabs.setMovable(True)  # pořadí záložek přetažením myší
-        self.tabs.tabMoved.connect(lambda *_: self._save_tab_order())
+        self.tabs.tabMoved.connect(self._in(pane, lambda *_: self._save_tab_order()))
         self.tabs.setExpanding(False)
         self.tabs.setDocumentMode(True)
         # bez posouvacích šipek – jinak si lišta i s jedinou záložkou rezervuje místo navíc
@@ -289,50 +523,79 @@ class MainWindow(QMainWindow):
             tab_font.setPointSizeF(tab_font.pointSizeF() * 1.2)
         self.tabs.setFont(tab_font)
         self.tabs.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.tabs.customContextMenuRequested.connect(self._tab_menu)
+        self.tabs.customContextMenuRequested.connect(self._in(pane, self._tab_menu))
+        self.tabs.tabBarClicked.connect(lambda *_: self._activate_pane(pane))
         self.btn_add_tab = QToolButton()
         self.btn_add_tab.setText("+")
-        self.btn_add_tab.setToolTip("Přidat záložku s další síťovou složkou projektů")
+        self.btn_add_tab.setToolTip("Přidat záložku (síťová složka projektů nebo obyčejná složka)")
         self.btn_add_tab.setAutoRaise(True)
         self.btn_add_tab.setFont(tab_font)
-        self.btn_add_tab.clicked.connect(lambda: self.add_workspace())
+        self.btn_add_tab.clicked.connect(self._in(pane, lambda *_: self.add_workspace()))
         self._fill_tabs()
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-        tabs_row = QHBoxLayout()
-        tabs_row.setSpacing(2)
-        tabs_row.addWidget(self.tabs)
-        tabs_row.addWidget(self.btn_add_tab)
-        tabs_row.addStretch()
-        # stav aplikace vpravo v řádku záložek (aktualizuji…, přenáším data…, aktualizováno)
-        self.status_label = QLabel()
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.status_label.setContentsMargins(8, 0, 4, 0)
-        self._busy: dict[str, str] = {}       # druh činnosti -> text (viz BUSY_ORDER)
-        self._idle_status = ("", "", False)  # text, tooltip, chyba
-        tabs_row.addWidget(self.status_label)
+        self.tabs.currentChanged.connect(self._in(pane, self._on_tab_changed))
+        self.tabs_row = QHBoxLayout()
+        self.tabs_row.setSpacing(2)
+        self.tabs_row.addWidget(self.tabs)
+        self.tabs_row.addWidget(self.btn_add_tab)
+        self.tabs_row.addStretch()
 
-        central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(6, 6, 6, 0)
-        layout.addLayout(tabs_row)
-        layout.addWidget(self.search)
-        layout.addWidget(self.splitter)
-        self.setCentralWidget(central)
-        focus = QAction(self)
-        focus.setShortcut(QKeySequence.StandardKey.Find)
-        focus.triggered.connect(lambda: (self.search.setFocus(), self.search.selectAll()))
-        self.addAction(focus)
-        clear = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.search)
-        # jen v poli hledání projektů – Esc v panelu stromu ruší hledání souborů
-        clear.setContext(Qt.ShortcutContext.WidgetShortcut)
-        clear.activated.connect(self.search.clear)
+        # záložka projektů (hledání, seznam, strom a poznámky) / záložka „Složka“ (strom složky)
+        self.projects_page = QWidget()
+        page_lay = QVBoxLayout(self.projects_page)
+        page_lay.setContentsMargins(0, 0, 0, 0)
+        page_lay.addWidget(self.search)
+        page_lay.addWidget(self.splitter)
+        self.folder_panel = FolderPanel()
+        self.folder_panel.pm_for = self.pm_for
+        self.folder_panel.modified.connect(self._in(pane, self._on_panel_modified))
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.projects_page)
+        self.pages.addWidget(self.folder_panel)
+        self.frame = PaneFrame()
+        frame_lay = QVBoxLayout(self.frame)
+        frame_lay.setContentsMargins(2, 2, 2, 2)
+        frame_lay.addLayout(self.tabs_row)
+        frame_lay.addWidget(self.pages)
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(lambda: self.refresh(silent=True, check_names=False, background=True))
-        self._apply_refresh_timer()
+    def set_dual(self, on: bool) -> None:
+        """Režim dvou panelů (zapnutí / vypnutí z lišty)."""
+        if on == self.dual:
+            return
+        self.settings.ui["main.dual"] = "1" if on else ""
+        self._apply_dual()
+        if on:  # druhý panel se načte až při prvním zobrazení
+            with self.on_pane(self.panes[1]):
+                if self.settings.is_complete() and not self.projects:
+                    self.refresh(check_names=False)
+        elif self.active_pane is not self.panes[0]:
+            self._activate_pane(self.panes[0])
 
+    def _apply_dual(self) -> None:
+        self.dual = self.act_dual.isChecked()
+        self.panes[1].frame.setVisible(self.dual)
+        # stav aplikace a „pro vás“ vpravo v řádku záložek posledního panelu
+        self.visible_panes()[-1].tabs_row.addWidget(self.status_box)
+        self._highlight_panes()
+
+    def _highlight_panes(self) -> None:
+        for pane in self.panes:
+            pane.frame.set_active(self.dual and pane is self.active_pane)
+
+    def _on_focus_changed(self, _old, new) -> None:
+        if new is None or self._closing:
+            return
+        for pane in self.visible_panes():
+            if pane is not self.active_pane and pane.frame.isAncestorOf(new):
+                self._activate_pane(pane)
+                return
+
+    def _activate_pane(self, pane: Pane) -> None:
+        """Aktivní panel: na něj míří lišta a klávesové zkratky (poznámky má každý panel své)."""
+        self.active_pane = self.pane = pane
+        self._highlight_panes()
+        self._update_actions()
+        self._update_for_me()
         self._update_status_bar()
-        QTimer.singleShot(0, self._startup)
 
     def _action(self, tb: QToolBar, text: str, slot, shortcut=None, tip: str = "") -> QAction:
         act = QAction(text, self)
@@ -347,13 +610,32 @@ class MainWindow(QMainWindow):
     def _startup(self) -> None:
         if self._closing:  # okno zavřené dřív, než se stihlo spustit
             return
-        if not self.settings.is_complete():
+        if self.dual:  # druhý panel (záložka projektů – Složka se načítá sama)
+            with self.on_pane(self.panes[1]):
+                if self.settings.is_complete():
+                    self.refresh()
+        if self.settings.is_folder:
+            pass
+        elif not self.settings.is_complete():
             QMessageBox.information(self, "Vítejte", "Nejdříve nastavte síťovou a místní složku.")
             self.open_settings()
         else:
             self.refresh()
+        for pane in self.visible_panes():  # poznámky byly naposledy v samostatném okně
+            with self.on_pane(pane):
+                if self.settings.ui.get("notes.detached" + pane.key) == "1":
+                    self.toggle_notes_detached()
 
     def _update_status_bar(self) -> None:
+        with self.on_pane(self.active_pane):  # stavový řádek patří aktivnímu panelu
+            self._status_bar_text()
+
+    def _status_bar_text(self) -> None:
+        if self.settings.is_folder:
+            self.statusBar().showMessage(f"Uživatel: {self.pm.user} @ {self.pm.pc}    |    "
+                                         f"Složka: {self.settings.folder_root}")
+            self._update_config_label()
+            return
         self.statusBar().showMessage(
             f"Uživatel: {self.pm.user} @ {self.pm.pc}    |    Server: {self.settings.server_root or '—'}"
             f"    |    Místní: {self.settings.local_root or '—'}"
@@ -472,7 +754,7 @@ class MainWindow(QMainWindow):
         view = self.app_settings.view(ws_id)
         view.tab_color = key
         self._save_settings_of(view)
-        self._fill_tabs()
+        self._fill_all_tabs()
 
     def _save_settings_of(self, view: Settings) -> None:
         try:
@@ -483,8 +765,15 @@ class MainWindow(QMainWindow):
     def changeEvent(self, event) -> None:
         # světlý / tmavý režim: jiná varianta barev záložek a zelené barvy textu
         if event.type() == QEvent.Type.PaletteChange and hasattr(self, "tabs"):
-            self._fill_tabs()
+            self._fill_all_tabs()
         super().changeEvent(event)
+
+    def _fill_all_tabs(self) -> None:
+        """Záložky se změnily (přidání, odebrání, název, barva, pořadí) – lišty obou panelů."""
+        for pane in self.panes:
+            if hasattr(pane, "tabs"):
+                with self.on_pane(pane):
+                    self._fill_tabs()
 
     def _fill_tabs(self) -> None:
         self.tabs.blockSignals(True)
@@ -495,8 +784,12 @@ class MainWindow(QMainWindow):
                 i = self.tabs.addTab("")
                 self._style_tab(i, ws)
                 self.tabs.setTabData(i, ws["id"])
-                self.tabs.setTabToolTip(i, f"Síť: {ws.get('server_root') or '—'}\n"
-                                           f"Místní: {ws.get('local_root') or '—'}")
+                if ws.get("folder_root"):
+                    self.tabs.setTabToolTip(i, f"Složka: {ws['folder_root']}")
+                    self.tabs.setTabIcon(i, self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
+                else:
+                    self.tabs.setTabToolTip(i, f"Síť: {ws.get('server_root') or '—'}\n"
+                                               f"Místní: {ws.get('local_root') or '—'}")
                 if ws["id"] == self.settings.workspace_id:
                     self.tabs.setCurrentIndex(i)
         finally:
@@ -507,9 +800,15 @@ class MainWindow(QMainWindow):
         mine = sorted(p.name for p in self.projects if p.mine)
         self.settings.ui[self._ui_key("activated")] = str(len(mine))
         self.settings.ui[self._ui_key("activated_names")] = "\n".join(mine)  # pro upozornění při ukončení
-        i = self.tabs.currentIndex()
-        if i >= 0:
-            self._style_tab(i, self.app_settings.workspace(self.settings.workspace_id))
+        ws_id = self.settings.workspace_id
+        ws = self.app_settings.workspace(ws_id)
+        for pane in self.panes:  # záložka v liště obou panelů
+            if not hasattr(pane, "tabs"):
+                continue
+            with self.on_pane(pane):
+                for i in range(self.tabs.count()):
+                    if self.tabs.tabData(i) == ws_id:
+                        self._style_tab(i, ws)
 
     def _on_tab_changed(self, index: int) -> None:
         ws_id = self.tabs.tabData(index)
@@ -520,9 +819,12 @@ class MainWindow(QMainWindow):
         """Přepne na jinou záložku: jiné nastavení, jiný seznam projektů i strom."""
         if getattr(self, "_running_task", None):
             QMessageBox.information(self, "Záložky", "Počkejte na dokončení probíhající akce.")
-            self._fill_tabs()
+            self._fill_all_tabs()
             return
-        self.app_settings.active = ws_id
+        if self.pane.index == 0:
+            self.app_settings.active = ws_id
+        else:
+            self.app_settings.base.ui["pane2.workspace"] = ws_id
         self.settings = self.app_settings.view(ws_id)
         self.pm = ProjectManager(self.settings)
         self.panel.pm = self.pm
@@ -530,15 +832,31 @@ class MainWindow(QMainWindow):
         self.projects, self.name_issues = [], {}
         self._name_check_again = False
         self._render(None)
-        self.panel.show_project(None)
-        self._fill_tabs()
+        self._show_project(None)
+        self._fill_all_tabs()
         self._update_status_bar()
+        self._show_page()
         if self.settings.is_complete():
             self.refresh()
         else:
             self._update_config_label()
 
+    def _show_page(self) -> None:
+        """Záložka projektů, nebo záložka „Složka“ (obyčejná složka mimo spolupráci)."""
+        if self.settings.is_folder:
+            self.folder_panel.set_root(self.settings.folder_root, self.settings.workspace_id)
+            self.pages.setCurrentWidget(self.folder_panel)
+        else:
+            self.pages.setCurrentWidget(self.projects_page)
+
     def add_workspace(self) -> None:
+        kinds = ["Projekty (síťová složka pro spolupráci)", "Složka (obyčejná, např. Data)"]
+        kind, ok = QInputDialog.getItem(self, "Přidat záložku", "Druh záložky:", kinds, 0, False)
+        if not ok:
+            return
+        if kind == kinds[1]:
+            self.add_folder_workspace()
+            return
         name, ok = QInputDialog.getText(self, "Přidat záložku",
                                         "Název záložky (např. podle síťového disku):")
         name = name.strip()
@@ -549,13 +867,52 @@ class MainWindow(QMainWindow):
         ws_id = self.app_settings.add_workspace(name)
         if previous_local:  # návrh místní složky vedle té dosavadní: C:\Projekty -> C:\<název>
             self.app_settings.view(ws_id).local_root = str(Path(previous_local).parent / name)
-        self._fill_tabs()
+        self._fill_all_tabs()
         self.switch_workspace(ws_id)
         if not self.open_settings():  # bez nastavených složek záložku nezakládat
             self.app_settings.remove_workspace(ws_id)
             self.switch_workspace(previous)
             return
         self._save_settings()
+
+    def choose_folder(self, ws_id: str, current: str = "") -> str | None:
+        """Výběr složky pro záložku „Složka“ – s kontrolou, že se nekryje se spoluprací."""
+        path = current
+        while True:
+            path = QFileDialog.getExistingDirectory(self, "Složka záložky", path)
+            if not path:
+                return None
+            error = self.app_settings.folder_tab_conflict(ws_id, path)
+            if not error:
+                return str(Path(path))
+            QMessageBox.warning(self, "Složka záložky", error)
+
+    def add_folder_workspace(self) -> None:
+        path = self.choose_folder("")
+        if not path:
+            return
+        name, ok = QInputDialog.getText(self, "Přidat záložku", "Název záložky:",
+                                        QLineEdit.EchoMode.Normal, Path(path).name)
+        name = name.strip()
+        if not ok or not name:
+            return
+        ws_id = self.app_settings.add_workspace(name)
+        self.app_settings.workspace(ws_id)["folder_root"] = path
+        self.app_settings.view(ws_id).folder_root = path
+        self._fill_all_tabs()
+        self.switch_workspace(ws_id)
+        self._save_settings()
+
+    def change_folder(self, ws_id: str) -> None:
+        view = self.app_settings.view(ws_id)
+        path = self.choose_folder(ws_id, view.folder_root)
+        if path:
+            view.folder_root = path
+            self._save_settings_of(view)
+            self._fill_all_tabs()
+            if ws_id == self.settings.workspace_id:
+                self._show_page()
+                self._update_status_bar()
 
     def _tab_menu(self, pos) -> None:
         index = self.tabs.tabAt(pos)
@@ -581,6 +938,9 @@ class MainWindow(QMainWindow):
         if chosen is act_rename:
             self.rename_workspace(ws_id)
         elif chosen is act_settings:
+            if self.app_settings.view(ws_id).is_folder:
+                self.change_folder(ws_id)
+                return
             if ws_id != self.settings.workspace_id:
                 self.switch_workspace(ws_id)
             self.open_settings()
@@ -594,7 +954,7 @@ class MainWindow(QMainWindow):
         name = name.strip()
         if ok and name and name != ws["name"]:
             self.app_settings.rename_workspace(ws_id, name)
-            self._fill_tabs()
+            self._fill_all_tabs()
             self._save_settings()
 
     def remove_workspace(self, ws_id: str) -> None:
@@ -608,18 +968,21 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self, "Odebrat záložku",
-            f"Odebrat záložku „{ws['name']}“?\n\nSíť: {ws.get('server_root') or '—'}\n"
-            f"Místní: {ws.get('local_root') or '—'}\n\n"
-            "Projekty na síti ani soubory v místní složce se nemažou – odebere se jen záložka.")
+            f"Odebrat záložku „{ws['name']}“?\n\n"
+            + (f"Složka: {ws['folder_root']}\n\nSoubory ve složce se nemažou – odebere se jen záložka."
+               if ws.get("folder_root") else
+               f"Síť: {ws.get('server_root') or '—'}\nMístní: {ws.get('local_root') or '—'}\n\n"
+               "Projekty na síti ani soubory v místní složce se nemažou – odebere se jen záložka."))
         if answer != QMessageBox.StandardButton.Yes:
             return
         current = self.settings.workspace_id
         self.app_settings.remove_workspace(ws_id)
         self._shared.pop(ws_id, None)
-        if current == ws_id:
-            self.switch_workspace(self.app_settings.active)
-        else:
-            self._fill_tabs()
+        for pane in self.panes:
+            if pane.settings.workspace_id == ws_id:
+                with self.on_pane(pane):
+                    self.switch_workspace(self.app_settings.active)
+        self._fill_all_tabs()
         self._save_settings()
 
     def _save_settings(self) -> None:
@@ -649,17 +1012,24 @@ class MainWindow(QMainWindow):
                 or QApplication.activeModalWidget() is not None          # otevřený dialog
                 or time.monotonic() - self._last_refresh < FOCUS_REFRESH_MIN_GAP):
             return
-        self.refresh(silent=True, check_names=False, background=True)
+        self._each_pane(lambda: self.refresh(silent=True, check_names=False, background=True,
+                                             propagate=False))
 
-    def refresh(self, silent: bool = False, check_names: bool = True, background: bool = False) -> None:
+    def refresh(self, silent: bool = False, check_names: bool = True, background: bool = False,
+                propagate: bool = True) -> None:
         """Obnoví seznam projektů. Kontrola nepovolených znaků (prochází celé stromy projektů
         na serveru) běží jen při spuštění a při ručním obnovení, ne při automatickém.
         background: seznam se načte ve vlákně a okno mezitím zůstane použitelné (tiché
-        obnovení po návratu do okna a automatické obnovení)."""
+        obnovení po návratu do okna a automatické obnovení).
+        propagate: obnovit i druhý panel (po akci v tomto panelu – viz _sync_other_panes)."""
+        if self.settings.is_folder:  # záložka „Složka“ – strom se obnovuje sám
+            if not background:
+                self._refreshed()
+            return
         if not self.settings.is_complete() or getattr(self, "_running_task", None):
             return
         if background:
-            self._refresh_in_background(check_names)
+            self._refresh_in_background(check_names, propagate)
             return
         self._last_refresh = time.monotonic()
         current = self.selected().name if self.selected() else self.settings.ui.get(self._ui_key("last_project"))
@@ -687,25 +1057,27 @@ class MainWindow(QMainWindow):
 
         self._render(current)
         self._update_tab_label()
+        if propagate:
+            self._sync_other_panes()
         if check_names:
             self._start_name_check()
-        self.panel.show_project(self.selected())
+        self._show_project(self.selected())
 
-    def _refresh_in_background(self, check_names: bool) -> None:
+    def _refresh_in_background(self, check_names: bool, propagate: bool = False) -> None:
         if self._bg_refresh is not None and self._bg_refresh.isRunning():
             return  # už se načítá
         self._last_refresh = time.monotonic()
         if self._sync_shared():  # společná konfigurace – jen pár malých souborů
             check_names = True
         thread = ProjectListThread(self.pm)
-        thread.done.connect(lambda projects, error, t=thread:
-                            self._on_background_list(t, projects, check_names, error))
+        thread.done.connect(self._in(self.pane, lambda projects, error, t=thread:
+                            self._on_background_list(t, projects, check_names, error, propagate)))
         self._bg_refresh = thread
         self.set_busy("refresh", "Aktualizuji…")
         thread.start()
 
     def _on_background_list(self, thread: ProjectListThread, projects, check_names: bool,
-                            error: str = "") -> None:
+                            error: str = "", propagate: bool = False) -> None:
         if self._closing:
             return
         self.set_busy("refresh", None)
@@ -722,7 +1094,9 @@ class MainWindow(QMainWindow):
         self._update_tab_label()
         if check_names:
             self._start_name_check()
-        self.panel.show_project(self.selected())
+        self._show_project(self.selected())
+        if propagate:
+            self._sync_other_panes()
 
     def _start_name_check(self) -> None:
         """Na pozadí zkontroluje názvy složek a souborů v projektech, které nemám aktivované."""
@@ -733,10 +1107,25 @@ class MainWindow(QMainWindow):
             return
         self._name_check_again = False
         projects = [p for p in self.projects if not p.mine]
+        if self._name_check is not None:  # výsledek dokončené kontroly ještě nemusí být doručen
+            self._finished_checks.append(self._name_check)
         self._name_check = NameCheckThread(self.pm, projects)
-        self._name_check.done.connect(self._on_name_check)
+        self._name_check.done.connect(self._on_name_check_done)
         self.set_busy("names", "Kontroluji názvy souborů…")
         self._name_check.start()
+
+    def _on_name_check_done(self, issues: dict) -> None:
+        """Výsledek kontroly názvů – v kontextu panelu, kterému vlákno patří (spojení na metodu
+        okna se doručí hned při dalším zpracování událostí)."""
+        thread = self.sender()
+        if thread in self._finished_checks:
+            self._finished_checks.remove(thread)
+        # i výsledek starší kontroly téže záložky (mezitím mohla začít další)
+        pane = next((p for p in self.panes if p._name_check is thread), None) or next(
+            (p for p in self.panes if thread is not None and p.pm is getattr(thread, "pm", None)), None)
+        if pane is not None:
+            with self.on_pane(pane):
+                self._on_name_check(issues)
 
     def _on_name_check(self, issues: dict) -> None:
         if self._closing:
@@ -746,6 +1135,10 @@ class MainWindow(QMainWindow):
             self.name_issues = issues
             current = self.selected().name if self.selected() else None
             self._render(current)
+            for pane in self._same_workspace_panes():  # stejná záložka ve druhém panelu
+                with self.on_pane(pane):
+                    self.name_issues = dict(issues)
+                    self._render(self.selected().name if self.selected() else None)
         if self._name_check_again:
             self._start_name_check()
 
@@ -773,6 +1166,7 @@ class MainWindow(QMainWindow):
                                                        COMMENT_COLUMN_MAX))
             self._columns_sized = True
         self._apply_filter()
+        self._update_for_me()
 
     def _render_row(self, r: int, p: ProjectStatus) -> None:
         issues = self.issues_of(p)
@@ -836,7 +1230,31 @@ class MainWindow(QMainWindow):
         if status is not None:
             self.projects[r] = status
             self._render_row(r, status)
+            self._update_for_me()
+            self._sync_row(status)
         return self.projects[r]
+
+    def _update_for_me(self) -> None:
+        """Počítadlo otevřených poznámek pro mě (všechny projekty záložky) v řádku záložek."""
+        count = sum(p.notes_for_me for p in self.active_pane.projects)
+        self.btn_for_me.setText(f"📝 {count} pro vás")
+        self.btn_for_me.setVisible(count > 0)
+
+    def _for_me_menu(self) -> None:
+        """Nabídka projektů s poznámkami pro mě; výběr otevře jejich poznámky (filtr Pro mě)."""
+        projects = [p for p in self.projects if p.notes_for_me]
+        if not projects:
+            return
+        menu = QMenu(self)
+        for p in projects:
+            menu.addAction(f"{p.name}  ({p.notes_for_me})").setData(p.name)
+        chosen = menu.exec(self.btn_for_me.mapToGlobal(self.btn_for_me.rect().bottomLeft()))
+        if chosen is not None:
+            self.show_notes_for_me(chosen.data())
+
+    def show_notes_for_me(self, name: str) -> None:
+        if self.open_notes(name) is not None:
+            self.notes.set_filter(FILTER_MINE)
 
     def show_invalid_names(self) -> None:
         p = self.selected()
@@ -876,8 +1294,8 @@ class MainWindow(QMainWindow):
         if p:
             self.settings.ui[self._ui_key("last_project")] = p.name
         self._update_actions()
-        self.panel.show_project(p)
-        if p and p.notes_for_me and not self._rendering:
+        self._show_project(p)
+        if p and p.notes_for_me and not self._rendering and self.pane is self.active_pane:
             self._open_notes_if_new(p.name, only_for_me=True)
 
     def activated_projects(self) -> dict[str, list[str]]:
@@ -925,20 +1343,24 @@ class MainWindow(QMainWindow):
             return
         self.timer.stop()
         self._closing = True  # výsledky vláken na pozadí už nezobrazovat
-        for window in self._notes_windows.values():
-            window.close()  # uloží rozepsané poznámky
-        if self._name_check:
-            self._name_check.wait(5000)
-        if self._bg_refresh:
-            self._bg_refresh.wait(5000)
-            try:
-                self._bg_refresh.done.disconnect()  # výsledek po zavření okna už nezpracovat
-            except (RuntimeError, TypeError):
-                pass
-        self.panel.stop()
-        self.settings.ui["main.splitter"] = bytes(self.splitter.saveState().toBase64()).decode("ascii")
+        for pane in self.panes:  # odpojené poznámky – zapamatovat, že byly odpojené
+            if pane._notes_window is not None:
+                save_geometry(self.settings, "notes_window" + pane.key, pane._notes_window)
+                pane._notes_window.close()
+        for pane in self.panes:
+            if pane._name_check:
+                pane._name_check.wait(5000)
+            if pane._bg_refresh:
+                pane._bg_refresh.wait(5000)
+                try:
+                    pane._bg_refresh.done.disconnect()  # výsledek po zavření okna už nezpracovat
+                except (RuntimeError, TypeError):
+                    pass
+            pane.panel.stop()
+            self.settings.ui["main.splitter" + pane.key] = bytes(pane.splitter.saveState().toBase64()).decode("ascii")
+            save_header(self.settings, HEADER_KEY + pane.key, pane.table.horizontalHeader())
+        self.settings.ui["main.panes"] = bytes(self.panes_split.saveState().toBase64()).decode("ascii")
         save_geometry(self.settings, "main", self)
-        save_header(self.settings, HEADER_KEY, self.table.horizontalHeader())
         try:
             self.settings.save()
         except OSError:
@@ -953,6 +1375,8 @@ class MainWindow(QMainWindow):
         return accepted
 
     def _update_actions(self) -> None:
+        if self.pane is not self.active_pane:
+            return  # lišta patří aktivnímu panelu
         p = self.selected()
         issues = bool(self.issues_of(p))
         mine = bool(p and p.mine)
@@ -1129,11 +1553,8 @@ class MainWindow(QMainWindow):
 
     def _confirm_upload(self, plan: UploadPlan, end_session: bool,
                         preselect: str | list[str] | None = None) -> None:
-        window = self._notes_windows.get((self.settings.workspace_id, plan.name))
-        if window is not None:
-            window.flush()  # rozepsané v otevřeném okně se uloží (okno může zůstat otevřené)
         dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name), preselect=preselect,
-                           drafts=self.pm.drafts(plan.name))
+                           drafts=self.pm.drafts(plan.name), users=self.notes.users or self._known_users())
         accepted = self._exec_dialog(dlg, "upload")
         assignments, comment, selected = dlg.assignments(), dlg.comment_text(), dlg.selected_keys()
         notes = dlg.selected_notes()
@@ -1374,8 +1795,9 @@ class MainWindow(QMainWindow):
 
     def pm_for(self, ws_id: str) -> ProjectManager:
         """ProjectManager jiné záložky (stejný uživatel a počítač)."""
-        if ws_id == self.settings.workspace_id:
-            return self.pm
+        for pane in [self.pane] + self.panes:
+            if pane.settings.workspace_id == ws_id:
+                return pane.pm
         return ProjectManager(self.app_settings.view(ws_id), user=self.pm.user, pc=self.pm.pc)
 
     def _ws_name(self, ws_id: str) -> str:
@@ -1416,7 +1838,7 @@ class MainWindow(QMainWindow):
     def tab_infos(self) -> list[TabInfo]:
         return [TabInfo(ws["id"], ws["name"], self.app_settings.view(ws["id"]).server_name,
                         ws.get("server_root") or "", ws.get("local_root") or "")
-                for ws in self.app_settings.workspaces]
+                for ws in self.app_settings.workspaces if not ws.get("folder_root")]
 
     def script_env(self, name: str, action: str, files: list[ScriptFile], comment: str = "",
                    commit_id: int | None = None) -> ScriptEnv:
@@ -1657,56 +2079,123 @@ class MainWindow(QMainWindow):
     def _notes_seen_key(self, name: str) -> str:
         return f"notes_seen.{self.settings.workspace_id}.{name}"
 
-    def open_notes(self, name: str | None = None) -> NotesWindow | None:
-        """Plovoucí okno poznámek projektu (jedno na projekt; další volání ho jen vyzvedne)."""
-        if name is None:
-            p = self.selected()
-            if not p or p.local_only:
+    def _show_project(self, p: ProjectStatus | None) -> None:
+        """Pod seznamem: strom souborů a poznámky vybraného projektu."""
+        self.panel.show_project(p)
+        self.side.setVisible(p is not None)
+        self._show_notes_for(p)
+
+    def _show_notes_for(self, p: ProjectStatus | None) -> None:
+        """Poznámky projektu p (aktuální panel)."""
+        self.notes.set_project(self.pm, p.name if p and not p.local_only else None)
+        self.side.setTabEnabled(self.side.indexOf(self.notes), bool(p and not p.local_only))
+        if self._notes_window is not None:
+            self._notes_window.setWindowTitle(f"Poznámky – projekt {p.name}" if p else "Poznámky")
+
+    def _on_tree_selection(self) -> None:
+        self.notes.set_selection(self.panel.selected_scopes())
+
+    def _update_notes_tab(self, open_count: int, for_me: int) -> None:
+        text = "Poznámky" + (f" ({open_count}" + (f" · pro vás {for_me}" if for_me else "") + ")"
+                             if open_count else "")
+        index = self.side.indexOf(self.notes)
+        if index >= 0:
+            self.side.setTabText(index, text)
+
+    def _on_notes_changed(self) -> None:
+        self._refresh_selected_row()  # i řádek ve druhém panelu (_sync_row)
+        self.panel.reload()  # sloupec Poznámky ve stromu
+
+    def _on_tree_click(self, item, column: int) -> None:
+        """Klepnutí na 📝 ve stromu: poznámky k tomuto souboru / složce."""
+        if column == 3 and item.text(3):
+            self.notes.set_filter(FILTER_SELECTED)
+            self.open_notes()
+
+    def open_notes(self, name: str | None = None) -> NotesPanel | None:
+        """Zobrazí poznámky projektu (záložku vedle stromu, nebo odpojené okno)."""
+        if name is not None and (self.selected() is None or self.selected().name != name):
+            names = [p.name for p in self.projects]
+            if name not in names:
                 return None
-            name = p.name
-        key = (self.settings.workspace_id, name)
-        window = self._notes_windows.get(key)
-        if window is None:
-            seen_key = self._notes_seen_key(name)
-            window = NotesWindow(self.pm, name, self,
-                                 seen_get=lambda: int(self.settings.ui.get(seen_key) or 0),
-                                 seen_set=lambda note_id: self.settings.ui.__setitem__(seen_key, str(note_id)))
-            window.file_clicked.connect(lambda path, n=name: self._show_in_tree(n, path))
-            window.changed.connect(lambda: self._refresh_selected_row())
-            self._notes_windows[key] = window
+            self.table.selectRow(names.index(name))
+        p = self.selected()
+        if not p or p.local_only:
+            return None
+        if self._notes_window is not None:
+            self._notes_window.show()
+            self._notes_window.raise_()
+            self._notes_window.activateWindow()
         else:
-            window.reload()
-        window.show()
-        window.raise_()
-        window.activateWindow()
-        return window
+            self.side.setCurrentWidget(self.notes)
+        return self.notes
 
     def _open_notes_if_new(self, name: str, only_for_me: bool, after_activation: bool = False) -> None:
-        """Otevře poznámky, pokud jsou nové (od posledního zobrazení) – jen pro mě, nebo po
+        """Ukáže poznámky, pokud jsou nové (od posledního zobrazení) – jen pro mě, nebo po
         aktivaci jakékoliv otevřené."""
         try:
             notes = [n for n in self.pm.notes(name) if not n.resolved]
         except Exception:  # noqa: BLE001
             return
         seen = int(self.settings.ui.get(self._notes_seen_key(name)) or 0)
-        if only_for_me:  # pro mě / moje doplněná – nová, upravená nebo s novým doplněním
+        if only_for_me:  # pro mě / moje s odpovědí – nová, upravená nebo s novou odpovědí
             notes = [n for n in notes if n.concerns(self.pm.user) and n.has_news(seen, self.pm.user)]
-        if notes or (after_activation and self.pm.drafts(name)):
+        else:
+            notes = [n for n in notes if n.has_news(seen, self.pm.user)]
+        if notes:
             self.open_notes(name)
 
     def _reload_notes_window(self, name: str) -> None:
-        window = self._notes_windows.get((self.settings.workspace_id, name))
-        if window is not None and window.isVisible():
-            window.reload()
+        """Poznámky projektu se změnily – obnovit je ve všech panelech, které ho ukazují."""
+        ws_id = self.settings.workspace_id
+        for pane in self.panes:
+            if pane.settings.workspace_id == ws_id and pane.notes.name == name:
+                pane.notes.reload()
 
-    def _show_in_tree(self, name: str, path: str) -> None:
-        """Odkaz na soubor v okně poznámek: vybrat projekt a soubor označit ve stromu."""
+    def toggle_notes_detached(self) -> None:
+        """Poznámky ve vlastním okně, nebo zpět v záložce vedle stromu."""
+        if self._notes_window is None:
+            pane = self.pane
+            self.side.removeTab(self.side.indexOf(self.notes))
+            window = DetachedNotes(self)
+            window.lay.addWidget(self.notes)
+            window.closed.connect(self._in(pane, self._attach_notes))
+            restore_geometry(self.settings, "notes_window" + pane.key, window)
+            p = self.selected()
+            window.setWindowTitle(f"Poznámky – projekt {p.name}" if p else "Poznámky")
+            self._notes_window = window
+            self.notes.set_detached(True)
+            self.notes.show()
+            window.show()
+            self.settings.ui["notes.detached" + pane.key] = "1"
+        else:
+            self._notes_window.close()  # closed -> _attach_notes
+
+    def _attach_notes(self) -> None:
+        window, self._notes_window = self._notes_window, None
+        if window is None:
+            return
+        save_geometry(self.settings, "notes_window" + self.pane.key, window)
+        self.side.addTab(self.notes, "Poznámky")
+        self.notes.set_detached(False)
+        p = self.selected()
+        self.side.setTabEnabled(self.side.indexOf(self.notes), bool(p and not p.local_only))
+        self.notes.reload()  # popisek záložky
+        if not self._closing:
+            self.settings.ui["notes.detached" + self.pane.key] = ""
+        window.deleteLater()
+
+    def _show_in_tree(self, name: str | None, path: str) -> None:
+        """Odkaz na soubor v poznámkách: vybrat projekt a soubor označit ve stromu."""
+        if not name:
+            return
         current = self.selected()
         if current is None or current.name != name:
             names = [p.name for p in self.projects]
             if name not in names:
                 return
             self.table.selectRow(names.index(name))
+        self.side.setCurrentWidget(self.panel)
         self.raise_()
         self.activateWindow()
         if not self.panel.select_path(path):
@@ -1715,26 +2204,10 @@ class MainWindow(QMainWindow):
                                     "(byl smazán, nebo se strom ještě načítá).")
 
     def add_note(self, scopes: list[str]) -> None:
-        """Přidat poznámku k označeným souborům / složkám (z nabídky stromu)."""
-        p = self.selected()
-        if not p or p.local_only:
-            return
-        if p.mine:  # aktivovaný projekt: rozepsaná poznámka – zveřejní se s odevzdáním
-            window = self.open_notes(p.name)
-            if window is not None:
-                window.add_draft(scopes)
-            return
-        dlg = QuickNoteDialog(p.name, scopes, self._known_users(), self)
-        if not self._exec_dialog(dlg, "quick_note"):
-            return
-        try:
-            self.pm.add_notes(p.name, [dlg.draft()])
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.critical(self, "Poznámky", str(e))
-            return
-        self._refresh_selected_row()
-        self.panel.reload()
-        self._reload_notes_window(p.name)
+        """Nová poznámka k označeným souborům / složkám (nabídka stromu, Ctrl+N) – zaměří pole
+        pro psaní v panelu poznámek; zveřejní se hned odesláním."""
+        if self.open_notes() is not None:
+            self.notes.compose(scopes)
 
     def _known_users(self) -> list:
         try:
@@ -1743,10 +2216,7 @@ class MainWindow(QMainWindow):
             return []
 
     def _settle_drafts_before_cancel(self, name: str) -> bool:
-        """Zrušení aktivace: co s rozepsanými poznámkami? False = nerušit."""
-        window = self._notes_windows.get((self.settings.workspace_id, name))
-        if window is not None:
-            window.flush()
+        """Zrušení aktivace: co s rozepsanými poznámkami (ze starších verzí)? False = nerušit."""
         drafts = [d for d in self.pm.drafts(name) if d.text.strip()]
         if not drafts:
             return True
@@ -1819,6 +2289,9 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> bool:
         """Nastavení aktuální záložky (a osobní nastavení). Vrací True, pokud se uložilo."""
+        if self.settings.is_folder:  # záložka „Složka“ má jen svou složku
+            self.change_folder(self.settings.workspace_id)
+            return True
         self._sync_shared()  # dialog má ukázat aktuální stav souboru na síti
         ws_id = self.settings.workspace_id
         ws = self.app_settings.workspace(ws_id)
@@ -1826,8 +2299,9 @@ class MainWindow(QMainWindow):
                              folder_check=lambda server, local: self.app_settings.folder_conflict(
                                  ws_id, server, local))
         if dlg.exec():
-            self.panel.tree.default_expanded = self.settings.tree_expanded
-            self._fill_tabs()  # tooltip záložky se složkami
+            for pane in self.panes:
+                pane.panel.tree.default_expanded = self.settings.tree_expanded
+            self._fill_all_tabs()  # tooltip záložky se složkami
             self._update_status_bar()
             self._apply_refresh_timer()
             self.refresh()
@@ -1835,3 +2309,12 @@ class MainWindow(QMainWindow):
         if dlg.exported:  # export na síť a pak Zrušit -> převzít, co je na síti
             self.refresh()
         return False
+
+
+def _pane_property(name: str) -> property:
+    return property(lambda self: getattr(self.pane, name),
+                    lambda self, value: setattr(self.pane, name, value))
+
+
+for _name in PANE_ATTRS:
+    setattr(MainWindow, _name, _pane_property(_name))
