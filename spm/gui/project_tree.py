@@ -19,7 +19,7 @@ from typing import Callable
 
 from PySide6.QtCore import QMimeData, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDrag, QPainter, QPen
-from PySide6.QtWidgets import QAbstractItemView, QTreeWidgetItem, QWidget
+from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTreeWidgetItem, QWidget
 
 from .check_tree import PATH_ROLE, CheckTree
 
@@ -79,6 +79,17 @@ def mime_items(mime: QMimeData) -> list[tuple[str, str]] | None:
 class ProjectTree(CheckTree):
     def __init__(self, headers: list[str], parent: QWidget | None = None):
         super().__init__(headers, checkable=False, parent=parent)
+        # šířky sloupců: „Soubor“ zabírá zbytek místa, ostatní (Drží, Zrcadlo, Poznámky) jsou
+        # co nejužší – dlouhý text se zkrátí (celý v bublině); šířky lze měnit myší
+        header = self.header()
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(28)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        metrics = header.fontMetrics()
+        for i in range(1, len(headers)):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+            self.setColumnWidth(i, metrics.horizontalAdvance(headers[i]) + 24)
+        self.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)

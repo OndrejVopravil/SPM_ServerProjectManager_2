@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QEvent, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPainter, QPalette, QPen, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -34,9 +34,9 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..config import AppSettings, Settings, _same_dir
-from ..db import ProjectDB
+from ..db import ProjectDB, db_path
 from ..names import format_invalid
-from ..restore import RestoreCatalog, RestoreResult
+from ..restore import RestoreCatalog, RestorePoint, RestoreResult
 from ..shared_config import ERROR as SHARED_ERROR, SharedConfig
 from ..sync import (
     ActivationResult,
@@ -56,15 +56,16 @@ from ..scripting.runtime import ScriptEnv, ScriptSession, clear_stale_marks
 from .comment_dialog import CommentDialog
 from .script_ui import GuiScriptUI
 from .scripts_dialog import ScriptsDialog
+from ..folder_zones import ProtectedZones
 from .folder_panel import FolderPanel
 from .notes_panel import FILTER_MINE, FILTER_SELECTED, DetachedNotes, NotesPanel
 from .tab_bar import TAB_COLORS, ColorTabBar, is_dark
 from .. import notes as notes_mod
 from .file_select_dialog import FileSelectDialog
-from .history_dialog import HistoryDialog
+from .file_history_dialog import FileHistoryDialog
 from .project_panel import ProjectPanel
 from .publish_dialog import PublishDialog
-from .restore_dialog import RestoreDialog
+from .timeline_dialog import TimelineDialog
 from .search import normalize
 from .settings_dialog import SettingsDialog
 from .ui_state import restore_geometry, restore_header, save_geometry, save_header
@@ -78,6 +79,7 @@ COLOR_INVALID = QColor("#e67e22")   # nepovolené znaky v názvech – nelze akt
 
 COLUMNS = ["Projekt", "Komentář", "Stav", "Aktivováno", "Od", "Místní kopie"]
 COL_NAME, COL_COMMENT, COL_STATE, COL_USERS, COL_SINCE, COL_LOCAL = range(len(COLUMNS))
+TREE_HEADER_KEY = "tree.v1"  # šířky sloupců stromu souborů projektu
 HEADER_KEY = "main.v3"  # změna sloupců -> neobnovovat šířky uložené pro starší rozvržení
 COMMENT_COLUMN_MAX = 300  # výchozí šířka sloupce Komentář nejvýše (zbytek je v tooltipu)
 LOCAL_NOT_DELETED = "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
@@ -169,30 +171,6 @@ class Pane:
     def key(self) -> str:
         """Přípona klíčů uloženého vzhledu (levý panel bez přípony – jako dřív)."""
         return "" if self.index == 0 else ".2"
-
-
-class PaneFrame(QFrame):
-    """Rámeček panelu – aktivní panel (v režimu dvou panelů) má zvýrazněný okraj. Kreslí se
-    sám, bez stylu (styl by bránil předávání palety – tmavý režim záložek)."""
-
-    def __init__(self):
-        super().__init__()
-        self.active = False
-
-    def set_active(self, active: bool) -> None:
-        if active != self.active:
-            self.active = active
-            self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802 – Qt
-        super().paintEvent(event)
-        if self.active:
-            painter = QPainter(self)
-            pen = QPen(self.palette().color(QPalette.ColorRole.Highlight))
-            pen.setWidth(2)
-            painter.setPen(pen)
-            painter.drawRect(self.rect().adjusted(1, 1, -1, -1))
-            painter.end()
 
 
 # stav a ovládací prvky, které má každý panel svoje (MainWindow.<název> = aktuální panel)
@@ -480,6 +458,7 @@ class MainWindow(QMainWindow):
         self.panel.take_requested.connect(self._in(pane, self.take))
         self.panel.activate_requested.connect(self._in(pane, self.activate))
         self.panel.note_requested.connect(self._in(pane, self.add_note))
+        self.panel.history_requested.connect(self._in(pane, self.file_history))
         self.panel.pm_for = self.pm_for
         self.panel.modified.connect(self._in(pane, self._on_panel_modified))
         self.panel.tree.itemSelectionChanged.connect(self._in(pane, self._on_tree_selection))
@@ -510,6 +489,9 @@ class MainWindow(QMainWindow):
         state = settings.ui.get("main.splitter" + pane.key)
         if state:
             self.splitter.restoreState(QByteArray.fromBase64(state.encode("ascii")))
+        self.splitter.splitterMoved.connect(self._in(pane, lambda *_: self._sync_splitters()))
+        # šířky sloupců stromu souborů (uložené od minula)
+        restore_header(settings, TREE_HEADER_KEY + pane.key, self.panel.tree.header())
         # záložky = pracovní prostory (každá má vlastní síťovou a místní složku)
         self.tabs = ColorTabBar()
         self.tabs.setMovable(True)  # pořadí záložek přetažením myší
@@ -548,10 +530,12 @@ class MainWindow(QMainWindow):
         self.folder_panel = FolderPanel()
         self.folder_panel.pm_for = self.pm_for
         self.folder_panel.modified.connect(self._in(pane, self._on_panel_modified))
+        self.folder_panel.zones_get = self.protected_zones
+        self.folder_panel.open_in_project.connect(self._in(pane, self.go_to_protected))
         self.pages = QStackedWidget()
         self.pages.addWidget(self.projects_page)
         self.pages.addWidget(self.folder_panel)
-        self.frame = PaneFrame()
+        self.frame = QFrame()
         frame_lay = QVBoxLayout(self.frame)
         frame_lay.setContentsMargins(2, 2, 2, 2)
         frame_lay.addLayout(self.tabs_row)
@@ -575,11 +559,18 @@ class MainWindow(QMainWindow):
         self.panes[1].frame.setVisible(self.dual)
         # stav aplikace a „pro vás“ vpravo v řádku záložek posledního panelu
         self.visible_panes()[-1].tabs_row.addWidget(self.status_box)
-        self._highlight_panes()
+        if self.dual:  # seznam projektů v obou panelech stejně vysoký
+            with self.on_pane(self.panes[0]):
+                self._sync_splitters()
 
-    def _highlight_panes(self) -> None:
+    def _sync_splitters(self) -> None:
+        """Dělič mezi seznamem projektů a stromem posunutý v jednom panelu – stejně i ve druhém."""
+        sizes = self.splitter.sizes()
+        if not sum(sizes):
+            return  # ještě nerozvržené okno
         for pane in self.panes:
-            pane.frame.set_active(self.dual and pane is self.active_pane)
+            if pane is not self.pane:
+                pane.splitter.setSizes(sizes)
 
     def _on_focus_changed(self, _old, new) -> None:
         if new is None or self._closing:
@@ -592,7 +583,6 @@ class MainWindow(QMainWindow):
     def _activate_pane(self, pane: Pane) -> None:
         """Aktivní panel: na něj míří lišta a klávesové zkratky (poznámky má každý panel své)."""
         self.active_pane = self.pane = pane
-        self._highlight_panes()
         self._update_actions()
         self._update_for_me()
         self._update_status_bar()
@@ -610,6 +600,9 @@ class MainWindow(QMainWindow):
     def _startup(self) -> None:
         if self._closing:  # okno zavřené dřív, než se stihlo spustit
             return
+        if self.dual:  # až po prvním rozvržení okna
+            with self.on_pane(self.panes[0]):
+                self._sync_splitters()
         if self.dual:  # druhý panel (záložka projektů – Složka se načítá sama)
             with self.on_pane(self.panes[1]):
                 if self.settings.is_complete():
@@ -896,12 +889,54 @@ class MainWindow(QMainWindow):
         name = name.strip()
         if not ok or not name:
             return
+        inside = self.app_settings.contained_collaboration(path)
+        if inside:
+            QMessageBox.information(
+                self, "Přidat záložku",
+                "Složka obsahuje složky pro spolupráci – v této záložce budou jen pro čtení "
+                "(dvojklik na soubor přepne do jeho projektu):\n\n" + "\n".join(inside))
         ws_id = self.app_settings.add_workspace(name)
         self.app_settings.workspace(ws_id)["folder_root"] = path
         self.app_settings.view(ws_id).folder_root = path
         self._fill_all_tabs()
         self.switch_workspace(ws_id)
         self._save_settings()
+
+    def protected_zones(self) -> ProtectedZones:
+        """Složky spolupráce (chráněné v záložkách Složka) – podle aktuálních záložek."""
+        key = tuple((w["id"], w.get("server_root"), w.get("local_root"), w.get("name"))
+                    for w in self.app_settings.workspaces if not w.get("folder_root"))
+        if getattr(self, "_zones_key", None) != key:
+            self._zones_key = key
+            self._zones = ProtectedZones.from_workspaces(self.app_settings.workspaces)
+        return self._zones
+
+    def go_to_protected(self, path: Path) -> None:
+        """Soubor / složka z chráněné oblasti záložky Složka: přepnout panel do záložky projektů
+        a projektu, kam patří, a soubor označit ve stromu."""
+        zone = self.protected_zones().zone_of(Path(path), Path(self.settings.folder_root or path))
+        if zone is None:
+            return
+        if not zone.ws_id:
+            QMessageBox.information(self, "Chráněná složka",
+                                    f"Soubor patří projektu SPM, který není v žádné vaší záložce:\n"
+                                    f"{zone.root}\n\nPřidejte záložku s jeho síťovou složkou.")
+            return
+        project, rel = ProtectedZones.project_of(zone, Path(path))
+        if self.settings.workspace_id != zone.ws_id:
+            self.switch_workspace(zone.ws_id)
+        if not project:
+            return
+        names = [p.name for p in self.projects]
+        match = next((n for n in names if n.lower() == project.lower()), None)
+        if match is None:
+            QMessageBox.information(self, "Chráněná složka",
+                                    f"Projekt {project} v seznamu záložky není.")
+            return
+        self.table.selectRow(names.index(match))
+        self.side.setCurrentWidget(self.panel)
+        if rel and not Path(path).is_dir():
+            self.panel.select_when_loaded(rel)
 
     def change_folder(self, ws_id: str) -> None:
         view = self.app_settings.view(ws_id)
@@ -1184,26 +1219,31 @@ class MainWindow(QMainWindow):
         since = min((u.since for u in p.users), default="").replace("T", " ")
         comment = p.comment.first_line + (" …" if "\n" in p.comment.text else "") if p.comment else ""
         values = [p.name, comment, state, ", ".join(names), since, "ano" if p.local_exists else ""]
+        # barva stavu platí pro celý řádek (i komentář) – stejná jako u názvu projektu
+        if issues:
+            color = COLOR_INVALID
+            tip = ("Projekt obsahuje názvy s nepovolenými znaky – nelze ho "
+                   + ("publikovat" if p.local_only else "aktivovat")
+                   + ", dokud je neopravíte:\n\n" + format_invalid(issues))
+        elif p.local_only:
+            color = self.palette().color(QPalette.ColorRole.PlaceholderText)
+            tip = "Složka existuje jen v místním úložišti – lze ji publikovat na server."
+        elif p.active:
+            color = COLOR_MINE if p.mine else COLOR_OTHER
+            tip = "Aktivováno:\n" + "\n".join(f"{u.label} od {u.since.replace('T', ' ')}" for u in p.users)
+        else:
+            color, tip = None, ""
         for c, v in enumerate(values):
             item = QTableWidgetItem(v)
-            if c == COL_COMMENT:
-                # komentář je popis projektu, ne stav – bez barvy stavu, celý text v tooltipu
+            if color is not None:
+                item.setForeground(color)
+            if c == COL_COMMENT:  # celý text komentáře v bublině
                 if p.comment:
                     item.setToolTip(f"{p.comment.text}\n\n{p.comment.describe_change()}")
                 elif not p.local_only:
                     item.setToolTip("Bez komentáře – upravíte dvojklikem nebo v nabídce pravého tlačítka.")
-            elif issues:
-                item.setForeground(COLOR_INVALID)
-                item.setToolTip("Projekt obsahuje názvy s nepovolenými znaky – nelze ho "
-                                + ("publikovat" if p.local_only else "aktivovat")
-                                + ", dokud je neopravíte:\n\n" + format_invalid(issues))
-            elif p.local_only:
-                item.setForeground(self.palette().color(QPalette.ColorRole.PlaceholderText))
-                item.setToolTip("Složka existuje jen v místním úložišti – lze ji publikovat na server.")
-            elif p.active:
-                item.setForeground(COLOR_MINE if p.mine else COLOR_OTHER)
-                item.setToolTip("Aktivováno:\n" + "\n".join(
-                    f"{u.label} od {u.since.replace('T', ' ')}" for u in p.users))
+            elif tip:
+                item.setToolTip(tip)
             if c == COL_NAME and p.script_pending:
                 item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
                 item.setToolTip((item.toolTip() + "\n\n" if item.toolTip() else "")
@@ -1359,6 +1399,7 @@ class MainWindow(QMainWindow):
             pane.panel.stop()
             self.settings.ui["main.splitter" + pane.key] = bytes(pane.splitter.saveState().toBase64()).decode("ascii")
             save_header(self.settings, HEADER_KEY + pane.key, pane.table.horizontalHeader())
+            save_header(self.settings, TREE_HEADER_KEY + pane.key, pane.panel.tree.header())
         self.settings.ui["main.panes"] = bytes(self.panes_split.saveState().toBase64()).decode("ascii")
         save_geometry(self.settings, "main", self)
         try:
@@ -2022,22 +2063,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Otevřít místní složku", str(e))
 
     def restore_project(self) -> None:
-        """Obnovení ze zálohy: spočítat obnovitelné stavy, vybrat, obnovit do místní složky."""
-        p = self.selected()
-        if not p or p.local_only:
-            return
+        """Obnovení ze zálohy – časová osa (u každého stavu je vidět, zda ho lze obnovit)."""
+        self.history()
 
-        def chosen(catalog: RestoreCatalog) -> None:
-            dlg = RestoreDialog(catalog, f"{p.name}_obnova_<datum stavu> v {self.settings.local_root}", self)
-            accepted = self._exec_dialog(dlg, "restore")
-            point = dlg.selected_point()
-            dlg.deleteLater()
-            if not accepted or point is None:
-                return
-            run_task(self, f"Obnovení projektu {p.name}", self.pm.restore, catalog, point,
-                     status_text="Obnovuji soubory…",
-                     on_done=done)
-
+    def _restore_point(self, catalog: RestoreCatalog, point: RestorePoint) -> None:
+        """Obnoví projekt ke stavu point do nové místní složky (na pozadí)."""
         def done(res: RestoreResult) -> None:
             self.refresh()  # jako F5 – nová složka …_obnova_… se objeví v seznamu
             if res.failed:
@@ -2056,23 +2086,52 @@ class MainWindow(QMainWindow):
             if box.clickedButton() is open_btn:
                 os.startfile(res.folder)
 
-        run_task(self, f"Výpočet obnovitelných stavů – {p.name}", self.pm.restore_points, p.name,
-                 status_text="Procházím historii…",
-                 on_done=chosen)
+        run_task(self, f"Obnovení projektu {catalog.name}", self.pm.restore, catalog, point,
+                 status_text="Obnovuji soubory…", on_done=done)
+
+    def file_history(self, path: str) -> None:
+        """Historie jednoho souboru (verze, otevření, obnovení)."""
+        p = self.selected()
+        if not p or p.local_only:
+            return
+        entry = next((e for e in self.panel.entries if e.path == path), None)
+        # obnovit do místní kopie lze jen soubor, který mám aktivovaný (zamčený)
+        local = (self.pm.local_dir(p.name).joinpath(*path.split("/"))
+                 if p.mine and entry is not None and entry.mine else None)
+        try:
+            dlg = FileHistoryDialog(self.pm, p.name, path, local, self)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Historie souboru", str(e))
+            return
+        self._exec_dialog(dlg, "file_history")
+        dlg.deleteLater()
+        self.panel.reload()  # obnovená verze v místní kopii = změněný soubor
 
     def history(self) -> None:
+        """Časová osa projektu: historie a obnova ze záloh v jednom okně."""
         p = self.selected()
-        if not p:
+        if not p or p.local_only:
             return
-        try:
-            db = ProjectDB.for_project(self.pm.server_dir(p.name))
-        except FileNotFoundError:
+        server = self.pm.server_dir(p.name)
+        if not db_path(server).exists():
             QMessageBox.information(self, "Historie", "Projekt zatím nemá žádnou historii.")
             return
-        with db:
-            dlg = HistoryDialog(db, p.name, self)
-            self._exec_dialog(dlg, "history")
-            dlg.deleteLater()
+        scopes = self.panel.selected_scopes() if self.panel.project is not None \
+            and self.panel.project.name == p.name else []
+
+        def show(catalog: RestoreCatalog | None) -> None:
+            with ProjectDB.for_project(server) as db:
+                dlg = TimelineDialog(db, p.name, catalog, self.pm.user, scopes, self,
+                                     file_history=self.file_history)
+                accepted = self._exec_dialog(dlg, "history")
+                point = dlg.chosen_point
+                dlg.deleteLater()
+            if accepted and point is not None and catalog is not None:
+                self._restore_point(catalog, point)
+
+        # obnovitelné stavy (existence záloh) – na pozadí; bez nich se ukáže jen historie
+        run_task(self, f"Historie projektu {p.name}", self.pm.restore_points, p.name,
+                 status_text="Procházím historii…", on_done=show, on_error=lambda _e: show(None))
 
     # --- poznámky -----------------------------------------------------------------
 

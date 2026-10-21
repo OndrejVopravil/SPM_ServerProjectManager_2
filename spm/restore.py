@@ -11,6 +11,7 @@ Při obnově se každý soubor ověří hashem; server se jen čte.
 
 from __future__ import annotations
 
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -18,7 +19,7 @@ from pathlib import Path
 
 from . import db as dbm
 from .db import ProjectDB, db_path
-from .scanner import Progress, copy_with_hash, same_stat, to_abs
+from .scanner import TEMP_SUFFIX, Progress, copy_with_hash, same_stat, set_readonly, to_abs
 
 # změny, po kterých soubor v projektu není
 REMOVING = {dbm.DELETED, dbm.EXTERNAL_DELETED}
@@ -146,6 +147,110 @@ def restore_points(server: Path, name: str, progress: Progress | None = None) ->
         progress(len(all_blobs), len(all_blobs), "")
     points.reverse()
     return RestoreCatalog(name, points, blobs)
+
+
+# --- jeden soubor ---------------------------------------------------------------------------
+
+@dataclass
+class FileVersion:
+    """Jeden záznam historie souboru (verze po změně) a kde leží její obsah."""
+    change_id: int
+    commit_id: int
+    created_at: str
+    user: str
+    comment: str
+    change_type: str
+    path: str                     # cesta souboru po změně (u smazání před ní)
+    sha256: str | None            # obsah po změně (None u smazání)
+    size: int | None
+    sources: list[Blob] = field(default_factory=list)  # kde obsah leží (ověří se při obnově)
+    reason: str = ""              # proč verze není k dispozici
+
+    @property
+    def removed(self) -> bool:
+        return self.change_type in REMOVING
+
+    @property
+    def available(self) -> bool:
+        return bool(self.sources)
+
+
+def file_versions(server: Path, file_id: str, backup_count: int | None = None) -> list[FileVersion]:
+    """Historie jednoho souboru (nejnovější první): každá změna, obsah po ní a jeho dostupnost
+    – aktuální soubor na serveru, záloha (obsahuje verzi před změnou, která ji vytvořila) nebo
+    koš projektu (verze před smazáním). Server se jen čte; existence se ověřuje bez čtení obsahu."""
+    if not db_path(server).exists():
+        return []
+    with ProjectDB.for_project(server) as db:
+        rows = list(reversed(db.file_history(file_id)))  # od nejstarší
+        current = db.active_files(include_pending=True)
+    cur = next((f for f in current.values() if f.file_id == file_id and not f.pending), None)
+    versions = [FileVersion(r["change_id"], r["commit_id"], r["created_at"], r["user"],
+                            r["comment"] or "", r["change_type"],
+                            r["new_path"] or r["old_path"] or "", r["sha256"], r["size"])
+                for r in rows]
+    # obsah poslední verze před změnou s uloženou zálohou / koš = tato záloha
+    pending_reason: dict[int, str] = {}
+    last: FileVersion | None = None
+    for v, r in zip(versions, rows):
+        if last is not None and not last.removed and last.sha256:
+            if r["backup_path"]:
+                last.sources.append(Blob(r["backup_path"], last.size))
+            elif v.sha256 != last.sha256 and r["change_type"] not in REMOVING:
+                pending_reason[last.change_id] = "nebyla zálohována (zálohování bylo vypnuté)"
+        if v.removed:
+            v.sha256 = None
+        last = v if not v.removed else None
+    if cur is not None and last is not None and last.sha256 == cur.sha256:
+        last.sources.append(Blob(cur.path, cur.size, cur.mtime, current=True))
+    # stejný obsah = stejné zdroje (přejmenování bez změny, vrácení k dřívější verzi)
+    by_sha: dict[str, list[Blob]] = defaultdict(list)
+    for v in versions:
+        if v.sha256:
+            by_sha[v.sha256].extend(v.sources)
+    for v in versions:
+        if not v.sha256:
+            continue
+        v.sources = [b for b in dict.fromkeys(
+            (b.path, b.size, b.mtime, b.current) for b in by_sha[v.sha256])]
+        v.sources = [Blob(*b) for b in v.sources if _blob_exists(server, Blob(*b))]
+        if not v.sources:
+            if v.change_id in pending_reason:
+                v.reason = pending_reason[v.change_id]
+            elif v is last and cur is not None:
+                v.reason = "soubor na serveru byl změněn mimo aplikaci"
+            else:
+                v.reason = ("záloha už byla smazána"
+                            + (f" (ponechává se posledních {backup_count} záloh)" if backup_count else ""))
+    return list(reversed(versions))
+
+
+def _blob_exists(server: Path, b: Blob) -> bool:
+    try:
+        st = to_abs(server, b.path).stat()
+    except OSError:
+        return False
+    if b.current:
+        return same_stat(st.st_size, st.st_mtime, b.size, b.mtime)
+    return b.size is None or st.st_size == b.size
+
+
+def restore_file_version(server: Path, version: FileVersion, dest: Path) -> bool:
+    """Zkopíruje verzi souboru do dest a ověří ji hashem (zkusí všechny zdroje). Nejdřív do
+    dočasného souboru – dest (např. soubor v místní kopii) se nahradí až ověřenou verzí.
+    Kopie není jen pro čtení. Vrací, zda se to podařilo."""
+    tmp = dest.with_name(dest.name + ".restore" + TEMP_SUFFIX)
+    for blob in sorted(version.sources, key=lambda b: not b.current):
+        try:
+            if copy_with_hash(to_abs(server, blob.path), tmp, writable=True) == version.sha256:
+                if dest.exists():
+                    set_readonly(dest, False)
+                os.replace(tmp, dest)
+                return True
+        except Exception:  # noqa: BLE001 – nečitelný zdroj = zkusit další
+            pass
+        tmp.unlink(missing_ok=True)
+    return False
 
 
 def restore_folder_name(name: str, point: RestorePoint, local_root: Path) -> Path:

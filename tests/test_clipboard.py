@@ -130,3 +130,36 @@ def test_cut_from_local_only_folder_into_project(panel, env, clip, recycled):
     settle_panel(panel)
     assert (alice.local_dir("Forma") / "dily/a/x.elt").read_text(encoding="utf-8") == "x"
     assert not (mistni / "a/x.elt").exists() and recycled
+
+
+def test_copy_names():
+    from spm.folder_ops import copy_name, free_copy_name
+    assert copy_name("deska.elt") == "deska_copy.elt" and copy_name("deska.elt", 2) == "deska_copy2.elt"
+    assert copy_name("a.b.dwg") == "a.b_copy.dwg" and copy_name("README") == "README_copy"
+    assert copy_name(".gitignore") == ".gitignore_copy" and copy_name("Vykresy.v2", is_dir=True) == "Vykresy.v2_copy"
+    assert free_copy_name("x.txt", lambda n: n in {"x_copy.txt", "x_copy2.txt"}) == "x_copy3.txt"
+
+
+def test_paste_in_same_place_duplicates_with_copy_suffix(panel, env, clip):
+    alice, bob, proj, src = env
+    local = alice.local_dir("Forma")
+    assert panel.copy_selected(["sestava/elektrody/E02.elt"])          # můj soubor
+    panel.paste_into("sestava/elektrody/")
+    settle_panel(panel)
+    assert (local / "sestava/elektrody/E02_copy.elt").read_text(encoding="utf-8") == "sestava/elektrody/E02.elt"
+    panel.paste_into("sestava/elektrody/")                              # podruhé
+    settle_panel(panel)
+    assert (local / "sestava/elektrody/E02_copy2.elt").exists()
+    assert any(e.path == "sestava/elektrody/E02_copy.elt" and e.local_new for e in panel.entries)
+    # cizí (neaktivovaný) soubor jde zduplikovat taky – kopie je můj nový soubor
+    assert panel.copy_selected(["dily/deska.elt"])
+    panel.paste_into("dily/")
+    settle_panel(panel)
+    assert writable(local / "dily/deska_copy.elt")
+    # složka vložená na své místo: celá složka s _copy
+    assert panel.copy_selected(["sestava/elektrody/"])
+    panel.paste_into("sestava/")
+    settle_panel(panel)
+    assert (local / "sestava/elektrody_copy/E01.elt").exists()
+    assert (local / "sestava/elektrody_copy/E02_copy.elt").exists()
+    assert not (local / "sestava/elektrody/E01_copy.elt").exists()

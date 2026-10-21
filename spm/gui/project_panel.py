@@ -32,16 +32,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import recycle
+from .. import recycle, zip_ops
+from ..folder_ops import free_copy_name, free_name
 from ..scanner import to_abs
 from ..sync import (
     COPY_ADD,
     COPY_REPLACE,
     COPY_SKIP,
+    COPY_TAKE,
     CopyItem,
     FileEntry,
     ProjectManager,
     ProjectStatus,
+    as_copy,
     validate_file_name,
     validate_folder_name,
 )
@@ -140,6 +143,7 @@ class ProjectPanel(QWidget):
     take_requested = Signal(object)
     activate_requested = Signal(object)  # projekt, který nemám aktivovaný
     note_requested = Signal(object)      # přidat poznámku k označeným souborům / složkám
+    history_requested = Signal(str)      # historie jednoho souboru
     publish_requested = Signal(object)   # složka „Jen místně“
     modified = Signal()                  # změna souborů z tohoto panelu (kopie, přesun, mazání…)
 
@@ -151,6 +155,7 @@ class ProjectPanel(QWidget):
         self.project: ProjectStatus | None = None
         self.entries: list[FileEntry] = []
         self.open_notes: list = []  # otevřené poznámky projektu (sloupec Poznámky)
+        self._select_pending = ""   # soubor k označení po načtení stromu
         self.empty_folders: list[str] = []  # prázdné složky místní kopie
         self._thread: EntriesThread | None = None
         self._again = False
@@ -291,6 +296,15 @@ class ProjectPanel(QWidget):
         self.open_notes = open_notes or []
         self.empty_folders = empty_folders or []
         self._fill()
+        # soubor vybraný odjinud (např. ze záložky Složka) – až po posledním načtení stromu
+        if self._select_pending and not (self._thread is not None and self._thread.isRunning()):
+            path, self._select_pending = self._select_pending, ""
+            self.select_path(path)
+
+    def select_when_loaded(self, path: str) -> None:
+        """Označit soubor ve stromu – hned, nebo až se strom (znovu) načte."""
+        if (self._thread is not None and self._thread.isRunning()) or not self.select_path(path):
+            self._select_pending = path
 
     def _fill(self) -> None:
         if self.project is None:
@@ -544,6 +558,12 @@ class ProjectPanel(QWidget):
             "new_folder": local_only or mine_project,
             # neaktuální zrcadlené soubory lze uvolnit (stanou se běžnými soubory projektu)
             "release_mirror": not local_only and any(e.mirror and e.mirror_stale for e in inside),
+            # zip vzniká v místní kopii – jako nová složka / soubor
+            "zip": (local_only or mine_project) and any(not e.local_deleted for e in inside),
+            # historie jednoho souboru, který už je na serveru (v evidenci)
+            "history": not local_only and single_file and any(not e.local_new for e in inside),
+            "unzip": ((local_only or mine_project) and single_file and zip_ops.is_zip(scopes[0])
+                      and any(e.in_local for e in inside)),
         }
 
     def release_mirror(self, scopes: list[str]) -> None:
@@ -850,6 +870,83 @@ class ProjectPanel(QWidget):
                 sources.append((path, target + path.name))
         return sources
 
+    # --- ZIP -----------------------------------------------------------------------
+
+    def _path_taken(self, rel: str) -> bool:
+        """Je cesta v projektu obsazená (soubor nebo složka – na serveru i v místní kopii)?"""
+        low = rel.lower().rstrip("/")
+        paths = {e.path.lower() for e in self.entries} | {f.lower() for f in self.empty_folders}
+        local = self.pm.local_dir(self.project.name)
+        return (low in paths or any(x.startswith(low + "/") for x in paths)
+                or to_abs(local, rel.rstrip("/")).exists())
+
+    def zip_selected(self, scopes: list[str]) -> None:
+        """Zabalí označené soubory a složky do zipu (název viz zip_ops) v jejich společné
+        nadřazené složce; zip je nový soubor místní kopie (na server s odevzdáním)."""
+        if self.project is None or not self.context_actions(scopes)["zip"]:
+            return
+        title = "Zabalit do ZIP"
+        base = zip_ops.zip_base(scopes)
+        name = free_name(zip_ops.zip_name(scopes, self.project.name) + zip_ops.ZIP_EXT,
+                         lambda n: self._path_taken(base + n))
+        members = [(self.pm.file_source(self.project.name, e.path), e.path[len(base):])
+                   for e in self.entries if in_scope(e.path, scopes) and not e.local_deleted]
+        stage = new_staging_dir() / name
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            zip_ops.make_zip(members, stage)
+        except (OSError, zip_ops.ZipError) as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, title, str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        self.drop_files([stage], None, base)  # do místní kopie podle pravidel kopírování
+
+    def unzip(self, path: str) -> None:
+        """Rozbalí zip do nové složky vedle něj (se stejným názvem jako zip)."""
+        if self.project is None or not self.context_actions(path)["unzip"]:
+            return
+        title = "Rozbalit ZIP"
+        base = zip_ops._parent(path)
+        folder = free_name(zip_ops.unzip_folder_name(path), lambda n: self._path_taken(base + n),
+                           is_dir=True)
+        stage = new_staging_dir() / folder
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            zip_ops.extract_zip(to_abs(self.pm.local_dir(self.project.name), path), stage)
+        except (OSError, zip_ops.ZipError) as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, title, str(e))
+            return
+        QApplication.restoreOverrideCursor()
+        if not any(stage.rglob("*")):
+            QMessageBox.information(self, title, "Zip je prázdný.")
+            return
+        self.drop_files([stage], None, base)
+
+    def _duplicate_folders(self, items: list[tuple[str, str]], target: str) -> list[tuple[str, str]]:
+        """Složka vložená na své vlastní místo (Ctrl+C, Ctrl+V) = duplikát celé složky
+        s _copy v názvu (Vykresy -> Vykresy_copy), ne _copy u každého souboru v ní."""
+        local = self.pm.local_dir(self.project.name) if self.project else None
+        paths = {e.path.lower() for e in self.entries} | {f.lower() for f in self.empty_folders}
+
+        def taken(rel: str) -> bool:
+            low = rel.lower()
+            return (low in paths or any(p.startswith(low + "/") for p in paths)
+                    or (local is not None and to_abs(local, rel).exists()))
+        renamed: dict[str, str] = {}
+        result = []
+        for rel, out in items:
+            top, sep, rest = out.partition("/")
+            if sep:  # soubor ve vytahované složce
+                source_top = rel[:len(rel) - len(out) + len(top)]
+                if (target + top).lower() == source_top.lower():
+                    if top not in renamed:
+                        renamed[top] = free_copy_name(top, lambda n: taken(target + n), is_dir=True)
+                    out = f"{renamed[top]}/{rest}"
+            result.append((rel, out))
+        return result
+
     def drop_files(self, urls: list[Path], internal: list[tuple[str, str]] | None, target: str) -> None:
         """Puštění do stromu: soubory a složky ze systému (urls), nebo položky z tohoto stromu
         (internal = (cesta v projektu, cesta v cíli)); target = cílová složka v projektu."""
@@ -857,6 +954,7 @@ class ProjectPanel(QWidget):
             return
         name = self.project.name
         if internal is not None:
+            internal = self._duplicate_folders(internal, target)
             sources = [(self.pm.file_source(name, rel), target + out) for rel, out in internal]
         else:
             sources = self.url_sources(urls, target)
@@ -890,31 +988,57 @@ class ProjectPanel(QWidget):
         QApplication.clipboard().clear()
 
     def copy_into(self, plan: list[CopyItem], target: str) -> list[str] | None:
-        """Potvrzení (když se něco nahrazuje nebo přeskakuje) a kopírování do místní kopie.
-        Vrací zkopírované cesty (None = zrušeno nebo chyba)."""
+        """Potvrzení (když se něco nahrazuje, přebírá nebo přeskakuje) a kopírování do místní
+        kopie. Přeskočené soubory (drží je jiný / spravuje zrcadlo) lze vložit jako kopie
+        (soubor_copy.ext). Vrací zkopírované cesty (None = zrušeno nebo chyba)."""
         adds = [i for i in plan if i.action == COPY_ADD]
         replaces = [i for i in plan if i.action == COPY_REPLACE]
+        takes = [i for i in plan if i.action == COPY_TAKE]
         skips = [i for i in plan if i.action == COPY_SKIP]
+        copyable = [i for i in skips if i.copy_rel]
         where = f"do složky {target.rstrip('/')}" if target else "do kořene projektu"
-        details = "\n".join([f"+ {i.rel}" for i in adds] + [f"* {i.rel} (nahradí se)" for i in replaces]
-                            + [f"- {i.rel} – {i.reason}" for i in skips])
-        if not adds and not replaces:
+        details = "\n".join(
+            [f"+ {i.rel}" for i in adds] + [f"* {i.rel} (nahradí se)" for i in replaces]
+            + [f"* {i.rel} (převezme se a nahradí)" for i in takes]
+            + [f"- {i.rel} – {i.reason}" + (f" (lze vložit jako {i.copy_rel})" if i.copy_rel else "")
+               for i in skips])
+        Btn = QMessageBox.StandardButton
+        if not adds and not replaces and not takes and not copyable:
             box = QMessageBox(QMessageBox.Icon.Information, "Kopírování",
-                              f"Nic se nezkopírovalo {where} – žádný soubor nelze přidat ani nahradit "
-                              "(nahradit lze jen soubory, které máte aktivované).", parent=self)
+                              f"Nic se nezkopírovalo {where} – žádný soubor nelze přidat ani nahradit.",
+                              parent=self)
             box.setDetailedText(details)
             box.exec()
             return None
-        if replaces or skips:
-            text = (f"Kopírování {where}:\n\nnové soubory: {len(adds)}\n"
-                    f"nahradí se (máte je aktivované): {len(replaces)}\n"
-                    f"přeskočí se: {len(skips)}"
-                    + ("\n\nNahrazené soubory se na serveru změní až při odevzdání." if replaces else "")
-                    + "\n\nPokračovat?")
-            box = QMessageBox(QMessageBox.Icon.Question, "Kopírování", text,
-                              QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
+        if replaces or takes or skips:
+            if adds or replaces or takes:
+                text = (f"Kopírování {where}:\n\nnové soubory: {len(adds)}\n"
+                        f"nahradí se (máte je aktivované): {len(replaces)}\n"
+                        + (f"převezmou se a nahradí (jsou volné): {len(takes)}\n" if takes else "")
+                        + f"přeskočí se: {len(skips)}"
+                        + (f" (z toho {len(copyable)} drží jiný uživatel nebo zrcadlo – lze je vložit "
+                           "jako kopie)" if copyable else "")
+                        + ("\n\nNahrazené soubory se na serveru změní až při odevzdání."
+                           if replaces or takes else "")
+                        + "\n\nPokračovat?")
+                buttons = Btn.Yes | Btn.No | (Btn.YesToAll if copyable else Btn.NoButton)
+            else:  # nic nejde přidat ani nahradit – jen vložit jako kopie
+                text = (f"Soubory {where} nelze nahradit – drží je jiný uživatel nebo je spravuje "
+                        f"zrcadlo ({len(copyable)}).\n\nVložit je jako kopie (s _copy v názvu)?")
+                buttons = Btn.YesToAll | Btn.No
+            box = QMessageBox(QMessageBox.Icon.Question, "Kopírování", text, buttons, self)
+            box.button(Btn.No).setText("Zrušit")
+            if box.button(Btn.Yes) is not None:
+                box.button(Btn.Yes).setText("Pokračovat" if copyable else "Ano")
+            if box.button(Btn.YesToAll) is not None:
+                box.button(Btn.YesToAll).setText(
+                    "Vložit jako kopie" if not (adds or replaces or takes)
+                    else "Pokračovat a přeskočené vložit jako kopie")
             box.setDetailedText(details)
-            if box.exec() != QMessageBox.StandardButton.Yes:
+            answer = box.exec()
+            if answer == Btn.YesToAll:
+                plan = [as_copy(i) if i.action == COPY_SKIP and i.copy_rel else i for i in plan]
+            elif answer != Btn.Yes:
                 return None
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         copied = None
@@ -1023,13 +1147,23 @@ class ProjectPanel(QWidget):
         act_rename.setEnabled(enabled["rename"])
         act_delete = menu.addAction("Smazat… (do Koše)" + many + "\tDel")
         act_delete.setEnabled(enabled["delete"])
+        menu.addSeparator()
+        act_zip = menu.addAction("Zabalit do ZIP" + many)
+        act_zip.setEnabled(enabled["zip"])
+        act_unzip = None
+        if zip_ops.is_zip(scopes[0]) and len(scopes) == 1:
+            act_unzip = menu.addAction("Rozbalit ZIP")
+            act_unzip.setEnabled(enabled["unzip"])
         act_note = act_release = None
         if enabled["release_mirror"]:
             menu.addSeparator()
             act_release = menu.addAction("Uvolnit ze zrcadla…" + many)
+        act_history = None
         if not self.project.local_only:
             menu.addSeparator()
             act_note = menu.addAction("Přidat poznámku…" + many + "\tCtrl+N")
+            act_history = menu.addAction("Historie souboru…")
+            act_history.setEnabled(enabled["history"])
         if not self.project.mine and not self.project.local_only:
             menu.addSeparator()
             note = menu.addAction("Odevzdat a převzít lze až u aktivovaného projektu")
@@ -1065,8 +1199,14 @@ class ProjectPanel(QWidget):
             self._delete(scopes)
         elif chosen is act_note:
             self.note_requested.emit(scopes)
+        elif chosen is act_history:
+            self.history_requested.emit(scopes[0])
         elif chosen is act_release:
             self.release_mirror(scopes)
+        elif chosen is act_zip:
+            self.zip_selected(scopes)
+        elif chosen is act_unzip:
+            self.unzip(scopes[0])
 
     OPEN_CONFIRM_OVER = 10  # při otevírání víc souborů najednou se nejdřív zeptat
 

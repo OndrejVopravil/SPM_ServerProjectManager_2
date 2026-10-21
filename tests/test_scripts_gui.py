@@ -384,17 +384,19 @@ def test_toolbar_has_scripts_not_mirror(window):
 
 
 def test_history_shows_script_log(window):
-    from spm.gui.history_dialog import HistoryDialog
+    from spm.gui.timeline_dialog import ROLE, ROW_COMMIT, TimelineDialog
     use_script(window, 'LOG "ahoj ze skriptu"')
     deactivate_with_change(window)
     with ProjectDB.for_project(window.o / "058768") as db:
-        dlg = HistoryDialog(db, "058768")
-        dlg.sessions.selectRow(0)
-        assert dlg.btn_scripts.isVisible() or not dlg.btn_scripts.isHidden()
+        dlg = TimelineDialog(db, "058768")
+        cards = [r for r in range(dlg.timeline.count())
+                 if dlg.timeline.item(r).data(ROLE)["row"] == ROW_COMMIT]
+        dlg.timeline.setCurrentRow(cards[0])                            # odevzdání se skriptem
+        assert not dlg.btn_scripts.isHidden()
         assert dlg.btn_scripts.text() == "Skripty: proběhly…"
         dlg.show_script_log()
         assert "ahoj ze skriptu" in window.shown[-1][1]
-        dlg.sessions.selectRow(1)                                       # aktivace – bez skriptů
+        dlg.timeline.setCurrentRow(cards[1])                            # aktivace – bez skriptů
         assert dlg.btn_scripts.isHidden()
         dlg.deleteLater()
 

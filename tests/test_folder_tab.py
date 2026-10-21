@@ -54,26 +54,29 @@ def folder(tmp_path):
 
 # --- nastavení ---------------------------------------------------------------------
 
-def test_folder_tab_must_not_overlap_collaboration(tmp_path):
+def test_folder_tab_must_not_start_inside_collaboration(tmp_path):
     for d in ("server", "local", "data", "jinde"):
         (tmp_path / d).mkdir()
     ws = AppSettings.new_workspace("Projekty", Settings(server_root=str(tmp_path / "server"),
                                                        local_root=str(tmp_path / "local")))
     app = AppSettings(Settings(), [ws], ws["id"])
     assert app.folder_tab_conflict("", str(tmp_path / "data")) is None
-    assert "místní složkou" in app.folder_tab_conflict("", str(tmp_path / "local"))
-    assert "místní složkou" in app.folder_tab_conflict("", str(tmp_path / "local" / "Forma"))   # uvnitř
-    assert "síťovou složkou" in app.folder_tab_conflict("", str(tmp_path))                       # obsahuje
+    assert "uvnitř místní složky" in app.folder_tab_conflict("", str(tmp_path / "local"))
+    assert "uvnitř místní složky" in app.folder_tab_conflict("", str(tmp_path / "local" / "Forma"))
+    assert "uvnitř síťové složky" in app.folder_tab_conflict("", str(tmp_path / "server" / "Data"))
+    # složka, která spolupráci obsahuje, je v pořádku (spolupráce v ní bude chráněná)
+    assert app.folder_tab_conflict("", str(tmp_path)) is None
+    assert len(app.contained_collaboration(str(tmp_path))) == 2
     # projekt SPM (servisní složka .spm), který není v žádné záložce
     (tmp_path / "jinde" / "Projekt" / ".spm").mkdir(parents=True)
-    assert "obsahuje projekt" in app.folder_tab_conflict("", str(tmp_path / "jinde"))
+    assert app.folder_tab_conflict("", str(tmp_path / "jinde")) is None                       # obsahuje
     assert "součástí projektu" in app.folder_tab_conflict("", str(tmp_path / "jinde" / "Projekt" / "x"))
-    # opačně: složky záložky projektů se nesmí krýt s existující záložkou Složka
+    # opačně: záložka Složka nesmí skončit uvnitř složky záložky projektů
     folder_ws = AppSettings.new_workspace("Data")
     folder_ws["folder_root"] = str(tmp_path / "data")
     app.workspaces.append(folder_ws)
-    assert "typu Složka" in app.folder_conflict(ws["id"], str(tmp_path / "server"), str(tmp_path / "data" / "x"))
-    assert app.folder_conflict(ws["id"], str(tmp_path / "server"), str(tmp_path / "local")) is None
+    assert "by ležela uvnitř" in app.folder_conflict(ws["id"], str(tmp_path / "server"), str(tmp_path))
+    assert app.folder_conflict(ws["id"], str(tmp_path / "server"), str(tmp_path / "data" / "x")) is None
     assert app.view(folder_ws["id"]).is_folder and not app.view(folder_ws["id"]).is_complete()
 
 
@@ -195,7 +198,7 @@ def test_folder_tab_in_main_window(tmp_path, monkeypatch):
         monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warnings.append(a[2]))
         answers = iter([str(tmp_path / "local"), ""])
         monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *a, **k: next(answers))
-        assert w.choose_folder("") is None and "místní složkou" in warnings[0]
+        assert w.choose_folder("") is None and "uvnitř místní složky" in warnings[0]
     finally:
         w.close()
         app.processEvents()
@@ -208,3 +211,29 @@ def test_copy_from_folder_into_project(panel, env, clip, folder):
     panel.paste_into("dily/")
     settle_panel(panel)
     assert (alice.local_dir("Forma") / "dily/vykres.dwg").exists() and (data / "vykres.dwg").exists()
+
+
+def test_paste_in_same_place_duplicates_in_folder(folder, clip):
+    fp, data = folder
+    fp.copy_selected([data / "vykres.dwg", data / "podklady"])
+    fp.paste(data)
+    assert (data / "vykres_copy.dwg").read_text() == "vykres" and (data / "podklady_copy" / "a.pdf").exists()
+    fp.paste(data)
+    assert (data / "vykres_copy2.dwg").exists() and (data / "podklady_copy2" / "a.pdf").exists()
+
+
+def test_keep_both_on_name_clash(folder, clip, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    fp, data = folder
+    other = tmp_path / "jinde"
+    write(other / "vykres.dwg", "novy")
+    write(other / "podklady" / "a.pdf", "novy a")
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: 0)
+    monkeypatch.setattr(QMessageBox, "clickedButton",
+                        lambda box: next(b for b in box.buttons() if b.text() == "Ponechat obě"))
+    done = fp.put([other / "vykres.dwg", other / "podklady"], data)
+    assert (data / "vykres.dwg").read_text() == "vykres"                  # původní beze změny
+    assert (data / "vykres_copy.dwg").read_text() == "novy"
+    assert (data / "podklady" / "a.pdf").read_text() == "a"               # složka se nesloučila
+    assert (data / "podklady_copy" / "a.pdf").read_text() == "novy a"
+    assert done

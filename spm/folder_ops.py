@@ -24,6 +24,31 @@ def _writable(path: Path) -> None:
         pass
 
 
+COPY_MARK = "_copy"
+
+
+def copy_name(name: str, n: int = 1, is_dir: bool = False) -> str:
+    """Název kopie: deska.elt -> deska_copy.elt, deska_copy2.elt…; složka Vykresy -> Vykresy_copy."""
+    mark = COPY_MARK + ("" if n == 1 else str(n))
+    stem, dot, ext = name.rpartition(".")
+    if is_dir or not dot or not stem:  # složka, bez přípony, nebo „.skryty“
+        return name + mark
+    return f"{stem}{mark}.{ext}"
+
+
+def free_copy_name(name: str, taken, is_dir: bool = False) -> str:
+    """První volný název kopie; taken(název) = je obsazený."""
+    n = 1
+    while taken(copy_name(name, n, is_dir)):
+        n += 1
+    return copy_name(name, n, is_dir)
+
+
+def free_name(name: str, taken, is_dir: bool = False) -> str:
+    """Název, pokud je volný; jinak první volný název kopie (_copy, _copy2…)."""
+    return free_copy_name(name, taken, is_dir) if taken(name) else name
+
+
 def targets(sources: list[Path], dest: Path) -> list[tuple[Path, Path]]:
     """Dvojice (zdroj, cíl) – položky se vloží do dest pod svým názvem."""
     return [(src, dest / src.name) for src in sources]
@@ -32,6 +57,21 @@ def targets(sources: list[Path], dest: Path) -> list[tuple[Path, Path]]:
 def conflicts(pairs: list[tuple[Path, Path]]) -> list[Path]:
     """Cíle, které už existují (a nejde o tentýž soubor)."""
     return [dst for src, dst in pairs if dst.exists() and not same_path(src, dst)]
+
+
+def keep_both(pairs: list[tuple[Path, Path]]) -> list[tuple[Path, Path]]:
+    """„Ponechat obě“: cíl, který už existuje, dostane název kopie (soubor_copy.ext) – nic se
+    nepřepíše ani nesloučí."""
+    used: set[str] = set()
+    result = []
+    for src, dst in pairs:
+        if dst.exists() and not same_path(src, dst):
+            name = free_copy_name(dst.name, lambda n: (dst.parent / n).exists()
+                                  or str(dst.parent / n).lower() in used, src.is_dir())
+            dst = dst.with_name(name)
+        used.add(str(dst).lower())
+        result.append((src, dst))
+    return result
 
 
 def _into_itself(src: Path, dst: Path) -> bool:
@@ -46,9 +86,9 @@ def copy_items(pairs: list[tuple[Path, Path]], overwrite: bool = False) -> tuple
     done: list[Path] = []
     skipped: list[str] = []
     for src, dst in pairs:
-        if same_path(src, dst):
-            skipped.append(f"{src.name} – kopie sama na sebe")
-        elif _into_itself(src, dst):
+        if same_path(src, dst):  # vložení na stejné místo = duplikát s _copy v názvu
+            dst = dst.with_name(free_copy_name(dst.name, lambda n: (dst.parent / n).exists(), src.is_dir()))
+        if _into_itself(src, dst):
             skipped.append(f"{src.name} – složku nelze kopírovat do sebe sama")
         elif src.is_dir():
             for f in sorted(p for p in src.rglob("*") if p.is_file()):

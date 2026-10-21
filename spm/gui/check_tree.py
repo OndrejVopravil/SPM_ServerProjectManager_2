@@ -114,9 +114,9 @@ class CheckTree(QTreeWidget):
             item.setData(0, PATH_ROLE, e.path)
             if e.tooltip:
                 item.setToolTip(0, e.tooltip)
-                for i, text in enumerate(e.columns[:extra]):  # i u krátkého textu ve sloupci
-                    if text:
-                        item.setToolTip(i + 1, e.tooltip)
+            for i, text in enumerate(e.columns[:extra]):  # úzký sloupec: celý text v bublině
+                if text:
+                    item.setToolTip(i + 1, e.tooltip or text)
             icon = None
             if e.file_path and self._shell_icons and icons.has_per_file_icon(name):
                 icon = icons.loader().cached(e.file_path)
@@ -151,7 +151,7 @@ class CheckTree(QTreeWidget):
             item = it.value()
             text, tip, *own = texts.get(item.data(0, PATH_ROLE), ("", ""))
             item.setText(column, text)
-            item.setToolTip(column, tip)
+            item.setToolTip(column, tip or text)
             use = own[0] if own and own[0] is not None else color
             if use is not None and text:
                 item.setForeground(column, use)

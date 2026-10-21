@@ -292,3 +292,31 @@ def test_tree_change_reloads_other_pane(qapp, app_settings, tmp_path):
         assert any(e.path == "novy.txt" for e in right.panel.entries)       # vpravo bez obnovení
     finally:
         close(w, qapp)
+
+
+# --- rozložení panelů ---------------------------------------------------------------------
+
+def test_splitters_move_together_and_tree_columns(qapp, app_settings):
+    w = make_window(qapp, app_settings)
+    try:
+        w.resize(1200, 700)
+        w.show()
+        w.act_dual.setChecked(True)
+        left, right = w.panes
+        for pane in (left, right):
+            pane.table.selectRow(0)
+        qapp.processEvents()
+        left.splitter.moveSplitter(150, 1)                                   # jako tažení myší
+        qapp.processEvents()
+        assert right.splitter.sizes() == left.splitter.sizes()
+        assert not hasattr(left.frame, "set_active")                         # bez rámečku aktivního panelu
+        # sloupce stromu: Soubor nejširší, ostatní úzké a nastavitelné
+        from PySide6.QtWidgets import QHeaderView
+        tree = left.panel.tree
+        header = tree.header()
+        assert header.sectionResizeMode(0) == QHeaderView.ResizeMode.Stretch
+        assert all(header.sectionResizeMode(i) == QHeaderView.ResizeMode.Interactive for i in (1, 2, 3))
+        assert tree.columnWidth(0) > max(tree.columnWidth(i) for i in (1, 2, 3))
+        assert max(tree.columnWidth(i) for i in (1, 2, 3)) < 100
+    finally:
+        close(w, qapp)

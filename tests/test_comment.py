@@ -192,18 +192,19 @@ def test_history_shows_comment_change(env):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
 
-    from spm.gui.history_dialog import HistoryDialog
+    from spm.gui.timeline_dialog import TimelineDialog
     QApplication.instance() or QApplication([])
     alice, bob, proj = env
     alice.set_comment("Forma", "a\nb")
     bob.set_comment("Forma", "")
     with ProjectDB.for_project(proj) as db:
-        dlg = HistoryDialog(db, "Forma")
-        texts = [(dlg.sessions.item(r, 3).text(), dlg.sessions.item(r, 5).text())
-                 for r in range(dlg.sessions.rowCount())]
+        dlg = TimelineDialog(db, "Forma")
+        from spm.gui.timeline_dialog import ROLE, ROW_COMMIT
+        cards = [dlg.timeline.item(r).data(ROLE) for r in range(dlg.timeline.count())]
+        texts = [(c["kind_label"], c["comment"]) for c in cards if c["row"] == ROW_COMMIT]
         assert texts == [("Komentář projektu", "(komentář smazán)"), ("Komentář projektu", "a ↵ b")]
         dlg.search.setText("komentar smazan")
-        assert not dlg.sessions.isRowHidden(0) and dlg.sessions.isRowHidden(1)
+        assert [c["comment"] or "" for c in dlg.visible_commits()] == [""]    # jen smazání komentáře
 
 
 def test_double_click_name_toggles_activation(window, monkeypatch):
@@ -226,3 +227,24 @@ def test_double_click_name_toggles_activation(window, monkeypatch):
     calls.clear()
     window._on_double_click(model.index(row_of(window, "Forma"), COL_NAME))
     assert calls == ["deactivate"]
+
+
+def test_comment_colored_like_project_name(window, env):
+    from spm.gui.main_window import COL_COMMENT, COL_NAME, COLOR_MINE, COLOR_OTHER
+    alice, bob, proj = env
+
+    def colors(name):
+        r = row_of(window, name)
+        return (window.table.item(r, COL_NAME).foreground().color(),
+                window.table.item(r, COL_COMMENT).foreground().color())
+    bob.activate("Forma")                                   # aktivováno mnou – zeleně
+    window.refresh(check_names=False)
+    name, comment = colors("Forma")
+    assert name == comment == COLOR_MINE
+    bob.cancel_activation("Forma")
+    alice.activate("Forma")                                 # pracují jiní – modře
+    window.refresh(check_names=False)
+    name, comment = colors("Forma")
+    assert name == comment == COLOR_OTHER
+    r = row_of(window, "Forma")
+    assert "druhý řádek" in window.table.item(r, COL_COMMENT).toolTip()   # bublina = celý komentář

@@ -33,6 +33,7 @@ from .db import DbFile, LockOwner, ProjectDB, db_path
 from .identity import current_full_name, current_pc, current_user
 from .lock import LockInfo, WriteLock, active_users, add_marker, now_iso, read_marker, remove_marker
 from .manifest import Entry, Manifest
+from .folder_ops import free_copy_name
 from .mirror import Mirror
 from .matcher import RenameSuggestion, similarity, suggest_renames
 from .names import describe_chars, find_invalid_names, forbidden_in, format_invalid, invalid_rel_paths
@@ -339,11 +340,18 @@ class CopyItem:
     """Jeden soubor kopírovaný do projektu (přetažením)."""
     rel: str                 # cílová cesta v projektu
     source: Path
-    action: str              # ADD (nový) / REPLACE (nahradí můj soubor) / SKIP
+    action: str              # ADD (nový) / REPLACE (nahradí můj soubor) / TAKE / SKIP
     reason: str = ""         # proč se přeskočí
+    copy_rel: str = ""       # přeskočený: volný název kopie (soubor_copy.ext), lze vložit místo něj
 
 
-COPY_ADD, COPY_REPLACE, COPY_SKIP = "add", "replace", "skip"
+# TAKE = existující volný soubor: převezme se (zamkne) a nahradí
+COPY_ADD, COPY_REPLACE, COPY_TAKE, COPY_SKIP = "add", "replace", "take", "skip"
+
+
+def as_copy(item: CopyItem) -> CopyItem:
+    """Přeskočený soubor vložit pod názvem kopie (nový soubor)."""
+    return CopyItem(item.copy_rel, item.source, COPY_ADD)
 
 # dočasná kopie při nahrávání na server (vedle cíle; scanner ji ignoruje – končí TEMP_SUFFIX)
 UPLOAD_SUFFIX = ".upload" + TEMP_SUFFIX
@@ -600,6 +608,23 @@ class ProjectManager:
         """Obnoví projekt ke stavu `point` do nové místní složky <projekt>_obnova_<datum>."""
         self.local_root.mkdir(parents=True, exist_ok=True)
         return restore.restore(self.server_dir(catalog.name), self.local_root, catalog, point, progress)
+
+    def file_versions(self, name: str, path: str) -> list[restore.FileVersion]:
+        """Historie jednoho souboru projektu (verze a jejich dostupnost) – viz restore.py."""
+        server = self.server_dir(name)
+        if not db_path(server).exists():
+            return []
+        with ProjectDB.for_project(server) as db:
+            f = db.active_files(include_pending=True).get(path)
+        if f is None:
+            raise SyncError(f"Soubor není v evidenci projektu:\n{path}")
+        keep = self.settings.backup_count if self.settings.backup_enabled else None
+        return restore.file_versions(server, f.file_id, keep)
+
+    def restore_file_version(self, name: str, version: restore.FileVersion, dest: Path) -> bool:
+        """Uloží verzi souboru do dest (ověřeno hashem)."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        return restore.restore_file_version(self.server_dir(name), version, dest)
 
     def create_local_project(self, name: str) -> Path:
         """Nový projekt jen v místním úložišti – prázdná složka (jako ručně vytvořená);
@@ -909,7 +934,17 @@ class ProjectManager:
                 continue
             dst = to_abs(local, rel)
             if dst.exists() and same_path(dst, src):
-                skip("kopie sama na sebe")
+                # vložení na stejné místo (Ctrl+C, Ctrl+V) = duplikát s _copy v názvu
+                folder, _, base = rel.rpartition("/")
+
+                def taken(candidate: str) -> bool:
+                    path = f"{folder}/{candidate}" if folder else candidate
+                    return (path.lower() in seen or path.lower() in files
+                            or to_abs(local, path).exists())
+                base = free_copy_name(base, taken)
+                rel = f"{folder}/{base}" if folder else base
+                seen.add(rel.lower())
+                items.append(CopyItem(rel, src, COPY_ADD))
                 continue
             f = files.get(rel.lower())
             if f is None:
@@ -919,20 +954,34 @@ class ProjectManager:
                     items.append(CopyItem(rel, src, COPY_REPLACE if dst.exists() else COPY_ADD))
                 continue
             rel = f.path  # existující soubor – jeho cesta v projektu (velikost písmen)
-            if f.file_id in mirrored:
-                skip("spravuje ho zrcadlo")
-            elif f.file_id in mine:
+            if f.file_id in mine and f.file_id not in mirrored:
                 items.append(CopyItem(rel, src, COPY_REPLACE))
-            elif f.file_id in owners:
-                skip(f"drží ho {owners[f.file_id].label}")
+            elif f.file_id in mirrored or f.file_id in owners:
+                # nahradit nelze – nabídne se vložení pod názvem kopie
+                folder, _, base = rel.rpartition("/")
+
+                def taken(candidate: str) -> bool:
+                    path = f"{folder}/{candidate}" if folder else candidate
+                    return (path.lower() in seen or path.lower() in files
+                            or to_abs(local, path).exists())
+                copy_name = free_copy_name(base, taken)
+                copy_rel = f"{folder}/{copy_name}" if folder else copy_name
+                seen.add(copy_rel.lower())
+                reason = ("spravuje ho zrcadlo" if f.file_id in mirrored
+                          else f"drží ho {owners[f.file_id].label}")
+                items.append(CopyItem(rel, src, COPY_SKIP, reason, copy_rel))
             else:
-                skip("není aktivovaný")
+                items.append(CopyItem(rel, src, COPY_TAKE))  # volný – převezme se a nahradí
         return items
 
     def copy_in(self, name: str, items: list[CopyItem], progress: Progress | None = None) -> list[str]:
         """Provede kopírování naplánované plan_copy_in (jen do místní kopie – na server až
-        odevzdáním). Vrací cesty zkopírovaných souborů; chyba jednoho souboru = SyncError."""
+        odevzdáním). Volné soubory k nahrazení (TAKE) se nejdřív převezmou – zamknou se a stáhne
+        se jejich aktuální verze. Vrací cesty zkopírovaných souborů; chyba = SyncError."""
         local = self.local_dir(name)
+        takes = [i.rel for i in items if i.action == COPY_TAKE]
+        if takes:
+            self.take(name, takes)  # mezitím je zamkl někdo jiný -> SyncError, nic se nekopíruje
         todo = [i for i in items if i.action != COPY_SKIP]
         done: list[str] = []
         for n, item in enumerate(todo):

@@ -186,24 +186,16 @@ def _inside(child: str, parent: str) -> bool:
         return False
 
 
-def _overlap(a: str, b: str) -> bool:
-    """Stejné složky, nebo jedna leží v druhé."""
-    return _same_dir(a, b) or _inside(a, b) or _inside(b, a)
-
-
 def project_folder_inside(folder: str) -> str | None:
-    """Je složka projektem SPM, leží v projektu, nebo obsahuje projekty (servisní složka .spm)?
-    Zachytí i složky pro spolupráci, které nejsou v žádné záložce tohoto počítače."""
+    """Je složka projektem SPM nebo leží v projektu (servisní složka .spm)? Zachytí i projekty,
+    které nejsou v žádné záložce tohoto počítače. (Složka, která projekty obsahuje, je v pořádku
+    – projekty v ní budou chráněné.)"""
     from . import SPM_DIR
     path = Path(folder)
     try:
         for p in [path, *path.parents]:
             if (p / SPM_DIR).is_dir():
                 return f"Složka je součástí projektu SPM ({p}) – vyberte složku mimo projekty."
-        for child in path.iterdir():
-            if child.is_dir() and (child / SPM_DIR).is_dir():
-                return (f"Složka obsahuje projekt SPM ({child.name}) – je to složka pro spolupráci, "
-                        "ne obyčejná složka.")
     except OSError:
         return None
     return None
@@ -283,17 +275,18 @@ class AppSettings:
 
     def folder_conflict(self, ws_id: str, server_root: str, local_root: str) -> str | None:
         """Kolize složek s jinou záložkou (stejný server, stejná nebo vnořená místní složka;
-        překrytí se záložkou „Složka“)."""
+        záložka „Složka“ uvnitř této složky). Složka pro spolupráci uvnitř záložky „Složka“ je
+        v pořádku – tam je chráněná (jen pro čtení, viz folder_zones)."""
         for w in self.workspaces:
             if w["id"] == ws_id:
                 continue
             folder = w.get("folder_root")
             if folder:
-                for root, label in ((server_root, "Síťová"), (local_root, "Místní")):
-                    if root and _overlap(root, folder):
-                        return (f"{label} složka se kryje se záložkou „{w['name']}“ typu Složka "
-                                f"({folder}).\nSložky pro spolupráci a obyčejné složky se nesmí "
-                                "překrývat (ani jedna nesmí ležet v druhé).")
+                for root, label in ((server_root, "síťové"), (local_root, "místní")):
+                    if root and (_same_dir(folder, root) or _inside(folder, root)):
+                        return (f"Záložka „{w['name']}“ typu Složka ({folder}) by ležela uvnitř "
+                                f"{label} složky této záložky.\nObyčejná složka nesmí být uvnitř "
+                                "složky pro spolupráci – nejdřív záložku Složka odeberte nebo změňte.")
                 continue
             if w.get("server_root") and server_root and _same_dir(w["server_root"], server_root):
                 return f"Síťovou složku už používá záložka „{w['name']}“."
@@ -306,17 +299,31 @@ class AppSettings:
         return None
 
     def folder_tab_conflict(self, ws_id: str, folder: str) -> str | None:
-        """Záložka „Složka“: nesmí obsahovat žádnou složku pro spolupráci (síťovou ani místní)
-        a nesmí v žádné ležet – jinak by šlo měnit soubory projektů mimo SPM."""
+        """Záložka „Složka“ nesmí začínat uvnitř síťové ani místní složky záložky projektů ani
+        uvnitř projektu SPM. Obsahovat je smí – v záložce Složka jsou pak chráněné (jen pro
+        čtení, viz folder_zones)."""
         for w in self.workspaces:
             if w["id"] == ws_id or w.get("folder_root"):
                 continue
-            for key, label in (("server_root", "síťovou"), ("local_root", "místní")):
+            for key, label in (("server_root", "síťové"), ("local_root", "místní")):
                 root = w.get(key)
-                if root and _overlap(root, folder):
-                    return (f"Složka se kryje s {label} složkou záložky „{w['name']}“ ({root}).\n"
-                            "Obyčejná složka nesmí obsahovat složku pro spolupráci ani v ní ležet.")
+                if root and (_same_dir(folder, root) or _inside(folder, root)):
+                    return (f"Složka leží uvnitř {label} složky záložky „{w['name']}“ ({root}).\n"
+                            "Záložka Složka nesmí začínat uvnitř složky pro spolupráci – soubory "
+                            "projektů se upravují v záložce projektů.")
         return project_folder_inside(folder)
+
+    def contained_collaboration(self, folder: str) -> list[str]:
+        """Popisy složek pro spolupráci uvnitř složky (pro upozornění při přidání záložky)."""
+        found = []
+        for w in self.workspaces:
+            if w.get("folder_root"):
+                continue
+            for key, label in (("server_root", "síťová"), ("local_root", "místní")):
+                root = w.get(key)
+                if root and _inside(root, folder) and not _same_dir(root, folder):
+                    found.append(f"{root} – {label} složka záložky „{w['name']}“")
+        return found
 
     # --- načtení a uložení ------------------------------------------------------
 

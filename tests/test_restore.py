@@ -117,26 +117,36 @@ def test_project_without_history(tmp_path):
         pm.restore_points("Prazdny")
 
 
-def test_restore_dialog(history):
+def test_restore_in_timeline(history):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PySide6.QtWidgets import QApplication
 
-    from spm.gui.restore_dialog import RestoreDialog
+    from spm.db import ProjectDB
+    from spm.gui.timeline_dialog import ROLE, ROW_COMMIT, ROW_HORIZON, TimelineDialog
 
-    app = QApplication.instance() or QApplication([])
+    QApplication.instance() or QApplication([])
     pm, proj = history
     sorted((proj / ".spm" / "backup").glob("zprava.txt.backup*"))[0].unlink()   # v1 nekompletní
     cat = pm.restore_points("Forma")
-    dlg = RestoreDialog(cat, "cil")
-    ok = dlg.buttons.buttons()[0]
-    assert dlg.selected_point() is cat.points[0] and ok.isEnabled()         # nejnovější předvybrán
-    last = len(cat.points) - 1
-    assert dlg.table.item(last, 3).text().startswith("chybí 1 z")
-    dlg.table.selectRow(last)                                                # nekompletní nejde vybrat
-    assert dlg.selected_point() is not cat.points[-1]
-    assert "zprava.txt" in dlg.table.item(last, 0).toolTip()
-    dlg.table.selectRow(1)
-    assert dlg.selected_point() is cat.points[1]
+    with ProjectDB.for_project(proj) as db:
+        dlg = TimelineDialog(db, "Forma", cat, "alice")
+        rows = [dlg.timeline.item(r).data(ROLE) for r in range(dlg.timeline.count())]
+        cards = [r for r in rows if r["row"] == ROW_COMMIT]
+        status = {c["commit"]["commit_id"]: c["status"] for c in cards}
+        newest, oldest = cat.points[0], cat.points[-1]
+        assert status[newest.commit_id] == "full" and status[oldest.commit_id] == "partial"
+        assert next(c for c in cards if c["commit"]["commit_id"] == oldest.commit_id)["missing"].startswith("chybí 1 z")
+        assert any(r["row"] == ROW_HORIZON for r in rows)                   # hranice obnovitelnosti
+        # nejnovější (předvybraný) lze obnovit, nekompletní ne
+        assert dlg.selected_commit()["commit_id"] == newest.commit_id and dlg.btn_restore.isEnabled()
+        row = next(i for i in range(dlg.timeline.count())
+                   if dlg.timeline.item(i).data(ROLE).get("commit", {}) and
+                   dlg.timeline.item(i).data(ROLE)["commit"]["commit_id"] == oldest.commit_id)
+        dlg.timeline.setCurrentRow(row)
+        assert not dlg.btn_restore.isEnabled() and "zálohy" in dlg.restore_info.text()
+        dlg.timeline.setCurrentRow(1)                                       # nejnovější karta
+        dlg._choose_restore()
+        assert dlg.chosen_point is newest
 
 
 def test_restore_refreshes_project_list(history, monkeypatch, tmp_path):
@@ -154,10 +164,10 @@ def test_restore_refreshes_project_list(history, monkeypatch, tmp_path):
     cat = pm.restore_points("Forma")
 
     class FakeDialog:                                                  # výběr nejnovějšího stavu
-        def __init__(self, *a, **k): pass
-        def selected_point(self): return cat.points[0]
+        def __init__(self, *a, **k):
+            self.chosen_point = cat.points[0]
         def deleteLater(self): pass
-    monkeypatch.setattr(main_window, "RestoreDialog", FakeDialog)
+    monkeypatch.setattr(main_window, "TimelineDialog", FakeDialog)
 
     def run_now(parent, title, fn, *args, on_done=None, on_error=None, status_text=None, **kwargs):
         res = fn(*args, progress=None, **kwargs)

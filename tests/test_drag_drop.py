@@ -7,7 +7,7 @@ import pytest
 
 from spm.config import Settings
 from spm.db import ProjectDB
-from spm.sync import COPY_ADD, COPY_REPLACE, COPY_SKIP, ProjectManager
+from spm.sync import COPY_ADD, COPY_REPLACE, COPY_SKIP, COPY_TAKE, ProjectManager
 
 
 def write(path: Path, text: str) -> None:
@@ -67,7 +67,7 @@ def test_plan_copy_in_rules(env):
     assert plan["SESTAVA/elektrody/e02.ELT"][0] == COPY_SKIP           # stejný soubor podruhé
     assert plan["sestava/elektrody/E01.elt"][0] == COPY_SKIP
     assert plan["sestava/elektrody/E01.elt"][1].startswith("drží ho bob")
-    assert plan["dily/deska.elt"] == (COPY_SKIP, "není aktivovaný")
+    assert plan["dily/deska.elt"] == (COPY_TAKE, "")                   # volný – převezme se a nahradí
     assert plan["moje_nova.elt"] == (COPY_REPLACE, "")
     assert plan["Díl 1.elt"] == (COPY_SKIP, "nepovolené znaky v názvu")
     assert plan["~$docasny.elt"] == (COPY_SKIP, "ignorovaný soubor")
@@ -80,15 +80,15 @@ def test_copy_in_writes_only_local_copy(env):
     plan = alice.plan_copy_in("Forma", [(src / "nova.elt", "dily/nova.elt"),
                                         (src / "E01.elt", "sestava/elektrody/E02.elt"),
                                         (src / "nova.elt", "dily/deska.elt")])
-    assert alice.copy_in("Forma", plan) == ["dily/nova.elt", "sestava/elektrody/E02.elt"]
+    assert alice.copy_in("Forma", plan) == ["dily/nova.elt", "sestava/elektrody/E02.elt", "dily/deska.elt"]
     assert (local / "dily/nova.elt").read_text(encoding="utf-8") == "nova"
     assert (local / "sestava/elektrody/E02.elt").read_text(encoding="utf-8") == "nova E01"
-    assert (local / "dily/deska.elt").read_text(encoding="utf-8") == "dily/deska.elt"   # přeskočen
+    assert (local / "dily/deska.elt").read_text(encoding="utf-8") == "nova"     # převzat a nahrazen
     assert writable(local / "dily/nova.elt")
     assert not (proj / "dily/nova.elt").exists()                     # na server až odevzdáním
     up = alice.plan_upload("Forma")
     assert [lf.path for lf in up.new] == ["dily/nova.elt"]
-    assert [lf.path for _, lf in up.modified] == ["sestava/elektrody/E02.elt"]
+    assert sorted(lf.path for _, lf in up.modified) == ["dily/deska.elt", "sestava/elektrody/E02.elt"]
 
 
 def test_copy_into_mirrored_file_is_skipped(env, tmp_path):
@@ -100,6 +100,8 @@ def test_copy_into_mirrored_file_is_skipped(env, tmp_path):
             db.set_mirrored(fid, "zdroj", "x")
     plan = plan_of(alice.plan_copy_in("Forma", [(src / "E01.elt", "sestava/elektrody/E02.elt")]))
     assert plan["sestava/elektrody/E02.elt"] == (COPY_SKIP, "spravuje ho zrcadlo")
+    item = alice.plan_copy_in("Forma", [(src / "E01.elt", "sestava/elektrody/E02.elt")])[0]
+    assert item.copy_rel == "sestava/elektrody/E02_copy.elt"            # lze vložit jako kopii
 
 
 def test_local_only_folder_accepts_everything(env, tmp_path):
@@ -199,7 +201,7 @@ def test_drop_from_explorer_and_between_folders(panel, env, monkeypatch):
     # nahrazení vlastního a přeskočení cizího – zeptá se
     panel.drop_files([src / "E01.elt"], None, "sestava/elektrody/")
     settle_panel(panel)
-    assert "Nic se nezkopírovalo" in shown[-1]                    # E01 drží bob
+    assert "nelze nahradit" in shown[-1]                          # E01 drží bob – nabídne kopii
     assert (local / "sestava/elektrody/E01.elt").read_text(encoding="utf-8") == "sestava/elektrody/E01.elt"
     write(src / "E02.elt", "nova E02")
     panel.drop_files([src / "E02.elt"], None, "sestava/elektrody/")
@@ -315,3 +317,27 @@ def test_new_folder_only_in_active_project(panel, env):
     alice.cancel_activation("Forma")
     panel.show_project(alice.project_status("Forma"))
     assert not panel.context_actions([])["new_folder"]
+
+
+def test_take_free_file_when_replacing_and_copy_of_held(panel, env, monkeypatch):
+    """Vložení přes volný soubor: převezme se (zamkne mnou) a nahradí. Přes soubor, který drží
+    jiný: na přání se vloží jako kopie."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from conftest import settle_panel
+    alice, bob, proj, src = env
+    local = alice.local_dir("Forma")
+    texts = []
+    answer = {"value": QMessageBox.StandardButton.Yes}
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: texts.append(self.text()) or answer["value"])
+    write(src / "deska.elt", "nova deska")
+    panel.drop_files([src / "deska.elt"], None, "dily/")                 # dily/deska.elt je volný
+    settle_panel(panel)
+    assert "převezmou se a nahradí (jsou volné): 1" in texts[-1]
+    assert (local / "dily/deska.elt").read_text(encoding="utf-8") == "nova deska" and writable(local / "dily/deska.elt")
+    assert any(e.path == "dily/deska.elt" and e.mine for e in panel.entries)   # teď ho držím já
+    answer["value"] = QMessageBox.StandardButton.YesToAll                # „Vložit jako kopie“
+    panel.drop_files([src / "E01.elt"], None, "sestava/elektrody/")      # E01 drží bob
+    settle_panel(panel)
+    assert (local / "sestava/elektrody/E01_copy.elt").read_text(encoding="utf-8") == "nova E01"
+    assert (local / "sestava/elektrody/E01.elt").read_text(encoding="utf-8") == "sestava/elektrody/E01.elt"

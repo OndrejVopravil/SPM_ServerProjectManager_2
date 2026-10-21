@@ -274,10 +274,10 @@ def test_panel_context_actions_and_preselection(app, pms, tmp_path, monkeypatch)
     app.processEvents()
 
     ca = w.panel.context_actions
-    assert ca("sestava/elektrody/E01.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False}
-    assert ca("sestava/sestava.elt") == {"activate": False, "open": True, "submit": False, "take": False, "publish": False, "delete": False, "rename": False, "new_folder": True, "release_mirror": False}  # drží alice, jen pro čtení
-    assert ca("dily/deska.elt") == {"activate": False, "open": True, "submit": False, "take": True, "publish": False, "delete": False, "rename": False, "new_folder": True, "release_mirror": False}  # volný, jen pro čtení
-    assert ca("sestava/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False, "new_folder": True, "release_mirror": False}
+    assert ca("sestava/elektrody/E01.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False, "zip": True, "unzip": False, "history": True}
+    assert ca("sestava/sestava.elt") == {"activate": False, "open": True, "submit": False, "take": False, "publish": False, "delete": False, "rename": False, "new_folder": True, "release_mirror": False, "zip": True, "unzip": False, "history": True}  # drží alice, jen pro čtení
+    assert ca("dily/deska.elt") == {"activate": False, "open": True, "submit": False, "take": True, "publish": False, "delete": False, "rename": False, "new_folder": True, "release_mirror": False, "zip": True, "unzip": False, "history": True}  # volný, jen pro čtení
+    assert ca("sestava/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": False, "new_folder": True, "release_mirror": False, "zip": True, "unzip": False, "history": False}
 
     # menu panelu -> dialogy hlavního okna s předvýběrem
     got = []
@@ -364,8 +364,8 @@ def test_panel_shows_new_local_files(app, pms, tmp_path, monkeypatch):
     item = find(w.panel.tree, "sestava/elektrody/E03.elt")
     assert item.text(1) == "nový – neodevzdaný"
     assert item.foreground(0).color() == w.panel.palette().color(QPalette.ColorRole.PlaceholderText)
-    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False}
-    assert w.panel.context_actions("nc/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False}  # jen moje nové soubory
+    assert w.panel.context_actions("sestava/elektrody/E03.elt") == {"activate": False, "open": True, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False, "zip": True, "unzip": False, "history": False}
+    assert w.panel.context_actions("nc/") == {"activate": False, "open": False, "submit": True, "take": False, "publish": False, "delete": True, "rename": True, "new_folder": True, "release_mirror": False, "zip": True, "unzip": False, "history": False}  # jen moje nové soubory
     assert "nové neodevzdané: <b>2</b>" in w.panel.summary.text()
 
     w.panel._on_double_click(item, 0)
@@ -496,7 +496,7 @@ def test_panel_for_local_only_folder(app, pms, tmp_path, monkeypatch):
     app.processEvents()
     assert sorted(e.path for e in w.panel.entries) == ["dily/deska.elt", "dily/kolik.elt", "poznamky.txt"]
     assert w.panel.context_actions("dily/") == {"activate": False, "open": False, "submit": False, "take": False,
-                                                "publish": True, "delete": True, "rename": True, "new_folder": True, "release_mirror": False}
+                                                "publish": True, "delete": True, "rename": True, "new_folder": True, "release_mirror": False, "zip": True, "unzip": False, "history": False}
     assert w.panel.context_actions("poznamky.txt")["open"] is True
     w.panel._on_double_click(find(w.panel.tree, "poznamky.txt"), 0)
     assert opened == [novy / "poznamky.txt"]

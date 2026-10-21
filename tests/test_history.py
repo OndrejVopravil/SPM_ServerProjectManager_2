@@ -16,7 +16,7 @@ def app():
 
 @pytest.fixture
 def history(app, tmp_path):
-    from spm.gui.history_dialog import HistoryDialog
+    from spm.gui.timeline_dialog import TimelineDialog
 
     proj = tmp_path / "server" / "Forma"
     (proj / "sestava").mkdir(parents=True)
@@ -42,18 +42,17 @@ def history(app, tmp_path):
     bob.deactivate(plan, plan.default_assignments(), "NC program")
 
     db = ProjectDB.for_project(proj)
-    dlg = HistoryDialog(db, "Forma")
+    dlg = TimelineDialog(db, "Forma", me="alice")
     yield dlg
     db.close()
 
 
 def visible_comments(dlg):
-    return [dlg._session_rows[r]["comment"] for r in range(dlg.sessions.rowCount())
-            if not dlg.sessions.isRowHidden(r)]
+    return [c["comment"] for c in dlg.visible_commits()]
 
 
 def shown_changes(dlg):
-    return [dlg.changes.item(r, 2).text() for r in range(dlg.changes.rowCount())]
+    return dlg.shown_changes()
 
 
 def test_search_by_comment_ignores_case_and_diacritics(history):
@@ -87,10 +86,37 @@ def test_clear_search_shows_everything(history):
 
 def test_path_cells_have_full_path_tooltip(history, tmp_path):
     history.search.setText("Úprava sestavy")
-    rows = {history.changes.item(r, 2).text(): r for r in range(history.changes.rowCount())}
-    item = history.changes.item(rows["sestava/sestava.elt"], 2)      # nová cesta
+    items = [history.changes.topLevelItem(r) for r in range(history.changes.topLevelItemCount())]
+    item = next(i for i in items if i.text(1) == "sestava/sestava.elt")
     full = tmp_path / "server" / "Forma" / "sestava" / "sestava.elt"
-    assert item.toolTip() == f"sestava/sestava.elt\n{full}"
-    old = history.changes.item(rows["sestava/sestava.elt"], 1)       # původní cesta
-    assert old.toolTip().endswith(str(full))
-    assert history.changes.item(rows["sestava/sestava.elt"], 0).toolTip() == ""   # druh změny bez bubliny
+    assert item.toolTip(1) == f"sestava/sestava.elt\n{full}"
+    assert item.toolTip(0) == ""                                       # druh změny bez bubliny
+
+
+def test_filters_kind_user_mine_and_files(history):
+    from spm import db as dbm
+    from spm.gui.timeline_dialog import KIND_FILTERS
+    assert len(visible_comments(history)) == 4
+    history.only_mine.setChecked(True)                                 # me = alice
+    assert all(c["user"] == "alice" for c in history.visible_commits())
+    history.only_mine.setChecked(False)
+    history.user_filter.setCurrentIndex(history.user_filter.findData("bob"))
+    assert visible_comments(history) == ["NC program"]
+    history.user_filter.setCurrentIndex(0)
+    upload = next(i for i, (_, kinds) in enumerate(KIND_FILTERS) if kinds == {dbm.UPLOAD})
+    history.kind_filter.setCurrentIndex(upload)
+    assert visible_comments(history) == ["NC program", "Úprava sestavy", "Elektroda hotová"]
+    history.kind_filter.setCurrentIndex(0)
+    # k souborům vybraným ve stromu
+    history.scopes = ["sestava/E02.elt"]
+    history.only_scopes.setChecked(True)
+    assert visible_comments(history) == ["Úprava sestavy"] and shown_changes(history) == ["sestava/E02.elt"]
+
+
+def test_cards_and_day_rows(history):
+    from spm.gui.timeline_dialog import ROLE, ROW_COMMIT, ROW_DAY
+    rows = [history.timeline.item(r).data(ROLE) for r in range(history.timeline.count())]
+    assert rows[0]["row"] == ROW_DAY and rows[0]["label"] == "Dnes"
+    cards = [r for r in rows if r["row"] == ROW_COMMIT]
+    assert cards[0]["user"] == "bob" and cards[0]["kind_label"]
+    assert any("nov" in text for text, _ in cards[0]["chips"])          # „+1 nový“
