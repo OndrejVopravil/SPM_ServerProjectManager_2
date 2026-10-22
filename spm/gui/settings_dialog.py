@@ -355,17 +355,23 @@ class SettingsDialog(QDialog):
         s = self.shared
 
         def locked(key: str) -> bool:
-            """Zamčené je jen nastavení, které síťový soubor opravdu obsahuje (chybějící je místní)."""
-            if self.editing_shared or not s.active:
-                return False
-            return s.status == sc.ERROR or key in s.values
+            """Když nastavení řídí soubor na síti, jsou zamčená všechna společná nastavení – i ta,
+            která v souboru zatím nejsou (starší soubor bez nového nastavení); měnit se dají jen
+            přes „Upravit síťovou konfiguraci“ a uložením se do souboru doplní."""
+            return s.active and not self.editing_shared
 
         widgets = {"backup_enabled": self.backup_enabled, "backup_count": self.backup_count,
                    "ignore_patterns": self.ignore, "check_forbidden_chars": self.check_chars,
                    "archive_keep_backups": self.archive_keep, "messages_archive_days": self.messages_days,
                    "archivers": self.archivers}
+        missing_tip = ("V konfiguraci na síti zatím není – platí místní hodnota. Pro všechny ho nastavíte "
+                       "tlačítkem Upravit síťovou konfiguraci.")
         for key, w in widgets.items():
             w.setEnabled(not locked(key))
+            if not hasattr(w, "_base_tip"):
+                w._base_tip = w.toolTip()
+            missing = s.status == sc.OK and key not in s.values and not self.editing_shared
+            w.setToolTip("\n\n".join(t for t in (w._base_tip, missing_tip if missing else "") if t))
         self.backup_count.setEnabled(not locked("backup_count") and self.backup_enabled.isChecked())
         path = html.escape(str(s.path)) if s.path else ""
         if self.editing_shared:

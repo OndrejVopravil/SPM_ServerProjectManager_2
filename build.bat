@@ -21,6 +21,10 @@ rem Ikona SPM.exe (kresba: spm/gui/app_icon.py)
 rem Odstraneni nepouzivanych casti Qt (viz tools\trim_build.py)
 ".venv\Scripts\python.exe" tools\trim_build.py dist\SPM || goto :error
 
+rem Licencni podminky SPM a licence soucasti tretich stran (Qt / PySide6 - LGPL)
+copy /y LICENSE.txt dist\SPM\ >nul || goto :error
+xcopy /y /i /q licenses dist\SPM\licenses >nul || goto :error
+
 for /f %%v in ('.venv\Scripts\python.exe -c "import spm; print(spm.__version__)"') do set VER=%%v
 powershell -NoProfile -Command "Compress-Archive -Path 'dist\SPM' -DestinationPath 'dist\SPM-%VER%.zip' -Force" || goto :error
 

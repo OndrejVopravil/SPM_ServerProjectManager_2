@@ -1,0 +1,84 @@
+LICENČNÍ PODMÍNKY
+SPM – Server Project Manager
+
+Copyright (c) 2026 Ondřej Vopravil. Všechna práva vyhrazena.
+
+Stažením, instalací nebo použitím aplikace SPM (dále jen „aplikace“) vyjadřujete souhlas
+s těmito podmínkami. Pokud s nimi nesouhlasíte, aplikaci nepoužívejte.
+
+
+1. Udělení licence
+
+Autor uděluje každému nevýhradní, bezúplatnou, časově a územně neomezenou licenci
+k užití aplikace: aplikaci lze stáhnout, nainstalovat (rozbalit), spouštět a používat
+pro osobní i pracovní (komerční) účely, a to na libovolném počtu počítačů.
+
+
+2. Šíření
+
+Aplikaci je dovoleno dále šířit pouze bezúplatně, v nezměněné podobě a celou – včetně
+těchto podmínek a složky „licenses“.
+
+
+3. Omezení
+
+Bez předchozího písemného souhlasu autora není dovoleno:
+a) aplikaci prodávat, pronajímat ani za její poskytnutí požadovat úplatu,
+b) aplikaci upravovat, překládat, zpětně analyzovat, dekompilovat nebo z ní vytvářet
+   odvozená díla – s výjimkou případů, kdy to výslovně dovoluje zákon nebo licence
+   součástí třetích stran (bod 6),
+c) odstraňovat nebo měnit údaje o autorovi, tyto podmínky a upozornění na licence
+   součástí třetích stran.
+
+
+4. Bez záruky
+
+Aplikace se poskytuje „TAK, JAK JE“, bez jakékoli záruky, výslovné či předpokládané,
+zejména bez záruky bezchybnosti, nepřetržitého provozu, prodejnosti nebo vhodnosti
+pro určitý účel. Autor neposkytuje podporu, opravy ani aktualizace a nezavazuje se
+k nim.
+
+
+5. Omezení odpovědnosti
+
+Aplikaci používáte na vlastní riziko. Aplikace pracuje se soubory na síťových
+a místních discích (kopíruje, přesouvá, přepisuje a maže je). Za zálohování svých dat
+odpovídá uživatel.
+
+V nejširším rozsahu, který připouštějí právní předpisy, autor neodpovídá za žádnou
+škodu ani jinou újmu vzniklou v souvislosti s užitím aplikace nebo s nemožností ji
+užít – zejména za ztrátu nebo poškození dat, ušlý zisk, přerušení provozu nebo škodu
+na jiném software či hardware. Tím není dotčena odpovědnost, kterou nelze podle
+právních předpisů vyloučit ani omezit (např. za újmu způsobenou úmyslně nebo z hrubé
+nedbalosti).
+
+
+6. Součásti třetích stran
+
+Aplikace obsahuje součásti třetích stran (zejména Qt a Qt for Python / PySide6,
+interpret jazyka Python a knihovny jím používané), které se šíří pod vlastními
+licencemi. Jejich přehled a texty licencí jsou ve složce „licenses“. Na tyto součásti
+se vztahují jejich licence, nikoli tyto podmínky, a nic v těchto podmínkách
+neomezuje práva, která vám tyto licence dávají.
+
+Zejména knihovny Qt a PySide6 se šíří pod licencí GNU Lesser General Public License
+verze 3 (LGPL-3.0): jsou v aplikaci jako samostatné soubory (DLL) a máte právo je
+nahradit jinou kompatibilní verzí; v rozsahu potřebném k takové úpravě a k ladění
+těchto úprav je dovolena i zpětná analýza aplikace.
+
+Aplikace obsahuje běhové knihovny společnosti Microsoft (Microsoft Distributable
+Code). U nich není dovoleno měnit upozornění na autorská práva, ochranné známky
+a patenty, používat ochranné známky Microsoftu tak, aby to vzbuzovalo dojem, že
+aplikace pochází od Microsoftu nebo je jím podporována, ani je šířit k použití na
+jiné platformě než Microsoft Windows.
+
+
+7. Zánik licence
+
+Licence zaniká automaticky, pokud tyto podmínky porušíte. V takovém případě musíte
+užívání aplikace ukončit a její kopie odstranit.
+
+
+8. Rozhodné právo
+
+Tyto podmínky se řídí právním řádem České republiky.

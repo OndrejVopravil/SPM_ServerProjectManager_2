@@ -1,0 +1,34 @@
+SOUČÁSTI TŘETÍCH STRAN V APLIKACI SPM
+=====================================
+
+Aplikace SPM (licenční podmínky viz LICENSE.txt) obsahuje tyto součásti třetích stran.
+Řídí se svými licencemi, nikoli licenčními podmínkami SPM.
+
+
+Qt for Python (PySide6, shiboken6) 6.11.2 a Qt 6.11.2
+  Autor: The Qt Company Ltd. a další přispěvatelé
+  Licence: GNU Lesser General Public License verze 3 (LGPL-3.0) – text v LGPL-3.0.txt;
+           LGPL-3.0 doplňuje GNU General Public License verze 3 – text v GPL-3.0.txt
+  Soubory: _internal\PySide6\Qt6*.dll, *.pyd, pyside6.abi3.dll, _internal\shiboken6\
+  Zdrojový kód: https://download.qt.io/official_releases/QtForPython/
+                https://download.qt.io/official_releases/qt/6.11/6.11.2/
+  Knihovny jsou použité beze změny jako samostatné soubory DLL a lze je nahradit jinou
+  kompatibilní verzí (viz LICENSE.txt, bod 6).
+  Qt obsahuje další součásti pod vlastními licencemi (např. zlib, libpng, FreeType,
+  HarfBuzz, PCRE2); jejich přehled: https://doc.qt.io/qt-6/licenses-used-in-qt.html
+
+Python 3.13.1
+  Autor: Python Software Foundation
+  Licence: Python Software Foundation License – text v Python-PSF.txt (obsahuje
+           i licence součástí, které Python ve Windows používá: OpenSSL 3.0.15,
+           SQLite 3.45.3, libffi, bzip2, zlib, xz a běhové knihovny Microsoft Visual C++)
+
+PyInstaller 6.22.3 (spouštěcí část SPM.exe – bootloader)
+  Licence: GNU GPL verze 2 s výjimkou pro bootloader („Bootloader Exception“), která
+           dovoluje šířit aplikace sestavené PyInstallerem pod libovolnou licencí –
+           text v PyInstaller.txt
+
+Microsoft Visual C++ Runtime (VCRUNTIME140*.dll, MSVCP140*.dll, api-ms-win-*.dll)
+  Autor: Microsoft Corporation
+  Šíří se jako Microsoft Distributable Code s podmínkami uvedenými v Python-PSF.txt
+  (oddíl „Additional Conditions for this Windows binary build“) a v LICENSE.txt, bod 6.

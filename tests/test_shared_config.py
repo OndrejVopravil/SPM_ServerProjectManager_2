@@ -248,3 +248,21 @@ def test_dialog_archivers_picked_from_users(qapp, server, tmp_path, monkeypatch)
     assert dlg.archivers.choose()
     assert sorted(dlg._shared_values()["archivers"]) == ["novak", "svoboda"]
     assert "Jan Svoboda (svoboda)" in dlg.archivers.text.text()
+
+
+def test_dialog_locks_settings_missing_in_older_file(qapp, server, tmp_path):
+    """Starší spm_config.json bez nového nastavení: i to je zamčené (měnit jen přes Upravit
+    síťovou konfiguraci) a po uložení se do souboru doplní."""
+    write_config(server, {"backup_count": 4})                       # bez messages_archive_days
+    s = Settings(server_root=str(server), local_root=str(tmp_path / "l"))
+    dlg = dialog(s)
+    assert not dlg.messages_days.isEnabled() and not dlg.archive_keep.isEnabled()
+    assert not dlg.archivers.isEnabled()
+    assert "zatím není" in dlg.messages_days.toolTip()
+    assert "zatím není" not in dlg.backup_count.toolTip()           # v souboru je
+    dlg._edit_shared()
+    assert dlg.messages_days.isEnabled() and "zatím není" not in dlg.messages_days.toolTip()
+    dlg.messages_days.setValue(30)
+    dlg._accept()
+    assert sc.probe(str(server)).values["messages_archive_days"] == 30   # doplněno do souboru
+    assert s.messages_archive_days == 30
