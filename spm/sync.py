@@ -37,7 +37,7 @@ from .folder_ops import free_copy_name
 from .mirror import Mirror
 from .matcher import RenameSuggestion, similarity, suggest_renames
 from .names import describe_chars, find_invalid_names, forbidden_in, format_invalid, invalid_rel_paths
-from . import restore
+from . import file_locks, restore
 from .restore import RESTORE_DIR_RE, RestoreCatalog, RestorePoint, RestoreResult
 from .scripting import store as script_store
 from .scripting.model import ADDED, DELETED, MODIFIED, RENAMED, UNCHANGED, ScriptFile
@@ -1173,6 +1173,8 @@ class ProjectManager:
         local = self.local_dir(name)
         if not server.is_dir():
             raise SyncError(f"Projekt neexistuje: {server}")
+        if (server / SPM_DIR / "archiving.json").exists():
+            raise SyncError(f"Projekt {name} se právě archivuje – aktivovat ho nelze.")
         self.check_names(server, name)
         if db_path(server).exists():
             with ProjectDB.for_project(server) as db:
@@ -1590,6 +1592,19 @@ class ProjectManager:
         return result
 
     # --- odevzdání a deaktivace ----------------------------------------------
+
+    def files_open_elsewhere(self, plan: UploadPlan, end_session: bool = False) -> dict[str, list[str]]:
+        """Soubory k odevzdání, které má otevřené jiný program (CAD, právě se ukládá) -> programy
+        (Restart Manager Windows, viz file_locks). Při deaktivaci i ostatní soubory místní kopie
+        (místní kopie se pak maže a otevřený soubor by v ní zůstal)."""
+        local = self.local_dir(plan.name)
+        paths = [lf.path for _, lf in plan.modified] + [lf.path for lf in plan.new]
+        if end_session:
+            paths += [p for p in plan.local_files if p not in paths]
+        found = file_locks.open_by([to_abs(local, p) for p in paths])
+        by_path = {os.path.normcase(str(k)): v for k, v in found.items()}
+        return {p: by_path[os.path.normcase(str(to_abs(local, p)))] for p in paths
+                if os.path.normcase(str(to_abs(local, p))) in by_path}
 
     def plan_upload(self, name: str, progress: Progress | None = None) -> UploadPlan:
         """Porovná místní kopii s evidencí a připraví návrh změn (nic nezapisuje)."""

@@ -12,18 +12,32 @@ k souborům vybraným ve stromu.
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QRect, QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QShortcut
+from PySide6.QtCore import QMarginsF, QRect, QRectF, QSize, Qt
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QKeySequence,
+    QPageLayout,
+    QPageSize,
+    QPainter,
+    QPalette,
+    QPdfWriter,
+    QPen,
+    QShortcut,
+    QTextDocument,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -345,9 +359,13 @@ class TimelineDialog(QDialog):
         split.setStretchFactor(1, 2)
         close = QPushButton("Zavřít")
         close.clicked.connect(self.reject)
+        export = QPushButton("Export do PDF…")
+        export.setToolTip("Uloží zobrazené záznamy (podle filtrů) jako PDF – kdo, kdy, co, se soubory")
+        export.clicked.connect(lambda: self.export_pdf())
         bottom = QHBoxLayout()
         bottom.addWidget(legend)
         bottom.addStretch()
+        bottom.addWidget(export)
         bottom.addWidget(close)
 
         layout = QVBoxLayout(self)
@@ -586,6 +604,110 @@ class TimelineDialog(QDialog):
             return
         self.chosen_point = point
         self.accept()
+
+    # --- export ----------------------------------------------------------------------
+
+    def _filter_summary(self) -> str:
+        parts = []
+        if self.search.text().strip():
+            parts.append(f"hledání „{self.search.text().strip()}“")
+        if self.kind_filter.currentIndex():
+            parts.append(self.kind_filter.currentText())
+        if self.user_filter.currentIndex():
+            parts.append(f"uživatel {self.user_filter.currentText()}")
+        if self.only_mine.isChecked():
+            parts.append("jen moje")
+        if self.only_scopes.isChecked():
+            parts.append("k souborům: " + ", ".join(self.scopes[:5]) + (" …" if len(self.scopes) > 5 else ""))
+        return ", ".join(parts)
+
+    def export_html(self) -> str:
+        """Zobrazené záznamy (podle filtrů) jako HTML pro PDF."""
+        def esc(text: str) -> str:
+            return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        now = datetime.now()
+        rows = []
+        last_day = None
+        visible = [(i, c) for i, c in enumerate(self.commits) if self._commit_visible(i)]
+        for i, c in visible:
+            day = date_time(c["created_at"]).rsplit(" ", 1)[0]
+            if day != last_day:
+                rows.append(f'<tr><td colspan="5" style="background:#eef2f7;"><b>{esc(day)}</b></td></tr>')
+                last_day = day
+            point = self.points.get(c["commit_id"])
+            restore = ("" if point is None else "celý" if point.complete
+                       else f"chybí {len(point.missing)} z {len(point.files)}")
+            changes = self.matching_changes(i)
+            files = "<br>".join(
+                f'{esc(CHANGE_STYLE.get(ch["change_type"], ("", ""))[0])} '
+                f'{esc(dbm.CHANGE_LABELS.get(ch["change_type"], ch["change_type"]))}: '
+                f'{esc(ch["new_path"] or ch["old_path"] or "")}'
+                + (f' (z {esc(ch["old_path"])})' if ch["old_path"] and ch["new_path"]
+                   and ch["old_path"] != ch["new_path"] else "")
+                for ch in changes[:200]) + (f"<br>… a dalších {len(changes) - 200}" if len(changes) > 200 else "")
+            rows.append(
+                "<tr>"
+                f"<td>{esc(time_label(c['created_at']))}</td>"
+                f"<td>{esc(c['user'])}<br><span style='color:#777'>{esc(c['pc'])}</span></td>"
+                f"<td>{esc(dbm.COMMIT_LABELS.get(c['kind'], c['kind']))}"
+                + (f"<br><span style='color:#777'>obnova: {esc(restore)}</span>" if restore else "") + "</td>"
+                f"<td>{esc(_comment(c)).replace(chr(10), '<br>')}</td>"
+                f"<td style='font-size:7pt'>{files}</td></tr>")
+        summary = self._filter_summary()
+        return (
+            "<html><body style='font-family:Segoe UI, Arial; font-size:8.5pt'>"
+            f"<h2>Historie projektu {esc(self.name)}</h2>"
+            f"<p>Vytvořeno {now.day}. {now.month}. {now.year} {now:%H:%M}"
+            + (f" – uživatel {esc(self.me)}" if self.me else "")
+            + f"<br>Záznamů: {len(visible)} z {len(self.commits)}"
+            + (f"<br>Filtr: {esc(summary)}" if summary else "") + "</p>"
+            "<table width='100%' cellspacing='0' cellpadding='4' border='1' style='border-collapse:collapse;"
+            " border-color:#c8c8c8'>"
+            "<tr style='background:#dde3ea'><th>Čas</th><th>Kdo</th><th>Akce</th><th>Komentář</th>"
+            "<th>Změny souborů</th></tr>" + "".join(rows) + "</table></body></html>")
+
+    def export_pdf(self, path: str | None = None) -> Path | None:
+        """Uloží zobrazené záznamy do PDF (A4, na šířku)."""
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, "Export historie do PDF",
+                                                  f"{self.name}_historie.pdf", "PDF (*.pdf)")
+            if not path:
+                return None
+        target = Path(path)
+        if target.exists():
+            try:  # PDF otevřený v prohlížeči (Acrobat) je zamčený – QPdfWriter by chybu neohlásil
+                with open(target, "r+b"):
+                    pass
+            except OSError:
+                QMessageBox.warning(self, "Export historie",
+                                    f"Soubor nelze přepsat – je nejspíš otevřený v jiném programu:\n{target}"
+                                    "\n\nZavřete ho, nebo uložte PDF pod jiným názvem.")
+                return None
+        started = time.time()
+        writer = QPdfWriter(path)
+        writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        writer.setPageOrientation(QPageLayout.Orientation.Landscape)
+        writer.setPageMargins(QMarginsF(12, 12, 12, 12), QPageLayout.Unit.Millimeter)
+        writer.setTitle(f"Historie projektu {self.name}")
+        writer.setCreator("SPM – Server Project Manager")
+        doc = QTextDocument()
+        doc.setHtml(self.export_html())
+        try:
+            doc.print_(writer)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Export historie", f"PDF se nepodařilo uložit:\n{e}")
+            return None
+        del writer  # zavře soubor
+        try:
+            st = target.stat()
+            written = st.st_size > 0 and st.st_mtime >= started - 2
+        except OSError:
+            written = False
+        if not written:
+            QMessageBox.warning(self, "Export historie", f"PDF se nepodařilo uložit:\n{target}\n\n"
+                                "Zkontrolujte, že složka existuje a máte do ní právo zápisu.")
+            return None
+        return target
 
     def show_script_log(self) -> None:
         c = self.selected_commit()

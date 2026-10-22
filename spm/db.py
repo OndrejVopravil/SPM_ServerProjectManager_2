@@ -202,6 +202,8 @@ CANCELLED = "cancelled"             # zrušení vlastní aktivace
 FORCE_UNLOCK = "force-unlock"       # odebrání zámků jiného uživatele
 PROJECT_COMMENT = "project-comment"  # změna komentáře projektu (komentář záznamu = nový text)
 MIRROR = "mirror"                   # soubory zrcadlené z jiného serveru (v cílovém projektu)
+ARCHIVED = "archived"               # projekt archivován (zip v archivní složce)
+UNARCHIVED = "unarchived"           # projekt obnoven z archivu
 
 COMMIT_LABELS = {
     UPLOAD: "Odevzdání",
@@ -212,6 +214,8 @@ COMMIT_LABELS = {
     FORCE_UNLOCK: "Odebrání zámků",
     PROJECT_COMMENT: "Komentář projektu",
     MIRROR: "Zrcadlení",
+    ARCHIVED: "Archivace",
+    UNARCHIVED: "Obnova z archivu",
 }
 
 

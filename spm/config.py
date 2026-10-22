@@ -93,6 +93,12 @@ class Settings:
     tab_color: str = ""
     # Skripty spouštěné po odevzdání z této záložky (názvy souborů ve složce scripts, v pořadí běhu)
     scripts: list[str] = field(default_factory=list)
+    # Archivace dokončených projektů (společná konfigurace spm_config.json): archivní složka
+    # (\\server\… nebo cesta vzhledem k síťové složce), kolik záloh každého souboru se do
+    # archivu ponechá a kdo smí archivovat a vracet z archivu (loginy; prázdné = nikdo)
+    archive_root: str = ""
+    archive_keep_backups: int = 2
+    archivers: list[str] = field(default_factory=list)
     # --- převzato ze spm_config.json síťové složky záložky (viz shared_config) ---
     # identita síťové složky – stejná pro všechny uživatele bez ohledu na připojení disku
     server_id: str = ""
@@ -166,7 +172,8 @@ INTERNAL_FIELDS = ("workspace_id", "_app")
 # Nastavení, která má každá záložka vlastní; ostatní (kromě ui) jsou osobní – pro všechny záložky
 WORKSPACE_FIELDS = ("server_root", "local_root", "folder_root", "backup_enabled", "backup_count",
                     "check_forbidden_chars", "ignore_patterns", "known_default_ignore",
-                    "server_id", "server_name", "tab_color", "scripts")
+                    "server_id", "server_name", "tab_color", "scripts",
+                    "archive_root", "archive_keep_backups", "archivers")
 PERSONAL_FIELDS = tuple(f.name for f in fields(Settings)
                         if f.name not in WORKSPACE_FIELDS + INTERNAL_FIELDS + ("ui",))
 DEFAULT_WORKSPACE_NAME = "Projekty"
@@ -223,6 +230,7 @@ class AppSettings:
         ws["ignore_patterns"] = list(ws["ignore_patterns"])
         ws["known_default_ignore"] = list(ws["known_default_ignore"])
         ws["scripts"] = list(ws["scripts"])
+        ws["archivers"] = list(ws["archivers"])
         return ws
 
     def workspace(self, ws_id: str) -> dict:

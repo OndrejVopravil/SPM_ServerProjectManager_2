@@ -120,3 +120,44 @@ def test_cards_and_day_rows(history):
     cards = [r for r in rows if r["row"] == ROW_COMMIT]
     assert cards[0]["user"] == "bob" and cards[0]["kind_label"]
     assert any("nov" in text for text, _ in cards[0]["chips"])          # „+1 nový“
+
+
+def test_export_pdf(history, tmp_path):
+    history.search.setText("uprava")                                  # jen nalezené záznamy
+    html = history.export_html()
+    assert "Úprava sestavy" in html and "NC program" not in html and "hledání „uprava“" in html
+    assert "sestava/E02.elt" in html                                    # se seznamem souborů
+    out = history.export_pdf(str(tmp_path / "historie.pdf"))
+    data = out.read_bytes()
+    assert data.startswith(b"%PDF") and len(data) > 1000
+
+
+def test_export_pdf_warns_when_not_written(history, tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    from PySide6.QtWidgets import QMessageBox
+    shown = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: shown.append(a[2]))
+    assert history.export_pdf(str(tmp_path / "neexistuje" / "h.pdf")) is None   # složka není
+    assert "nepodařilo uložit" in shown[-1]
+    pdf = tmp_path / "h.pdf"
+    pdf.write_bytes(b"%PDF stary")
+    # jiný proces drží soubor bez sdílení zápisu (jako Acrobat)
+    holder = subprocess.Popen([sys.executable, "-c",
+                               "import ctypes, sys; k = ctypes.windll.kernel32; "
+                               "k.CreateFileW.restype = ctypes.c_void_p; "
+                               "h = k.CreateFileW(sys.argv[1], 0x80000000, 1, None, 3, 0x80, None); "
+                               "print('ready' if h not in (None, ctypes.c_void_p(-1).value) else 'fail', "
+                               "flush=True); sys.stdin.readline()", str(pdf)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "ready"
+        assert history.export_pdf(str(pdf)) is None
+        assert "otevřený v jiném programu" in shown[-1]
+        assert pdf.read_bytes() == b"%PDF stary"                            # původní soubor nedotčený
+    finally:
+        holder.stdin.write("\n")
+        holder.stdin.flush()
+        holder.wait(10)
+    assert history.export_pdf(str(pdf)).read_bytes().startswith(b"%PDF-")    # po zavření jde

@@ -124,7 +124,7 @@ class SettingsDialog(QDialog):
                  folder_check: Callable[[str, str], str | None] | None = None):
         super().__init__(parent)
         self.setWindowTitle(f"Nastavení – záložka {workspace_name}" if workspace_name else "Nastavení")
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(680)
         self.settings = settings
         # kolize složek s jinými záložkami: (síť, místní) -> popis chyby nebo None
         self.folder_check = folder_check
@@ -156,6 +156,22 @@ class SettingsDialog(QDialog):
         self.threshold.setValue(round(settings.rename_threshold * 100))
 
         self.ignore = QLineEdit("; ".join(settings.ignore_patterns))
+
+        # archivace dokončených projektů (společné nastavení)
+        self.archive_root = QLineEdit(settings.archive_root)
+        self.archive_root.setPlaceholderText("prázdné = archivace vypnutá")
+        self.archive_root.setToolTip("Kam se ukládají archivované projekty (zip). Zadejte cestu "
+                                     "\\\\server\\… nebo cestu vzhledem k síťové složce s projekty "
+                                     "(např. ..\\Archiv) – písmeno disku má každý připojené jinak.")
+        self.archive_keep = QSpinBox()
+        self.archive_keep.setRange(0, sc.BACKUP_COUNT_MAX)
+        self.archive_keep.setValue(settings.archive_keep_backups)
+        self.archive_keep.setSuffix(" záloh")
+        self.archive_keep.setToolTip("Kolik posledních záloh každého souboru se při archivaci zachová "
+                                     "(koš projektu se vysype celý).")
+        self.archivers = QLineEdit("; ".join(settings.archivers))
+        self.archivers.setPlaceholderText("loginy oddělené středníkem – prázdné = nikdo")
+        self.archivers.setToolTip("Kdo smí archivovat projekty a vracet je z archivu.")
 
         self.check_chars = QCheckBox("Kontrolovat nepovolené znaky v názvech souborů a složek")
         self.check_chars.setToolTip("Česká diakritika, mezera a znaky ( ) & , . ; = ^ "
@@ -219,6 +235,9 @@ class SettingsDialog(QDialog):
         shared_form.addRow(hint)
         shared_form.addRow("Ignorované soubory:", self.ignore)
         shared_form.addRow(self.check_chars)
+        shared_form.addRow("Archivní složka:", self.archive_root)
+        shared_form.addRow("Při archivaci ponechat:", self.archive_keep)
+        shared_form.addRow("Archivovat smí:", self.archivers)
         self.shared_info = QLabel()
         self.shared_info.setWordWrap(True)
         self.shared_info.setTextFormat(Qt.TextFormat.RichText)
@@ -276,11 +295,15 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
         self._show_shared_values()
         self._update_shared_ui()
+        # výška podle obsahu při dané šířce (zalomené texty se jinak ořezávají)
+        self.resize(self.minimumWidth(), layout.totalHeightForWidth(self.minimumWidth())
+                    if layout.hasHeightForWidth() else self.sizeHint().height())
 
     # --- společná konfigurace ---------------------------------------------------
 
     def _shared_widgets(self) -> list[QWidget]:
-        return [self.backup_enabled, self.backup_count, self.ignore, self.check_chars]
+        return [self.backup_enabled, self.backup_count, self.ignore, self.check_chars,
+                self.archive_root, self.archive_keep, self.archivers]
 
     def _shared_values(self) -> dict:
         return {
@@ -288,6 +311,9 @@ class SettingsDialog(QDialog):
             "backup_count": self.backup_count.value(),
             "ignore_patterns": [p.strip() for p in self.ignore.text().split(";") if p.strip()],
             "check_forbidden_chars": self.check_chars.isChecked(),
+            "archive_root": self.archive_root.text().strip(),
+            "archive_keep_backups": self.archive_keep.value(),
+            "archivers": [u.strip() for u in self.archivers.text().replace(",", ";").split(";") if u.strip()],
         }
 
     def _show_shared_values(self) -> None:
@@ -303,6 +329,12 @@ class SettingsDialog(QDialog):
             self.ignore.setText("; ".join(v["ignore_patterns"]))
         if "check_forbidden_chars" in v:
             self.check_chars.setChecked(v["check_forbidden_chars"])
+        if "archive_root" in v:
+            self.archive_root.setText(v["archive_root"])
+        if "archive_keep_backups" in v:
+            self.archive_keep.setValue(v["archive_keep_backups"])
+        if "archivers" in v:
+            self.archivers.setText("; ".join(v["archivers"]))
 
     def _update_shared_ui(self) -> None:
         s = self.shared
@@ -314,7 +346,9 @@ class SettingsDialog(QDialog):
             return s.status == sc.ERROR or key in s.values
 
         widgets = {"backup_enabled": self.backup_enabled, "backup_count": self.backup_count,
-                   "ignore_patterns": self.ignore, "check_forbidden_chars": self.check_chars}
+                   "ignore_patterns": self.ignore, "check_forbidden_chars": self.check_chars,
+                   "archive_root": self.archive_root, "archive_keep_backups": self.archive_keep,
+                   "archivers": self.archivers}
         for key, w in widgets.items():
             w.setEnabled(not locked(key))
         self.backup_count.setEnabled(not locked("backup_count") and self.backup_enabled.isChecked())

@@ -29,6 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import archive
 from . import db as dbm
 from .db import DbFile, ProjectDB, db_path
 from .lock import WriteLock
@@ -146,6 +147,10 @@ class Mirror:
             targets[item.target_rel.lower()] = item
         if not targets and not db_path(target).exists():
             return res  # nic ke zrcadlení a cíl ještě neexistuje – nezakládat prázdný projekt
+        if not target.exists() and archive.is_archived(self.target_pm.settings, self.project):
+            raise MirrorError(f"Cílový projekt {self.project} je archivovaný – zrcadlení ho nezaloží "
+                              "znovu. Nejdřív ho obnovte z archivu (pravé tlačítko na záložku → "
+                              "Archiv projektů).")
         if not target.exists():
             target.mkdir()
             res.created_project = True

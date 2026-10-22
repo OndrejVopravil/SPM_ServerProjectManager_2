@@ -96,6 +96,21 @@ def scan(root: Path, ignore: Iterable[str] = (), progress: Progress | None = Non
     return result
 
 
+def is_open_elsewhere(path: Path) -> bool:
+    """Má soubor otevřený jiná aplikace k úpravám (bez sdílení zápisu – typicky CAD s otevřeným
+    dílem, nebo se soubor právě ukládá)? Zjistí se pokusem o otevření pro zápis – obsah ani čas
+    změny se tím nemění. Soubor jen pro čtení se takto zjistit nedá (vrací False)."""
+    if not os.access(path, os.W_OK):
+        return False
+    try:
+        with open(path, "r+b"):
+            return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
 def copy_with_hash(src: Path, dst: Path, writable: bool = False) -> str:
     """Zkopíruje soubor včetně času změny a vrátí SHA-256 obsahu. writable = kopie nikdy
     nebude jen pro čtení (atributy se jinak přenesou ze zdroje).

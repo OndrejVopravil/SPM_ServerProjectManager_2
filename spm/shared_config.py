@@ -26,7 +26,9 @@ CONFIG_NAME = "spm_config.json"
 FORMAT_KEY = "spm_config"
 FORMAT = 1
 # Nastavení řízená společnou konfigurací (ostatní zůstávají vždy místní)
-SHARED_FIELDS = ("backup_enabled", "backup_count", "ignore_patterns", "check_forbidden_chars")
+SHARED_FIELDS = ("backup_enabled", "backup_count", "ignore_patterns", "check_forbidden_chars",
+                 "archive_root", "archive_keep_backups", "archivers")
+LIST_FIELDS = ("ignore_patterns", "archivers")
 SERVER_ID, SERVER_NAME = "server_id", "server_name"
 OBSOLETE_KEYS = ("mirror_rules",)  # dřívější nastavení – při uložení se ze souboru odstraní
 BACKUP_COUNT_MAX = 99
@@ -94,6 +96,20 @@ def parse(text: str) -> dict:
         if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
             raise SharedConfigError("ignore_patterns: očekává se seznam textů, např. [\"*.tmp\"].")
         values["ignore_patterns"] = [p.strip() for p in patterns if p.strip()]
+    if "archive_root" in data:
+        if not isinstance(data["archive_root"], str):
+            raise SharedConfigError("archive_root: očekává se text (cesta k archivní složce).")
+        values["archive_root"] = data["archive_root"].strip()
+    if "archive_keep_backups" in data:
+        count = data["archive_keep_backups"]
+        if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= BACKUP_COUNT_MAX:
+            raise SharedConfigError(f"archive_keep_backups: očekává se celé číslo 0–{BACKUP_COUNT_MAX}.")
+        values["archive_keep_backups"] = count
+    if "archivers" in data:
+        users = data["archivers"]
+        if not isinstance(users, list) or not all(isinstance(u, str) for u in users):
+            raise SharedConfigError("archivers: očekává se seznam loginů, např. [\"novak\"].")
+        values["archivers"] = [u.strip() for u in users if u.strip()]
     for key in (SERVER_ID, SERVER_NAME):
         if key in data:
             if not isinstance(data[key], str):
@@ -137,7 +153,7 @@ def apply(settings: Settings, values: dict) -> bool:
     changed = False
     for key in SHARED_FIELDS + (SERVER_ID, SERVER_NAME):
         if key in values and getattr(settings, key) != values[key]:
-            setattr(settings, key, list(values[key]) if key == "ignore_patterns" else values[key])
+            setattr(settings, key, list(values[key]) if key in LIST_FIELDS else values[key])
             changed = True
     return changed
 

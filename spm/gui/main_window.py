@@ -5,12 +5,13 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QByteArray, QEvent, QEventLoop, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QSplitter,
     QStackedWidget,
     QStyle,
@@ -56,6 +58,7 @@ from ..scripting.runtime import ScriptEnv, ScriptSession, clear_stale_marks
 from .comment_dialog import CommentDialog
 from .script_ui import GuiScriptUI
 from .scripts_dialog import ScriptsDialog
+from .. import archive, recycle, storage
 from ..folder_zones import ProtectedZones
 from .folder_panel import FolderPanel
 from .notes_panel import FILTER_MINE, FILTER_SELECTED, DetachedNotes, NotesPanel
@@ -65,6 +68,8 @@ from .file_select_dialog import FileSelectDialog
 from .file_history_dialog import FileHistoryDialog
 from .project_panel import ProjectPanel
 from .publish_dialog import PublishDialog
+from .archive_dialog import ArchiveListDialog, ArchiveProjectDialog
+from .storage_dialog import StorageDialog
 from .timeline_dialog import TimelineDialog
 from .search import normalize
 from .settings_dialog import SettingsDialog
@@ -81,6 +86,10 @@ COLUMNS = ["Projekt", "Komentář", "Stav", "Aktivováno", "Od", "Místní kopie
 COL_NAME, COL_COMMENT, COL_STATE, COL_USERS, COL_SINCE, COL_LOCAL = range(len(COLUMNS))
 TREE_HEADER_KEY = "tree.v1"  # šířky sloupců stromu souborů projektu
 HEADER_KEY = "main.v3"  # změna sloupců -> neobnovovat šířky uložené pro starší rozvržení
+LIST_FILTERS = ["Všechny projekty", "★ Oblíbené", "Naposledy otevřené"]
+FILTER_ALL, FILTER_FAVORITES, FILTER_RECENT = range(3)
+STAR = "★"
+RECENT_COUNT = 15  # kolik naposledy otevřených projektů si pamatovat
 COMMENT_COLUMN_MAX = 300  # výchozí šířka sloupce Komentář nejvýše (zbytek je v tooltipu)
 LOCAL_NOT_DELETED = "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
 FOCUS_REFRESH_MIN_GAP = 5.0  # s – při rychlém přepínání oken (Alt+Tab) neobnovovat pokaždé
@@ -177,7 +186,8 @@ class Pane:
 PANE_ATTRS = ("settings", "pm", "shared", "projects", "name_issues", "_name_check", "_bg_refresh",
               "_name_check_again", "_rendering", "_columns_sized", "_last_refresh", "table",
               "search", "panel", "side", "splitter", "tabs", "btn_add_tab", "tabs_row",
-              "projects_page", "folder_panel", "pages", "frame", "notes", "_notes_window")
+              "projects_page", "folder_panel", "pages", "frame", "notes", "_notes_window",
+              "list_filter")
 
 
 class MainWindow(QMainWindow):
@@ -264,6 +274,16 @@ class MainWindow(QMainWindow):
         self.act_rename.setShortcut(QKeySequence(Qt.Key.Key_F2))
         self.act_rename.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         self.act_rename.triggered.connect(lambda: self.rename_project())
+        self.act_archive = QAction("Archivovat…", self)
+        self.act_archive.setToolTip("Zabalí dokončený projekt do archivu (zip) a odstraní ho z pracovní složky")
+        self.act_archive.triggered.connect(lambda: self.archive_selected())
+        self.act_storage = QAction("Zálohy a koš…", self)
+        self.act_storage.setToolTip("Kolik místa zabírají zálohy a koš projektu na serveru, úklid")
+        self.act_storage.triggered.connect(lambda: self.show_storage())
+        self.act_favorite = QAction("Přidat do oblíbených", self)
+        self.act_favorite.setShortcut(QKeySequence("Ctrl+D"))
+        self.act_favorite.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        self.act_favorite.triggered.connect(lambda: self.toggle_favorite())
         self.act_comment = QAction("Upravit komentář…", self)
         self.act_comment.setToolTip("Komentář projektu vidí všichni; změny se zapisují do historie")
         self.act_comment.triggered.connect(lambda: self.edit_comment())
@@ -346,6 +366,27 @@ class MainWindow(QMainWindow):
             yield pane
         finally:
             self.pane = previous
+
+    @contextmanager
+    def _please_wait(self, text: str):
+        """Krátká operace v hlavním vlákně – informační okénko „čekejte“, aby okno nevypadalo
+        zamrzle (např. kontrola otevřených souborů, velikost projektu)."""
+        dlg = QProgressDialog(text, None, 0, 0, self)
+        dlg.setWindowTitle("SPM")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setMinimumWidth(380)
+        dlg.show()
+        self.set_busy("task", text)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        try:
+            yield
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.set_busy("task", None)
+            dlg.close()
+            dlg.deleteLater()
 
     def _in(self, pane: Pane, fn):
         """Obsluha události z panelu pane – proběhne v jeho kontextu."""
@@ -437,6 +478,7 @@ class MainWindow(QMainWindow):
         # dvojklik: název = aktivovat / deaktivovat, komentář = upravit, jinak místní složka projektu
         self.table.doubleClicked.connect(self._in(pane, self._on_double_click))
         self.table.addAction(self.act_rename)
+        self.table.addAction(self.act_favorite)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._in(pane, self._context_menu))
 
@@ -525,7 +567,17 @@ class MainWindow(QMainWindow):
         self.projects_page = QWidget()
         page_lay = QVBoxLayout(self.projects_page)
         page_lay.setContentsMargins(0, 0, 0, 0)
-        page_lay.addWidget(self.search)
+        self.list_filter = QComboBox()
+        for label in LIST_FILTERS:
+            self.list_filter.addItem(label)
+        self.list_filter.setToolTip("Zobrazit všechny projekty, jen oblíbené (★, Ctrl+D), nebo "
+                                    "naposledy otevřené")
+        self.list_filter.currentIndexChanged.connect(self._in(pane, lambda _i: self._apply_filter()))
+        search_row = QHBoxLayout()
+        search_row.addWidget(self.search)
+        search_row.addWidget(self.list_filter)
+        search_row.addStretch()
+        page_lay.addLayout(search_row)
         page_lay.addWidget(self.splitter)
         self.folder_panel = FolderPanel()
         self.folder_panel.pm_for = self.pm_for
@@ -957,6 +1009,10 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         act_rename = menu.addAction("Přejmenovat záložku…")
         act_settings = menu.addAction("Nastavení složek…")
+        act_storage = act_archive = None
+        if not self.app_settings.view(ws_id).is_folder:
+            act_storage = menu.addAction("Zálohy a koš na serveru…")
+            act_archive = menu.addAction("Archiv projektů…")
         colors = menu.addMenu("Barva záložky")
         current_color = self.app_settings.view(ws_id).tab_color
         for key, (label, _light, _dark) in TAB_COLORS.items():
@@ -979,6 +1035,14 @@ class MainWindow(QMainWindow):
             if ws_id != self.settings.workspace_id:
                 self.switch_workspace(ws_id)
             self.open_settings()
+        elif act_archive is not None and chosen is act_archive:
+            if ws_id != self.settings.workspace_id:
+                self.switch_workspace(ws_id)
+            self.show_archive()
+        elif act_storage is not None and chosen is act_storage:
+            if ws_id != self.settings.workspace_id:
+                self.switch_workspace(ws_id)
+            self.show_storage(whole_server=True)
         elif chosen is act_remove:
             self.remove_workspace(ws_id)
 
@@ -1218,7 +1282,8 @@ class MainWindow(QMainWindow):
         names = ["já" if not any(u is o for o in p.others) else u.user for u in p.users]
         since = min((u.since for u in p.users), default="").replace("T", " ")
         comment = p.comment.first_line + (" …" if "\n" in p.comment.text else "") if p.comment else ""
-        values = [p.name, comment, state, ", ".join(names), since, "ano" if p.local_exists else ""]
+        shown_name = f"{STAR} {p.name}" if p.name in self.favorites() else p.name
+        values = [shown_name, comment, state, ", ".join(names), since, "ano" if p.local_exists else ""]
         # barva stavu platí pro celý řádek (i komentář) – stejná jako u názvu projektu
         if issues:
             color = COLOR_INVALID
@@ -1314,13 +1379,57 @@ class MainWindow(QMainWindow):
         """Skryje projekty, jejichž název ani komentář neobsahuje hledaný text (bez ohledu
         na velikost písmen a diakritiku)."""
         needle = normalize(self.search.text().strip())
+        mode = self.list_filter.currentIndex() if hasattr(self.pane, "list_filter") else 0
+        only = self.favorites() if mode == FILTER_FAVORITES else (
+            set(self.recent()) if mode == FILTER_RECENT else None)
         for r, p in enumerate(self.projects):
             text = p.name + "\n" + (p.comment.text if p.comment else "")
-            self.table.setRowHidden(r, bool(needle) and needle not in normalize(text))
+            hidden = (bool(needle) and needle not in normalize(text)) or (only is not None and p.name not in only)
+            self.table.setRowHidden(r, hidden)
         rows = self.table.selectionModel().selectedRows()
         if rows and self.table.isRowHidden(rows[0].row()):
             self.table.clearSelection()
         self._update_actions()
+
+    # --- oblíbené a naposledy otevřené ------------------------------------------------
+
+    def favorites(self) -> set[str]:
+        return {n for n in (self.settings.ui.get(self._ui_key("favorites")) or "").split("\n") if n}
+
+    def recent(self) -> list[str]:
+        """Naposledy otevřené projekty záložky (nejnovější první)."""
+        return [n for n in (self.settings.ui.get(self._ui_key("recent")) or "").split("\n") if n]
+
+    def _touch_recent(self, name: str) -> None:
+        names = [name] + [n for n in self.recent() if n != name]
+        self.settings.ui[self._ui_key("recent")] = "\n".join(names[:RECENT_COUNT])
+        if self.list_filter.currentIndex() == FILTER_RECENT:
+            self._apply_filter()
+
+    def toggle_favorite(self, name: str | None = None) -> None:
+        """Přidat projekt do oblíbených (★) / odebrat (Ctrl+D)."""
+        if name is None:
+            p = self.selected()
+            if p is None:
+                return
+            name = p.name
+        favs = self.favorites()
+        favs.symmetric_difference_update({name})
+        self.settings.ui[self._ui_key("favorites")] = "\n".join(sorted(favs, key=str.lower))
+        for pane in self.panes:  # i druhý panel se stejnou záložkou
+            if hasattr(pane, "table") and pane.settings.workspace_id == self.settings.workspace_id:
+                with self.on_pane(pane):
+                    names = [p.name for p in self.projects]
+                    if name in names:
+                        self._render_row(names.index(name), self.projects[names.index(name)])
+                    self._apply_filter()
+        self._update_actions()
+
+    def _rename_in_lists(self, old: str, new: str) -> None:
+        """Přejmenovaný projekt zůstane v oblíbených i naposledy otevřených."""
+        for key in ("favorites", "recent"):
+            names = (self.settings.ui.get(self._ui_key(key)) or "").split("\n")
+            self.settings.ui[self._ui_key(key)] = "\n".join(new if n == old else n for n in names if n)
 
     def _select_first_visible(self) -> None:
         for r in range(self.table.rowCount()):
@@ -1333,6 +1442,8 @@ class MainWindow(QMainWindow):
         p = self._refresh_selected_row() if not self._rendering else self.selected()
         if p:
             self.settings.ui[self._ui_key("last_project")] = p.name
+            if not self._rendering:
+                self._touch_recent(p.name)
         self._update_actions()
         self._show_project(p)
         if p and p.notes_for_me and not self._rendering and self.pane is self.active_pane:
@@ -1438,6 +1549,11 @@ class MainWindow(QMainWindow):
         self.act_comment.setEnabled(bool(p and not p.local_only))
         self.act_unlock.setEnabled(bool(p and p.others))
         self.act_rerun_scripts.setEnabled(bool(p and p.script_pending))
+        self.act_favorite.setEnabled(p is not None)
+        self.act_storage.setEnabled(bool(p and not p.local_only))
+        self.act_archive.setEnabled(bool(p and not p.local_only and archive.archive_dir(self.settings)))
+        self.act_favorite.setText("Odebrat z oblíbených\tCtrl+D" if p and p.name in self.favorites()
+                                  else "Přidat do oblíbených\tCtrl+D")
         self.act_discard_scripts.setEnabled(bool(p and p.script_pending))
 
     def _context_menu(self, pos) -> None:
@@ -1452,7 +1568,9 @@ class MainWindow(QMainWindow):
         self.table.selectRow(row)
         actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
                    self.act_deactivate, self.act_publish, None, self.act_open, self.act_history, self.act_notes,
-                   self.act_restore, None, self.act_comment, self.act_rename, None,
+                   self.act_restore, self.act_storage, self.act_archive, None, self.act_favorite,
+                   self.act_comment,
+                   self.act_rename, None,
                    self.act_cancel, self.act_unlock,
                    None, act_create, self.act_refresh]
         if self.act_invalid.isEnabled():
@@ -1592,8 +1710,46 @@ class MainWindow(QMainWindow):
                  status_text="Porovnávám soubory…",
                  on_done=lambda plan: self._confirm_upload(plan, end_session, preselect))
 
+    def _check_open_files(self, plan: UploadPlan, end_session: bool) -> str:
+        """Soubory otevřené v jiné aplikaci (CAD, právě se ukládají) – upozornit před odevzdáním.
+        Vrací "ok", "cancel", nebo "replan" (soubory se mezitím zavřely – mohly se uložit,
+        porovnání se serverem je potřeba udělat znovu)."""
+        title = "Deaktivace" if end_session else "Odevzdání"
+        waited = False
+        while True:
+            with self._please_wait("Kontroluji, zda nejsou soubory otevřené v jiném programu…"):
+                busy = self.pm.files_open_elsewhere(plan, end_session)
+            if not busy:
+                return "replan" if waited else "ok"
+            lines = [f"{path} – otevřeno v programu {', '.join(apps)}" if apps else path
+                     for path, apps in busy.items()]
+            shown = "\n".join(lines[:15]) + ("\n…" if len(lines) > 15 else "")
+            box = QMessageBox(
+                QMessageBox.Icon.Warning, title,
+                f"Tyto soubory má otevřené jiný program:\n\n"
+                f"{shown}\n\nUložte je a zavřete, pak zvolte Zkusit znovu. Otevřený soubor se nemusí "
+                "nahrát celý"
+                + (" a místní kopie po deaktivaci nepůjde smazat." if end_session else "."), parent=self)
+            retry = box.addButton("Zkusit znovu", QMessageBox.ButtonRole.AcceptRole)
+            anyway = box.addButton("Přesto pokračovat", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton("Zrušit", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is anyway:
+                return "ok"
+            if box.clickedButton() is not retry:
+                return "cancel"
+            waited = True
+
     def _confirm_upload(self, plan: UploadPlan, end_session: bool,
                         preselect: str | list[str] | None = None) -> None:
+        check = self._check_open_files(plan, end_session)
+        if check == "cancel":
+            return
+        if check == "replan":  # soubory zavřené (a možná uložené) – porovnat znovu
+            run_task(self, "Porovnávání souborů", self.pm.plan_upload, plan.name,
+                     status_text="Porovnávám soubory…",
+                     on_done=lambda new: self._confirm_upload(new, end_session, preselect))
+            return
         dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name), preselect=preselect,
                            drafts=self.pm.drafts(plan.name), users=self.notes.users or self._known_users())
         accepted = self._exec_dialog(dlg, "upload")
@@ -1735,6 +1891,7 @@ class MainWindow(QMainWindow):
             self.refresh()
             return
         self.settings.ui[self._ui_key("last_project")] = new_name
+        self._rename_in_lists(p.name, new_name)
         self.table.clearSelection()
         self.refresh()
         if p.local_only:
@@ -2088,6 +2245,129 @@ class MainWindow(QMainWindow):
 
         run_task(self, f"Obnovení projektu {catalog.name}", self.pm.restore, catalog, point,
                  status_text="Obnovuji soubory…", on_done=done)
+
+    # --- archivace ----------------------------------------------------------------------
+
+    def archive_selected(self) -> None:
+        """Archivovat vybraný projekt (zip do archivní složky, z pracovní složky pryč)."""
+        p = self.selected()
+        if not p or p.local_only:
+            return
+        problems = archive.archive_problems(self.pm, p.name)
+        if problems:
+            QMessageBox.information(self, "Archivovat", f"Projekt {p.name} nelze archivovat:\n\n• "
+                                    + "\n• ".join(problems))
+            return
+        server = self.pm.server_dir(p.name)
+        with self._please_wait(f"Zjišťuji velikost projektu {p.name}…"):
+            info = storage.project_storage(server)
+            project_bytes = sum(f.stat().st_size for f in server.rglob("*")
+                                if f.is_file() and ".spm" not in f.relative_to(server).parts[:1])
+        dlg = ArchiveProjectDialog(p.name, archive.archive_dir(self.settings), info, project_bytes,
+                                   self.settings.archive_keep_backups, self)
+        accepted = self._exec_dialog(dlg, "archive")
+        comment = dlg.comment_text()
+        dlg.deleteLater()
+        if not accepted:
+            return
+        name = p.name
+
+        def done(res) -> None:
+            self.refresh()
+            msg = (f"Projekt {name} je archivovaný:\n{res.zip_path}\n\n"
+                   f"{res.files} souborů, zip {storage.fmt_bytes(res.size)}.")
+            if res.leftover:
+                msg += ("\n\nSložku projektu se v pracovní složce nepodařilo celou smazat (některý "
+                        "soubor je otevřený) – smažte zbytek ručně.")
+            QMessageBox.information(self, "Archivovat", msg)
+            local = self.pm.local_dir(name)
+            if local.exists() and QMessageBox.question(
+                    self, "Archivovat",
+                    f"Máte místní složku projektu:\n{local}\n\nProjekt už v pracovní složce není – "
+                    "smazat ji (do Koše)?") == QMessageBox.StandardButton.Yes:
+                try:
+                    recycle.to_recycle_bin([local])
+                except OSError as e:
+                    QMessageBox.warning(self, "Archivovat", str(e))
+                self.refresh()
+
+        run_task(self, f"Archivace projektu {name}", archive.archive_project, self.pm, name, comment,
+                 status_text="Archivuji…", on_done=done)
+
+    def show_archive(self) -> None:
+        """Archiv projektů záložky – seznam, náhled, obnova do pracovní složky."""
+        folder = archive.archive_dir(self.settings)
+        if folder is None:
+            QMessageBox.information(self, "Archiv projektů",
+                                    "Archivní složka není nastavená (Nastavení → Společné nastavení).")
+            return
+        if not folder.is_dir():
+            QMessageBox.information(self, "Archiv projektů", f"Archivní složka zatím neexistuje "
+                                    f"nebo není dostupná:\n{folder}")
+            return
+
+        def restore(entry) -> bool:
+            name = entry.project
+            try:
+                same = archive.existing_identity(self.pm, entry.path)
+            except Exception as e:  # noqa: BLE001 – poškozený zip apod.
+                QMessageBox.critical(self, "Obnovit z archivu", str(e))
+                return False
+            if same:
+                QMessageBox.information(self, "Obnovit z archivu", archive.identity_message(entry.project, same))
+                return False
+            if any(x.name.lower() == name.lower() for x in self.pm.server_root.iterdir()):
+                name, ok = QInputDialog.getText(
+                    self, "Obnovit z archivu",
+                    f"V pracovní složce už projekt {entry.project} je.\nPod jakým názvem ho obnovit?",
+                    QLineEdit.EchoMode.Normal, f"{entry.project}_obnova")
+                if not ok or not name.strip():
+                    return False
+            elif QMessageBox.question(self, "Obnovit z archivu",
+                                      f"Obnovit projekt {name} z archivu do pracovní složky?\n\n"
+                                      f"{self.pm.server_root}\n\nZip v archivu zůstane.") \
+                    != QMessageBox.StandardButton.Yes:
+                return False
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                path = archive.restore_archive(self.pm, entry.path, name.strip())
+            except Exception as e:  # noqa: BLE001
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, "Obnovit z archivu", str(e))
+                return False
+            QApplication.restoreOverrideCursor()
+            self.refresh()
+            QMessageBox.information(self, "Obnovit z archivu", f"Projekt je obnovený:\n{path}")
+            return True
+
+        dlg = ArchiveListDialog(folder, restore, archive.permission_problem(self.settings, self.pm.user), self)
+        self._exec_dialog(dlg, "archive_list")
+        dlg.deleteLater()
+
+    def show_storage(self, whole_server: bool = False) -> None:
+        """Zálohy a koš – vybraného projektu, nebo všech projektů síťové složky záložky."""
+        if self.settings.is_folder or not self.settings.is_complete():
+            return
+
+        def show(infos) -> None:
+            if not infos:
+                QMessageBox.information(self, "Zálohy a koš", "V síťové složce nejsou žádné projekty.")
+                return
+            dlg = StorageDialog(self.pm.server_root, infos, self.pm.user, self.pm.pc,
+                                self.settings.backup_count, self,
+                                clean_problem=archive.cleanup_problem(self.settings, self.pm.user))
+            self._exec_dialog(dlg, "storage")
+            dlg.deleteLater()
+
+        if whole_server:
+            run_task(self, "Zálohy a koš na serveru", lambda progress=None:
+                     storage.server_storage(self.pm.server_root, progress),
+                     status_text="Procházím zálohy…", on_done=show)
+            return
+        p = self.selected()
+        if not p or p.local_only:
+            return
+        show([storage.project_storage(self.pm.server_dir(p.name))])
 
     def file_history(self, path: str) -> None:
         """Historie jednoho souboru (verze, otevření, obnovení)."""
