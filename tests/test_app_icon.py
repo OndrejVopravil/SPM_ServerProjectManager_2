@@ -22,3 +22,21 @@ def test_icon_sizes_and_ico_file(tmp_path):
     reserved, kind, count = struct.unpack("<HHH", data[:6])
     assert (reserved, kind, count) == (0, 1, len(SIZES))
     assert data[6 + 16 * count:][:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_app_id_only_when_run_from_source(monkeypatch):
+    """SPM.exe vlastní identitu procesu nenastavuje – jinak by připnutá ikona na hlavním
+    panelu zmizela; při spuštění přes Python ano (ikona SPM místo Pythonu)."""
+    import pytest
+    if sys.platform != "win32":
+        pytest.skip("jen Windows")
+    import ctypes
+
+    from spm import __main__ as entry
+    calls = []
+    monkeypatch.setattr(ctypes.windll.shell32, "SetCurrentProcessExplicitAppUserModelID",
+                        lambda app_id: calls.append(app_id))
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert entry._set_app_id() and calls == ["SPM.ServerProjectManager"]
+    monkeypatch.setattr(sys, "frozen", True, raising=False)               # sestavené SPM.exe
+    assert not entry._set_app_id() and calls == ["SPM.ServerProjectManager"]

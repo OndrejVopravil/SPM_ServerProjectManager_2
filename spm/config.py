@@ -98,6 +98,9 @@ class Settings:
     # smí archivovat, vracet z archivu a uklízet zálohy (loginy; prázdné = nikdo)
     archive_keep_backups: int = 2
     archivers: list[str] = field(default_factory=list)
+    # Vzkazy vyřízené / dokončené před více dny (a bez nové odpovědi) se přesunou do archivu
+    # vzkazů (<síťová složka>/.spm/vzkazy/_archiv) – nic se nemaže; 0 = nearchivovat
+    messages_archive_days: int = 90
     # --- převzato ze spm_config.json síťové složky záložky (viz shared_config) ---
     # identita síťové složky – stejná pro všechny uživatele bez ohledu na připojení disku
     server_id: str = ""
@@ -172,7 +175,7 @@ INTERNAL_FIELDS = ("workspace_id", "_app")
 WORKSPACE_FIELDS = ("server_root", "local_root", "folder_root", "backup_enabled", "backup_count",
                     "check_forbidden_chars", "ignore_patterns", "known_default_ignore",
                     "server_id", "server_name", "tab_color", "scripts",
-                    "archive_keep_backups", "archivers")
+                    "archive_keep_backups", "archivers", "messages_archive_days")
 PERSONAL_FIELDS = tuple(f.name for f in fields(Settings)
                         if f.name not in WORKSPACE_FIELDS + INTERNAL_FIELDS + ("ui",))
 DEFAULT_WORKSPACE_NAME = "Projekty"

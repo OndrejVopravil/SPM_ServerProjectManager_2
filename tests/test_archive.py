@@ -269,3 +269,16 @@ def test_archive_refused_with_reasons_and_no_restore_without_permission(window, 
     dlg = ArchiveListDialog(archive.archive_dir(bob.settings), lambda e: True,
                             archive.permission_problem(bob.settings, bob.user))
     assert not dlg.btn_restore.isEnabled() and "smí jen: alice" in dlg.btn_restore.toolTip()
+
+
+def test_shared_config_messages_archive_days():
+    from spm import shared_config as sc
+    assert sc.parse('{"messages_archive_days": 30}') == {"messages_archive_days": 30}
+    assert sc.parse('{"messages_archive_days": 0}') == {"messages_archive_days": 0}   # nearchivovat
+    with pytest.raises(sc.SharedConfigError, match="messages_archive_days"):
+        sc.parse('{"messages_archive_days": -5}')
+    with pytest.raises(sc.SharedConfigError, match="messages_archive_days"):
+        sc.parse('{"messages_archive_days": "90"}')
+    s = Settings()
+    assert s.messages_archive_days == 90
+    assert sc.apply(s, {"messages_archive_days": 30}) and s.messages_archive_days == 30

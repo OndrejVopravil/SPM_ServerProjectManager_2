@@ -1,7 +1,7 @@
 """Adresář uživatelů síťové složky s projekty (<síťová složka>/.spm_users/<login>.json).
 
 Aplikace v něm při spuštění zaregistruje svého uživatele (Windows login, přezdívka z nastavení,
-celé jméno z Windows, poslední počítač). Slouží k výběru adresáta poznámky – nabídnou se
+celé jméno z Windows, poslední počítač, verze SPM). Slouží k výběru adresáta poznámky – nabídnou se
 všichni, kdo kdy aplikaci s touto síťovou složkou spustili, nejen ti, kdo v projektu pracovali.
 Uživatel se pozná podle loginu (bez ohledu na velikost písmen), ne podle počítače.
 """
@@ -26,12 +26,34 @@ class UserInfo:
     full_name: str = ""
     pc: str = ""
     seen: str = ""
+    version: str = ""    # verze SPM, se kterou uživatel naposledy pracoval ("" = starší než 0.1.22)
+
+    @property
+    def short(self) -> str:
+        """Přezdívka, nebo celé jméno, nebo login (jako autor poznámky)."""
+        return self.nickname or self.full_name or self.login
 
     @property
     def display(self) -> str:
         """„Přezdívka (login)“ – nebo celé jméno, nebo jen login."""
         name = self.nickname or self.full_name
         return f"{name} ({self.login})" if name and name.lower() != self.login.lower() else self.login
+
+
+class Names:
+    """Aktuální jména uživatelů z adresáře – u starších poznámek a vzkazů se zobrazí nová
+    přezdívka; uložené jméno platí jen pro uživatele, který v adresáři není."""
+
+    def __init__(self, users: list[UserInfo]):
+        self._users = {u.login.lower(): u for u in users}
+
+    def author(self, login: str, stored: str = "") -> str:
+        u = self._users.get((login or "").lower())
+        return u.short if u else (stored or login)
+
+    def person(self, login: str, stored: str = "") -> str:
+        u = self._users.get((login or "").lower())
+        return u.display if u else (stored or login)
 
 
 def display_name(nickname: str, full_name: str, login: str) -> str:
@@ -52,8 +74,8 @@ def register(server_root: Path, user: UserInfo) -> bool:
     spuštění se aktualizuje nejvýše jednou denně). Vrací True, pokud se zapisovalo."""
     path = _file(server_root, user.login)
     current = read_user(path)
-    if current is not None and (current.nickname, current.full_name, current.pc) == \
-            (user.nickname, user.full_name, user.pc) and current.seen[:10] == now_iso()[:10]:
+    if current is not None and (current.nickname, current.full_name, current.pc, current.version) == \
+            (user.nickname, user.full_name, user.pc, user.version) and current.seen[:10] == now_iso()[:10]:
         return False
     user.seen = now_iso()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,7 +95,8 @@ def read_user(path: Path) -> UserInfo | None:
         return None
     if not isinstance(data, dict) or not isinstance(data.get("login"), str) or not data["login"]:
         return None
-    return UserInfo(data["login"], *(str(data.get(k) or "") for k in ("nickname", "full_name", "pc", "seen")))
+    return UserInfo(data["login"], *(str(data.get(k) or "")
+                                     for k in ("nickname", "full_name", "pc", "seen", "version")))
 
 
 def list_users(server_root: Path) -> list[UserInfo]:

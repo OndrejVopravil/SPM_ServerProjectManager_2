@@ -320,3 +320,59 @@ def test_splitters_move_together_and_tree_columns(qapp, app_settings):
         assert max(tree.columnWidth(i) for i in (1, 2, 3)) < 100
     finally:
         close(w, qapp)
+
+
+def test_panes_same_height_at_startup(qapp, app_settings):
+    """Start ve dvou panelech: seznam projektů a strom stejně vysoké v obou (i když si panely
+    dřív uložily různé děliče a strom se v každém objeví v jinou chvíli)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QSplitter
+    from spm.gui.main_window import MainWindow
+
+    def state(sizes):
+        s = QSplitter(Qt.Orientation.Vertical)
+        from PySide6.QtWidgets import QWidget
+        s.addWidget(QWidget())
+        s.addWidget(QWidget())
+        s.resize(100, sum(sizes))
+        s.setSizes(sizes)
+        return bytes(s.saveState().toBase64()).decode("ascii")
+
+    ui = app_settings.base.ui
+    ui["main.dual"] = "1"
+    ui["main.splitter"] = state([100, 500])          # dřívější verze: každý panel jinak
+    ui["main.splitter2"] = state([450, 150])
+    ui["last_project." + app_settings.workspaces[0]["id"]] = "Alfa"
+    w = MainWindow(app_settings)
+    try:
+        w.resize(1200, 700)
+        w.show()
+        for _ in range(5):
+            qapp.processEvents()
+        left, right = w.panes
+        if left.side.isHidden() or right.side.isHidden():   # vybrat projekty (jako po načtení)
+            for pane in (left, right):
+                with w.on_pane(pane):
+                    pane.table.selectRow(0)
+            for _ in range(5):
+                qapp.processEvents()
+        assert not left.side.isHidden() and not right.side.isHidden()
+        assert abs(left.splitter.sizes()[0] - right.splitter.sizes()[0]) <= 2
+        assert abs(left.splitter.sizes()[1] - right.splitter.sizes()[1]) <= 2
+        ratio = w._split_ratio
+        w.close()
+        qapp.processEvents()
+        assert abs(float(app_settings.base.ui["main.split_ratio"]) - ratio) < 0.001   # uloží se
+        # další start: poměr z minula v obou panelech
+        w = MainWindow(app_settings)
+        w.resize(1200, 700)
+        w.show()
+        for pane in w.panes:
+            with w.on_pane(pane):
+                pane.table.selectRow(0)
+        for _ in range(5):
+            qapp.processEvents()
+        for pane in w.panes:
+            assert abs(w._ratio_of(pane.splitter) - ratio) < 0.02
+    finally:
+        close(w, qapp)

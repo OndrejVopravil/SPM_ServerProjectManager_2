@@ -27,11 +27,12 @@ FORMAT_KEY = "spm_config"
 FORMAT = 1
 # Nastavení řízená společnou konfigurací (ostatní zůstávají vždy místní)
 SHARED_FIELDS = ("backup_enabled", "backup_count", "ignore_patterns", "check_forbidden_chars",
-                 "archive_keep_backups", "archivers")
+                 "archive_keep_backups", "archivers", "messages_archive_days")
 LIST_FIELDS = ("ignore_patterns", "archivers")
 SERVER_ID, SERVER_NAME = "server_id", "server_name"
 OBSOLETE_KEYS = ("mirror_rules", "archive_root")  # dřívější nastavení – při uložení se ze souboru odstraní
 BACKUP_COUNT_MAX = 99
+MESSAGES_ARCHIVE_DAYS_MAX = 3650
 
 # Stav společné konfigurace
 NONE = "none"                # soubor neexistuje -> místní nastavení
@@ -101,6 +102,12 @@ def parse(text: str) -> dict:
         if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= BACKUP_COUNT_MAX:
             raise SharedConfigError(f"archive_keep_backups: očekává se celé číslo 0–{BACKUP_COUNT_MAX}.")
         values["archive_keep_backups"] = count
+    if "messages_archive_days" in data:
+        days = data["messages_archive_days"]
+        if isinstance(days, bool) or not isinstance(days, int) or not 0 <= days <= MESSAGES_ARCHIVE_DAYS_MAX:
+            raise SharedConfigError("messages_archive_days: očekává se celé číslo 0–"
+                                    f"{MESSAGES_ARCHIVE_DAYS_MAX} (0 = vzkazy nearchivovat).")
+        values["messages_archive_days"] = days
     if "archivers" in data:
         users = data["archivers"]
         if not isinstance(users, list) or not all(isinstance(u, str) for u in users):

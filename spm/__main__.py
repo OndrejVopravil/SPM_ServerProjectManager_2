@@ -18,15 +18,20 @@ def _show_unhandled(exc_type, exc, tb) -> None:
     box.exec()
 
 
-def _set_app_id() -> None:
+def _set_app_id() -> bool:
     """Windows: vlastní identita procesu – hlavní panel pak ukazuje ikonu SPM, ne Pythonu
-    (při spuštění přes python / pythonw)."""
-    if sys.platform == "win32":
+    (jen při spuštění přes python / pythonw). Sestavené SPM.exe identitu nenastavuje: Windows
+    ho pozná podle souboru a ikonu vezme z něj – s vlastní identitou by ikona připnutého .exe
+    na hlavním panelu zmizela (Windows by k ní hledal zástupce, který neexistuje).
+    Vrací, zda se identita nastavila."""
+    if sys.platform == "win32" and not getattr(sys, "frozen", False):
         try:
             import ctypes
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SPM.ServerProjectManager")
+            return True
         except (AttributeError, OSError):
             pass
+    return False
 
 
 def main() -> int:

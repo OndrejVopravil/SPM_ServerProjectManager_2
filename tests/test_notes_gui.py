@@ -86,13 +86,19 @@ def test_recipient_from_text():
 
 
 def test_mention_and_touches():
-    from spm.gui.notes_panel import mention, touches
+    from spm.gui.notes_panel import cc_of, touches
+    from spm.mentions import link_projects, mentions, project_refs
     from spm.users import UserInfo
     users = [UserInfo("bob", nickname="Bobík"), UserInfo("alice")]
-    assert mention("Ahoj @bob, koukni", users) == ("bob", "Bobík (bob)")
-    assert mention("pro @Bobík.", users) == ("bob", "Bobík (bob)")
-    assert mention("pro @novak", users) == ("novak", "")             # ještě nespustil SPM
-    assert mention("mail jan@firma.cz", users) == ("", "")            # e-mail není zmínka
+    assert mentions("Ahoj @bob, koukni", users) == [("bob", "Bobík (bob)")]
+    assert mentions("pro @Bobík. a @alice, @bob", users) == [("bob", "Bobík (bob)"), ("alice", "alice")]
+    assert mentions("pro @Novak", users) == [("novak", "")]          # ještě nespustil SPM
+    assert mentions("mail jan@firma.cz", users) == []                 # e-mail není zmínka
+    assert cc_of("@bob a @alice", users, recipient="Bob") == [["alice", "alice"]]   # adresát není cc
+    names = ["058768", "Forma"]
+    assert project_refs("viz #058768, #forma a #2 bod", names) == ["058768", "Forma"]
+    assert link_projects("viz #058768.", names) == "viz [#058768](spm-project:058768)."
+    assert link_projects("# nadpis a #2", names) == "# nadpis a #2"     # jen existující projekty
     assert touches(["dily/deska.elt"], ["dily/"]) and touches(["dily/"], ["dily/deska.elt"])
     assert touches(["Dily/Deska.elt"], ["dily/deska.elt"]) and not touches(["sestava.elt"], ["dily/"])
 
@@ -145,8 +151,11 @@ def test_write_note_from_tree_publishes_immediately(qapp, pms):
         w.notes.editor.setPlainText("Deska je předběžná, @bob prosím zkontroluj")
         w.notes.send()
         (note,) = bob.notes("Forma")                       # zveřejněná hned, bez odevzdání
-        assert (note.recipient, note.targets) == ("bob", ["dily/deska.elt"])
+        assert (note.recipient, note.targets) == ("", ["dily/deska.elt"])   # @bob = na vědomí
+        assert note.is_cc("bob")
         assert w.notes.editor.toPlainText() == ""
+        card = w.notes.card_widgets()[0]
+        assert "na vědomí" in card.head.text()
         settle_panel(w.panel)
         assert find_item(w.panel.tree, "dily/deska.elt").text(3) == "📝 1"
         # bez vazby na soubory a adresát výběrem
@@ -431,10 +440,12 @@ def test_handover_note_in_upload_dialog(qapp, pms):
     dlg.handover.setPlainText("Deska je hotová, @bob zkontroluj díry")
     dlg.handover_files.setChecked(True)
     (note,) = dlg.selected_notes()
-    assert (note.recipient, note.targets) == ("bob", ["dily/deska.elt", "sestava.elt"])
+    assert (note.recipient, note.targets) == ("", ["dily/deska.elt", "sestava.elt"])   # @ = na vědomí
+    assert note.cc == [["bob", "bob"]]
     alice.upload(plan, plan.default_assignments(), "deska v2", end_session=True, notes=dlg.selected_notes())
     (published,) = bob.notes("Forma")
     assert published.text.startswith("Deska je hotová") and published.commit_id is not None
+    assert published.is_cc("Bob") and not published.is_for("bob")
 
 
 def test_for_me_counter_in_tab_row(qapp, pms):

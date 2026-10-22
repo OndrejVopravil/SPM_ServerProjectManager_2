@@ -3,6 +3,8 @@
 - Zveřejněné poznámky jsou v databázi projektu (tabulky notes a note_targets – zakládají se
   s první poznámkou). Mohou se týkat souborů (podle file_id – přežijí přejmenování) a složek
   (podle cesty), mohou být adresované uživateli (Windows login) a mají stav vyřízeno / otevřeno.
+  Uživatelé zmínění v textu „@jméno“ jsou „na vědomí“ (sloupec cc) – jen informace, adresát
+  se vybírá zvlášť.
 - Rozepsané poznámky (během práce na aktivovaném projektu) jsou v místní kopii
   (<místní kopie>/.spm/notes_draft.json) – ostatní je nevidí; zveřejní se s odevzdáním.
 - Souhrn otevřených poznámek je navíc v <projekt>/.spm/notes.json, aby seznam projektů
@@ -41,7 +43,8 @@ CREATE TABLE IF NOT EXISTS notes (
     resolved_by    TEXT,
     parent_id      INTEGER,             -- doplnění (odpověď) k poznámce; NULL = poznámka
     edited_at      TEXT,                -- poslední úprava autorem
-    seq            INTEGER              -- pořadí změny (vznik / úprava) – podle něj „NOVÁ“
+    seq            INTEGER,             -- pořadí změny (vznik / úprava) – podle něj „NOVÁ“
+    cc             TEXT                 -- na vědomí: JSON [[login, jméno], …] ze zmínek @
 );
 CREATE TABLE IF NOT EXISTS note_targets (
     note_id INTEGER NOT NULL REFERENCES notes(note_id),
@@ -59,7 +62,7 @@ CREATE TABLE IF NOT EXISTS note_versions (
 CREATE INDEX IF NOT EXISTS ix_note_versions ON note_versions(note_id);
 """
 # sloupce notes přidané později (tabulka mohla vzniknout dřív bez nich)
-NOTE_COLUMNS = (("parent_id", "INTEGER"), ("edited_at", "TEXT"), ("seq", "INTEGER"))
+NOTE_COLUMNS = (("parent_id", "INTEGER"), ("edited_at", "TEXT"), ("seq", "INTEGER"), ("cc", "TEXT"))
 
 
 @dataclass
@@ -71,6 +74,7 @@ class Draft:
     targets: list[str] = field(default_factory=list)  # soubory / složky ('/' na konci)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created_at: str = field(default_factory=now_iso)
+    cc: list = field(default_factory=list)  # na vědomí: [[login, jméno], …]
 
     @property
     def title(self) -> str:
@@ -105,6 +109,7 @@ class Note:
     seq: int = 0
     replies: list["Note"] = field(default_factory=list)       # doplnění (nejstarší první)
     versions: list[NoteVersion] = field(default_factory=list)  # předchozí znění (nejnovější první)
+    cc: list[tuple[str, str]] = field(default_factory=list)  # na vědomí: (login, jméno)
 
     @property
     def resolved(self) -> bool:
@@ -117,6 +122,10 @@ class Note:
 
     def is_for(self, login: str) -> bool:
         return bool(self.recipient) and self.recipient == login.lower()
+
+    def is_cc(self, login: str) -> bool:
+        """Uživatel je na vědomí (zmíněný „@jméno“)."""
+        return any(c[0] == login.lower() for c in self.cc)
 
     def is_new(self, seen: int, me: str) -> bool:
         """Vznikla / byla upravena po posledním zobrazení – a ne mnou (vlastní změny nejsou nové)."""
@@ -188,13 +197,26 @@ def read_notes(server: Path) -> list[Note]:
                   r["recipient"] or "", r["recipient_name"] or "", r["text"], r["commit_id"],
                   r["resolved_at"], r["resolved_by"], sorted(by_note.get(r["note_id"], [])),
                   r["parent_id"], r["edited_at"], r["seq"] or r["note_id"], [],
-                  old.get(r["note_id"], []))
+                  old.get(r["note_id"], []), _parse_cc(r["cc"]))
              for r in rows]
     by_id = {n.note_id: n for n in notes}
     for n in reversed(notes):  # doplnění od nejstaršího
         if n.parent_id is not None and n.parent_id in by_id:
             by_id[n.parent_id].replies.append(n)
     return [n for n in notes if n.parent_id is None]
+
+
+def _parse_cc(value: str | None) -> list[tuple[str, str]]:
+    try:
+        data = json.loads(value or "[]")
+        return [(str(c[0]).lower(), str(c[1] if len(c) > 1 else "")) for c in data if c and c[0]]
+    except (ValueError, TypeError, IndexError):
+        return []
+
+
+def _cc_json(cc) -> str | None:
+    items = [[str(c[0]).lower(), str(c[1] if len(c) > 1 else "")] for c in cc or [] if c and c[0]]
+    return json.dumps(items, ensure_ascii=False) if items else None
 
 
 def _next_seq(db: ProjectDB) -> int:
@@ -210,9 +232,9 @@ def insert_notes(db: ProjectDB, drafts: list[Draft], user: str, pc: str, author:
     for d in drafts:
         cur = db.conn.execute(
             "INSERT INTO notes(created_at, user, pc, author, recipient, recipient_name, text, "
-            "commit_id, parent_id, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "commit_id, parent_id, seq, cc) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (now_iso(), user, pc, author, d.recipient.lower() or None, d.recipient_name or None,
-             d.text.strip(), commit_id, parent_id, _next_seq(db)))
+             d.text.strip(), commit_id, parent_id, _next_seq(db), _cc_json(d.cc)))
         _set_targets(db, cur.lastrowid, d.targets, files)
         ids.append(cur.lastrowid)
     return ids
@@ -235,9 +257,10 @@ def _row(db: ProjectDB, note_id: int):
 
 
 def edit_note(db: ProjectDB, note_id: int, user: str, text: str, recipient: str | None = None,
-              recipient_name: str | None = None, targets: list[str] | None = None) -> bool:
+              recipient_name: str | None = None, targets: list[str] | None = None,
+              cc: list | None = None) -> bool:
     """Úprava poznámky (nebo doplnění) jejím autorem. Předchozí znění se uloží do historie.
-    recipient / targets None = beze změny. Vrací False, pokud se nic nezměnilo."""
+    recipient / targets / cc None = beze změny. Vrací False, pokud se nic nezměnilo."""
     row = _row(db, note_id)
     if row["user"].lower() != user.lower():
         raise NoteError("Upravit poznámku může jen její autor.")
@@ -248,15 +271,16 @@ def edit_note(db: ProjectDB, note_id: int, user: str, text: str, recipient: str 
     new_name = (recipient_name or None) if recipient is not None else row["recipient_name"]
     old_targets = sorted(r[0] for r in db.conn.execute(
         "SELECT path FROM note_targets WHERE note_id = ?", (note_id,)))
-    if (text, new_recipient) == (row["text"], row["recipient"]) and \
+    new_cc = _cc_json(cc) if cc is not None else row["cc"]
+    if (text, new_recipient, new_cc) == (row["text"], row["recipient"], row["cc"]) and \
             (targets is None or sorted(targets) == old_targets):
         return False
     db.conn.execute("INSERT INTO note_versions(note_id, saved_at, text, recipient, recipient_name) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (note_id, now_iso(), row["text"], row["recipient"], row["recipient_name"]))
     db.conn.execute("UPDATE notes SET text = ?, recipient = ?, recipient_name = ?, edited_at = ?, "
-                    "seq = ? WHERE note_id = ?",
-                    (text, new_recipient, new_name, now_iso(), _next_seq(db), note_id))
+                    "seq = ?, cc = ? WHERE note_id = ?",
+                    (text, new_recipient, new_name, now_iso(), _next_seq(db), new_cc, note_id))
     if targets is not None:
         _set_targets(db, note_id, targets)
     return True
@@ -321,7 +345,7 @@ def load_drafts(local: Path, path: Path | None = None) -> list[Draft]:
     for item in data if isinstance(data, list) else []:
         if isinstance(item, dict):
             known = {k: item[k] for k in ("text", "recipient", "recipient_name", "targets", "id",
-                                          "created_at") if k in item}
+                                          "created_at", "cc") if k in item}
             drafts.append(Draft(**known))
     return drafts
 

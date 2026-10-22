@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from spm import notes as notes_mod
-from spm import users
+from spm import __version__, users
 from spm.config import Settings
 from spm.notes import Draft
 from spm.sync import ProjectManager
@@ -42,8 +42,12 @@ def test_user_directory(env, tmp_path):
     found = {u.login: u for u in alice.users()}
     assert set(found) == {"alice", "Bob"}
     assert found["alice"].nickname == "Alča" and found["alice"].display == "Alča (alice)"
+    assert found["alice"].version == __version__                # verze SPM uživatele
     assert not users.register(tmp_path / "server", users.UserInfo("alice", "Alča",
-                                                                    found["alice"].full_name, "PC-alice"))
+                                                                    found["alice"].full_name, "PC-alice",
+                                                                    version=__version__))
+    assert users.register(tmp_path / "server", users.UserInfo(          # jiná verze se zapíše
+        "alice", "Alča", found["alice"].full_name, "PC-alice", version="0.0.1"))
     alice.settings.nickname = "Alice N."                       # změna přezdívky se zapíše
     alice.register_user()
     assert {u.login: u for u in alice.users()}["alice"].nickname == "Alice N."

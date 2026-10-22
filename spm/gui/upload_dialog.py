@@ -39,7 +39,8 @@ from ..notes import Draft
 from ..scanner import to_abs
 from ..sync import UploadPlan, auto_deactivation, new_key
 from .check_tree import CheckTree, TreeEntry, in_scope
-from .notes_panel import MentionEdit, mention, recipient_combo
+from .completer_edit import CompleterEdit
+from .notes_panel import cc_of, recipient_combo
 
 DELETED_LABEL = "— smazán —"
 KEY_ROLE = Qt.ItemDataRole.UserRole
@@ -136,16 +137,14 @@ class UploadDialog(QDialog):
         self.users = list(users or [])
         note_box = QGroupBox("Poznámka pro další uživatele (nepovinná) – zveřejní se s odevzdáním")
         note_lay = QVBoxLayout(note_box)
-        self.handover = MentionEdit()
+        self.handover = CompleterEdit()
         self.handover.users = self.users
-        self.handover.setPlaceholderText("Co je rozpracované, na co si dát pozor…  (@jméno = pro koho)")
+        self.handover.setPlaceholderText("Co je rozpracované, na co si dát pozor…  (@jméno = na vědomí)")
         self.handover.setMaximumHeight(70)
         note_lay.addWidget(self.handover)
         note_row = QHBoxLayout()
         note_row.addWidget(QLabel("Pro:"))
         self.handover_to = recipient_combo(self.users)
-        self.handover.mentioned.connect(
-            lambda login: self.handover_to.setCurrentIndex(max(self.handover_to.findData(login.lower()), 0)))
         note_row.addWidget(self.handover_to)
         self.handover_files = QCheckBox("Týká se odevzdávaných souborů")
         self.handover_files.setToolTip("Poznámka se zobrazí u souborů, které odevzdáváte "
@@ -270,14 +269,12 @@ class UploadDialog(QDialog):
         if text:
             login = self.handover_to.currentData() or ""
             name = self.handover_to.currentText() if login else ""
-            if not login:
-                login, name = mention(text, self.users)
             targets = []
             if self.handover_files.isChecked():
                 keys = self.selected_keys()
                 targets = sorted({e.path for kind, e in self._entries()
                                   if kind != "deleted" and (keys is None or e.key in keys)}, key=str.lower)
-            notes.insert(0, Draft(text, login, name, targets))
+            notes.insert(0, Draft(text, login, name, targets, cc=cc_of(text, self.users, login)))
         return notes
 
     def comment_text(self) -> str:

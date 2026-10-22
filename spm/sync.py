@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
-from . import SPM_DIR, recycle
+from . import SPM_DIR, __version__, recycle
 from . import db as dbm
 from .comment import MAX_LENGTH as COMMENT_MAX_LENGTH
 from .comment import COMMENT_FILE, ProjectComment, normalize_text, read_comment, write_comment
@@ -497,7 +497,7 @@ class ProjectManager:
         if not hasattr(self, "_full_name"):
             self._full_name = current_full_name()
         users.register(self.server_root, users.UserInfo(self.user, self.settings.nickname.strip(),
-                                                        self._full_name, self.pc))
+                                                        self._full_name, self.pc, version=__version__))
 
     def users(self) -> list[users.UserInfo]:
         return users.list_users(self.server_root)
@@ -532,20 +532,21 @@ class ProjectManager:
             notes_mod.write_summary(server, db)
 
     def edit_note(self, name: str, note_id: int, text: str, recipient: str | None = None,
-                  recipient_name: str | None = None) -> bool:
+                  recipient_name: str | None = None, cc: list | None = None) -> bool:
         """Úprava zveřejněné poznámky (nebo doplnění) – jen jejím autorem; předchozí znění se
         uloží. Upravená poznámka se ostatním znovu označí jako nová."""
         server = self.server_dir(name)
         self._ensure_notes_tables(server)
         try:
             with self._write(server) as db:
-                changed = notes_mod.edit_note(db, note_id, self.user, text, recipient, recipient_name)
+                changed = notes_mod.edit_note(db, note_id, self.user, text, recipient, recipient_name,
+                                              cc=cc)
                 notes_mod.write_summary(server, db)
         except notes_mod.NoteError as e:
             raise SyncError(str(e)) from None
         return changed
 
-    def reply_note(self, name: str, parent_id: int, text: str) -> int:
+    def reply_note(self, name: str, parent_id: int, text: str, cc: list | None = None) -> int:
         """Doplnění (odpověď) k poznámce – může kdokoliv; původní text se nemění."""
         if not text.strip():
             raise SyncError("Doplnění nesmí být prázdné.")
@@ -556,8 +557,8 @@ class ProjectManager:
             if parent is None:
                 raise SyncError("Poznámka už neexistuje.")
             parent_id = parent[0] or parent_id  # doplnění k doplnění patří k původní poznámce
-            note_id = notes_mod.insert_notes(db, [Draft(text)], self.user, self.pc, self.display_name,
-                                             None, parent_id=parent_id)[0]
+            note_id = notes_mod.insert_notes(db, [Draft(text, cc=list(cc or []))], self.user, self.pc,
+                                             self.display_name, None, parent_id=parent_id)[0]
             notes_mod.write_summary(server, db)
         return note_id
 

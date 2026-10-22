@@ -229,7 +229,7 @@ def test_dialog_archivers_picked_from_users(qapp, server, tmp_path, monkeypatch)
     from PySide6.QtWidgets import QDialog
 
     from spm import users
-    from spm.gui import settings_dialog
+    from spm.gui import user_picker
     users.register(server, users.UserInfo("novak", "Pepa"))
     users.register(server, users.UserInfo("svoboda", full_name="Jan Svoboda"))
     s = Settings(server_root=str(server), local_root=str(tmp_path / "l"), archivers=["Novak", "host"])
@@ -244,7 +244,7 @@ def test_dialog_archivers_picked_from_users(qapp, server, tmp_path, monkeypatch)
         rows["host"].setCheckState(Qt.CheckState.Unchecked)
         rows["svoboda"].setCheckState(Qt.CheckState.Checked)
         return QDialog.DialogCode.Accepted
-    monkeypatch.setattr(settings_dialog.UsersDialog, "exec", exec_)
+    monkeypatch.setattr(user_picker.UsersDialog, "exec", exec_)
     assert dlg.archivers.choose()
     assert sorted(dlg._shared_values()["archivers"]) == ["novak", "svoboda"]
     assert "Jan Svoboda (svoboda)" in dlg.archivers.text.text()

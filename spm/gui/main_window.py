@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QEventLoop, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QByteArray, QEvent, QEventLoop, QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -59,6 +61,9 @@ from .comment_dialog import CommentDialog
 from .script_ui import GuiScriptUI
 from .scripts_dialog import ScriptsDialog
 from .. import archive, recycle, storage
+from .. import messages as msgs_mod
+from ..messages import MessageStore
+from ..users import list_users
 from ..folder_zones import ProtectedZones
 from .folder_panel import FolderPanel
 from .notes_panel import FILTER_MINE, FILTER_SELECTED, DetachedNotes, NotesPanel
@@ -69,6 +74,7 @@ from .file_history_dialog import FileHistoryDialog
 from .project_panel import ProjectPanel
 from .publish_dialog import PublishDialog
 from .archive_dialog import ArchiveListDialog, ArchiveProjectDialog
+from .messages_window import MessagesWindow, Source, news as messages_news
 from .storage_dialog import StorageDialog
 from .timeline_dialog import TimelineDialog
 from .search import normalize
@@ -116,6 +122,50 @@ class ProjectListThread(QThread):
             self.done.emit(self.pm.list_projects(), "")
         except Exception as e:  # noqa: BLE001 – tiché obnovení chybu nehlásí
             self.done.emit(None, str(e) or type(e).__name__)
+
+
+class MessagesCheck(QObject):
+    """Kontrola vzkazů na pozadí – jen soubory vzkazů ve všech síťových složkách záložek
+    (seznamy projektů se kvůli tomu nenačítají).
+
+    Běží v obyčejném vlákně Pythonu (ne QThread): spouští se při každém obnovení seznamu
+    a QThread zrušený za běhu (okno zavřené dřív, než kontrola doběhla) by shodil celý
+    proces. Výsledek se předá signálem tohoto objektu (patří oknu – doručí se v hlavním
+    vlákně); když okno mezitím zaniklo, výsledek se zahodí."""
+
+    done = Signal(object, object, object)  # zdroje, vzkazy, chyby
+
+    def __init__(self, parent: QObject):
+        super().__init__(parent)
+        self.thread: threading.Thread | None = None
+
+    def running(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self, sources: list) -> None:
+        self.thread = threading.Thread(target=self._run, args=(sources,), daemon=True,
+                                       name="SPM-vzkazy")
+        self.thread.start()
+
+    def wait(self, timeout: float | None = None) -> None:
+        if self.thread is not None:
+            self.thread.join(timeout)
+
+    def _run(self, sources: list) -> None:
+        result, errors = [], []
+        for s in sources:
+            try:
+                loaded = s.store.load()
+                # staré vyřízené vzkazy do archivu (nejvýš jednou denně, nic se nemaže)
+                moved = set(s.store.archive_old(loaded, s.archive_days))
+                result += [m for m in loaded if m.id not in moved]
+            except Exception as e:  # noqa: BLE001 – nedostupná síť
+                errors.append(f"{s.label}: {e}")
+        result.sort(key=lambda m: m.last_activity, reverse=True)
+        try:
+            self.done.emit(sources, result, errors)
+        except RuntimeError:  # okno (a s ním tento objekt) mezitím zaniklo
+            pass
 
 
 class NameCheckThread(QThread):
@@ -210,6 +260,13 @@ class MainWindow(QMainWindow):
         settings = self.settings
         self._closing = False
         self._finished_checks: list[NameCheckThread] = []  # dokončené kontroly názvů (viz _start_name_check)
+        # vzkazy: okno (vzniká při prvním otevření), mezipaměť souborů po síťových složkách,
+        # kontrola na pozadí a upozornění čekající na návrat do aplikace
+        self._messages_window: MessagesWindow | None = None
+        self._message_stores: dict[str, MessageStore] = {}
+        self._messages_check = MessagesCheck(self)
+        self._messages_check.done.connect(self._on_messages)
+        self._messages_pending = 0
         # návrat do aplikace z jiné (klepnutí, Alt+Tab, hlavní panel) -> obnovit seznam
         QGuiApplication.instance().applicationStateChanged.connect(self._on_app_state)
         self.setWindowTitle(f"SPM – Server Project Manager {__version__}")
@@ -237,8 +294,12 @@ class MainWindow(QMainWindow):
         self.act_publish = self._action(tb, "Publikovat…", self.publish)
         self.act_open = self._action(tb, "Otevřít místní složku", self.open_local)
         self.act_history = self._action(tb, "Historie", self.history)
-        self.act_notes = self._action(tb, "Poznámky", self.open_notes,
-                                      tip="Poznámky k projektu – záložka vedle stromu souborů")
+        self.act_messages = self._action(tb, "Vzkazy", self.open_messages,
+                                         tip="Vzkazy pro konkrétní uživatele (nevázané na projekt)")
+        # poznámky projektu jsou v záložce nad stromem souborů (v liště už nejsou)
+        self.act_notes = QAction("Poznámky", self)
+        self.act_notes.setToolTip("Poznámky k projektu – záložka vedle stromu souborů")
+        self.act_notes.triggered.connect(lambda: self.open_notes())
         tb.addSeparator()
         self.act_scripts = self._action(tb, "Skripty", self.open_scripts,
                                         tip="Skripty spouštěné po odevzdání (zrcadlení, kopie, archivy…)")
@@ -317,9 +378,16 @@ class MainWindow(QMainWindow):
         status_lay.addWidget(self.btn_for_me)
         status_lay.addWidget(self.status_label)
 
+        # poměr výšky seznamu projektů a stromu souborů – stejný ve všech panelech
+        try:
+            self._split_ratio: float | None = float(settings.ui.get("main.split_ratio") or 0) or None
+        except ValueError:
+            self._split_ratio = None
         for pane in self.panes:
             with self.on_pane(pane):
                 self._build_pane()
+        if self._split_ratio is None:  # dřívější verze: poměr z uloženého děliče prvního panelu
+            self._split_ratio = self._ratio_of(self.panes[0].splitter)
         self.panes_split = QSplitter(Qt.Orientation.Horizontal)
         self.panes_split.setChildrenCollapsible(False)
         for pane in self.panes:
@@ -531,7 +599,7 @@ class MainWindow(QMainWindow):
         state = settings.ui.get("main.splitter" + pane.key)
         if state:
             self.splitter.restoreState(QByteArray.fromBase64(state.encode("ascii")))
-        self.splitter.splitterMoved.connect(self._in(pane, lambda *_: self._sync_splitters()))
+        self.splitter.splitterMoved.connect(self._in(pane, lambda *_: self._splitter_moved()))
         # šířky sloupců stromu souborů (uložené od minula)
         restore_header(settings, TREE_HEADER_KEY + pane.key, self.panel.tree.header())
         # záložky = pracovní prostory (každá má vlastní síťovou a místní složku)
@@ -615,14 +683,51 @@ class MainWindow(QMainWindow):
             with self.on_pane(self.panes[0]):
                 self._sync_splitters()
 
+    @staticmethod
+    def _ratio_of(splitter: QSplitter) -> float | None:
+        """Podíl seznamu projektů na výšce (None = strom není vidět / nerozvržené okno)."""
+        sizes = splitter.sizes()
+        if len(sizes) < 2 or sizes[0] <= 0 or sizes[1] <= 0:
+            return None
+        return sizes[0] / (sizes[0] + sizes[1])
+
+    def _splitter_moved(self) -> None:
+        """Dělič posunutý v jednom panelu – nový poměr pro všechny panely."""
+        ratio = self._ratio_of(self.splitter)
+        if ratio is not None:
+            self._split_ratio = ratio
+        self._sync_splitters()
+
+    def _apply_split(self, pane: Pane) -> None:
+        """Společný poměr seznamu a stromu do panelu (jen když je strom vidět; velikosti se
+        rozpočítají podle skutečné výšky panelu)."""
+        ratio = self._split_ratio
+        if ratio is None or pane.side.isHidden():
+            return
+        # skutečná výška děliče (sizes() bývá těsně po zobrazení stromu ještě z dřívějška)
+        total = pane.splitter.height() - pane.splitter.handleWidth()
+        if not pane.splitter.isVisible() or total <= 0:  # nerozvržené – poměrně (Qt rozpočítá)
+            total = 10000
+        top = round(ratio * total)
+        pane.splitter.setSizes([top, total - top])
+
+    def _tree_shown(self, pane: Pane) -> None:
+        """Strom se v panelu objevil (a okno je rozvržené): poměr zatím neznámý -> převzít ho
+        z tohoto panelu; pak stejně ve všech panelech."""
+        if self._closing:
+            return
+        if self._split_ratio is None:
+            self._split_ratio = self._ratio_of(pane.splitter)
+        for p in self.panes:
+            self._apply_split(p)
+
     def _sync_splitters(self) -> None:
-        """Dělič mezi seznamem projektů a stromem posunutý v jednom panelu – stejně i ve druhém."""
-        sizes = self.splitter.sizes()
-        if not sum(sizes):
-            return  # ještě nerozvržené okno
+        """Seznam projektů a strom ve všech panelech stejně vysoké (posun děliče, start aplikace,
+        zapnutí dvou panelů, zobrazení stromu po výběru projektu)."""
+        if self._split_ratio is None:
+            self._split_ratio = self._ratio_of(self.splitter)
         for pane in self.panes:
-            if pane is not self.pane:
-                pane.splitter.setSizes(sizes)
+            self._apply_split(pane)
 
     def _on_focus_changed(self, _old, new) -> None:
         if new is None or self._closing:
@@ -727,7 +832,8 @@ class MainWindow(QMainWindow):
         self.status_label.setPalette(palette)
 
     def _refreshed(self, error: str = "") -> None:
-        """Výsledek načtení seznamu projektů do stavového textu."""
+        """Výsledek načtení seznamu projektů do stavového textu (a kontrola vzkazů)."""
+        self.check_messages()
         if error:
             self.set_idle_status("Síť nedostupná", error, error=True)
         else:
@@ -1107,6 +1213,8 @@ class MainWindow(QMainWindow):
     def _on_app_state(self, state) -> None:
         """Aplikace se stala aktivní (přišla z jiné aplikace): lehké obnovení seznamu – bez
         kontroly nepovolených znaků (ta prochází celé stromy projektů na serveru)."""
+        if state == Qt.ApplicationState.ApplicationActive and self._messages_pending and not self._closing:
+            QTimer.singleShot(0, self._show_pending_messages)
         if (state != Qt.ApplicationState.ApplicationActive or self._closing
                 or QApplication.activeModalWidget() is not None          # otevřený dialog
                 or time.monotonic() - self._last_refresh < FOCUS_REFRESH_MIN_GAP):
@@ -1494,6 +1602,10 @@ class MainWindow(QMainWindow):
             return
         self.timer.stop()
         self._closing = True  # výsledky vláken na pozadí už nezobrazovat
+        self._messages_check.wait(5)
+        if self._messages_window is not None:
+            save_geometry(self.settings, "messages_window", self._messages_window)
+            self._messages_window.close()
         for pane in self.panes:  # odpojené poznámky – zapamatovat, že byly odpojené
             if pane._notes_window is not None:
                 save_geometry(self.settings, "notes_window" + pane.key, pane._notes_window)
@@ -1512,6 +1624,8 @@ class MainWindow(QMainWindow):
             save_header(self.settings, HEADER_KEY + pane.key, pane.table.horizontalHeader())
             save_header(self.settings, TREE_HEADER_KEY + pane.key, pane.panel.tree.header())
         self.settings.ui["main.panes"] = bytes(self.panes_split.saveState().toBase64()).decode("ascii")
+        if self._split_ratio is not None:
+            self.settings.ui["main.split_ratio"] = f"{self._split_ratio:.4f}"
         save_geometry(self.settings, "main", self)
         try:
             self.settings.save()
@@ -2421,7 +2535,12 @@ class MainWindow(QMainWindow):
     def _show_project(self, p: ProjectStatus | None) -> None:
         """Pod seznamem: strom souborů a poznámky vybraného projektu."""
         self.panel.show_project(p)
+        was_hidden = self.side.isHidden()
         self.side.setVisible(p is not None)
+        if was_hidden and p is not None:  # strom se právě objevil – stejná výška jako ve druhém panelu
+            pane = self.pane
+            self._apply_split(pane)
+            QTimer.singleShot(0, lambda: self._tree_shown(pane))  # po rozvržení okna
         self._show_notes_for(p)
 
     def _show_notes_for(self, p: ProjectStatus | None) -> None:
@@ -2450,6 +2569,129 @@ class MainWindow(QMainWindow):
         if column == 3 and item.text(3):
             self.notes.set_filter(FILTER_SELECTED)
             self.open_notes()
+
+    # --- vzkazy -----------------------------------------------------------------------
+
+    def message_sources(self) -> list[Source]:
+        """Síťové složky záložek projektů (záložky se stejnou složkou = jedna)."""
+        groups: dict[str, tuple[Path, list[str]]] = {}
+        for ws in self.app_settings.workspaces:
+            view = self.app_settings.view(ws["id"])
+            if view.is_folder or not view.server_root.strip():
+                continue
+            key = os.path.normcase(os.path.normpath(view.server_root))
+            groups.setdefault(key, (Path(view.server_root), [], view.messages_archive_days))[1].append(
+                ws.get("name", ""))
+        sources = []
+        for key, (root, names, days) in groups.items():
+            store = self._message_stores.setdefault(key, MessageStore(root))
+            sources.append(Source(", ".join(n for n in names if n) or str(root), root,
+                                  lambda root=root: list_users(root), store, days))
+        return sources
+
+    def _messages_seen(self) -> dict:
+        try:
+            data = json.loads(self.settings.ui.get("messages.seen") or "{}")
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
+
+    def _set_messages_seen(self, seen: dict) -> None:
+        self.settings.ui["messages.seen"] = json.dumps(seen)
+        self._update_messages_button()
+
+    def messages_window(self) -> MessagesWindow:
+        if self._messages_window is None:
+            w = MessagesWindow(self.pm.user, self.pm.display_name, self.pm.pc, self.message_sources,
+                               self._messages_seen, self._set_messages_seen)
+            restore_geometry(self.settings, "messages_window", w)
+            w.project_clicked.connect(self.open_project_link)
+            w.changed.connect(self._update_messages_button)
+            w.set_sources(self.message_sources())
+            self._messages_window = w
+        return self._messages_window
+
+    def open_messages(self) -> MessagesWindow:
+        w = self.messages_window()
+        w.reload()
+        w.show_messages()
+        self._messages_pending = 0
+        self._update_messages_button()
+        return w
+
+    def check_messages(self) -> None:
+        """Na pozadí načte vzkazy (jen jejich soubory) – při spuštění a každém obnovení."""
+        if self._closing:
+            return
+        if self._messages_check.running():
+            return
+        sources = self.message_sources()
+        if sources:
+            self._messages_check.start(sources)
+
+    def _on_messages(self, sources: list, messages: list, errors: list) -> None:
+        if self._closing:
+            return
+        w = self.messages_window()
+        w.set_sources(sources)
+        w.set_messages(messages, errors)
+        self._update_messages_button()
+        fresh = messages_news(messages, self.pm.user, self._messages_seen())
+        if not fresh:
+            return
+        self._messages_pending = len(fresh)
+        app = QGuiApplication.instance()
+        if app.applicationState() == Qt.ApplicationState.ApplicationActive and \
+                QApplication.activeModalWidget() is None:
+            self._show_pending_messages()
+        else:  # SPM není aktivní (práce v CADu) – jen bliknout na hlavním panelu
+            QApplication.alert(self)
+
+    def _show_pending_messages(self) -> None:
+        if not self._messages_pending or self._closing or QApplication.activeModalWidget() is not None:
+            return
+        count, self._messages_pending = self._messages_pending, 0
+        self.messages_window().show_messages(new_count=count)
+        self._update_messages_button()
+
+    def _update_messages_button(self) -> None:
+        w = self._messages_window
+        count = w.open_for_me() if w is not None else 0
+        self.act_messages.setText(f"Vzkazy ({count})" if count else "Vzkazy")
+        self.act_messages.setToolTip(f"Vzkazy – čeká na vás: {count}" if count
+                                     else "Vzkazy pro konkrétní uživatele (nevázané na projekt)")
+
+    def open_project_link(self, server: str, name: str, project_id: str = "") -> bool:
+        """Odkaz „#projekt“ ze vzkazu: vybere projekt v aktivním panelu (přepne na záložku
+        s jeho síťovou složkou, pokud ji panel nemá)."""
+        current = msgs_mod.find_project(server, name, project_id)
+        if current is None:
+            folder = archive.archive_dir(Settings(server_root=server))
+            archived = archive.is_archived(Settings(server_root=server), name)
+            QMessageBox.information(self, "Vzkazy", f"Projekt {name} je archivovaný – najdete ho "
+                                    f"v Archivu projektů:\n{folder}" if archived
+                                    else f"Projekt {name} v síťové složce není (smazaný nebo přejmenovaný):"
+                                         f"\n{server}")
+            return False
+        with self.on_pane(self.active_pane):
+            if self.settings.is_folder or not _same_dir(self.settings.server_root, server):
+                ws = next((w for w in self.app_settings.workspaces
+                           if not self.app_settings.view(w["id"]).is_folder
+                           and _same_dir(self.app_settings.view(w["id"]).server_root, server)), None)
+                if ws is None:
+                    return False
+                self.switch_workspace(ws["id"])
+            names = [p.name for p in self.projects]
+            if current not in names:
+                self.refresh(check_names=False)
+                names = [p.name for p in self.projects]
+            if current not in names:
+                return False
+            self.table.selectRow(names.index(current))
+            self.table.scrollTo(self.table.model().index(names.index(current), 0))
+        self.raise_()
+        self.activateWindow()
+        return True
 
     def open_notes(self, name: str | None = None) -> NotesPanel | None:
         """Zobrazí poznámky projektu (záložku vedle stromu, nebo odpojené okno)."""

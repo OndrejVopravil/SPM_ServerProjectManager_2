@@ -3,13 +3,13 @@
 - Nahoře filtry: Otevřené / Pro mě / K vybraným souborům / Vše.
 - Uprostřed karty poznámek: vyřízení zaškrtnutím, odpověď a úprava přímo v kartě (bez dialogů),
   soubory jsou odkazy (označí soubor ve stromu).
-- Dole psaní nové poznámky jako v chatu: týká se souborů vybraných ve stromu, adresát výběrem
-  nebo „@jméno“ v textu, odeslání Ctrl+Enter. Poznámka se zveřejní hned.
+- Dole psaní nové poznámky jako v chatu: týká se souborů vybraných ve stromu, adresát výběrem,
+  „@jméno“ v textu = na vědomí (po „@“ se nabídnou uživatelé, Tab vloží), odeslání Ctrl+Enter.
+  Poznámka se zveřejní hned.
 """
 
 from __future__ import annotations
 
-import re
 from html import escape
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -34,8 +34,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..mentions import mentions
 from ..notes import Draft, Note
 from ..sync import ProjectManager
+from ..users import Names
+from .completer_edit import CompleterEdit
 from .notes_window import (
     FOR_ME_DARK,
     FOR_ME_LIGHT,
@@ -51,7 +54,6 @@ FILTER_OPEN, FILTER_MINE, FILTER_SELECTED, FILTER_ALL = "open", "mine", "selecte
 FILTERS = ((FILTER_OPEN, "Otevřené"), (FILTER_MINE, "Pro mě"),
            (FILTER_SELECTED, "K vybraným souborům"), (FILTER_ALL, "Vše"))
 TARGETS_SHOWN = 4  # kolik vybraných souborů vypsat u psaní poznámky (zbytek „a další“)
-_MENTION_RE = re.compile(r"(?:^|\s)@([\w.\-]+)")
 
 
 def touches(targets: list[str], selection: list[str]) -> bool:
@@ -69,22 +71,22 @@ def note_visible(note: Note, flt: str, me: str, selection: list[str]) -> bool:
     if flt == FILTER_OPEN:
         return not note.resolved
     if flt == FILTER_MINE:
-        return not note.resolved and note.concerns(me)
+        return not note.resolved and (note.concerns(me) or note.is_cc(me))
     if flt == FILTER_SELECTED:
         return touches(note.targets, selection)
     return True
 
 
-def mention(text: str, users: list) -> tuple[str, str]:
-    """Adresát z „@jméno“ v textu: známý uživatel (login nebo přezdívka) -> (login, jméno);
-    neznámé jméno se bere jako login. Bez zmínky ("", "")."""
-    for word in _MENTION_RE.findall(text):
-        word = word.rstrip(".,")
-        for u in users:
-            if word.lower() in (u.login.lower(), (u.nickname or "").lower()):
-                return u.login, u.display
-        return word, ""
-    return "", ""
+def cc_of(text: str, users: list, recipient: str = "") -> list[list[str]]:
+    """Na vědomí ze zmínek „@jméno“ (bez adresáta – ten je „pro“, ne na vědomí)."""
+    return [[login, name] for login, name in mentions(text, users) if login != recipient.lower()]
+
+
+def cc_label(cc, me: str, names: Names | None = None) -> str:
+    """„na vědomí: Pepa, Jana“ – já jako „vy“ (jména aktuální z adresáře uživatelů)."""
+    names_of = names or Names([])
+    names = ["vy" if login == me.lower() else names_of.person(login, name) for login, name in cc]
+    return "na vědomí: " + ", ".join(escape(n) for n in names) if names else ""
 
 
 NEW_COLOR = "#2f80ed"  # tečka u nového
@@ -113,31 +115,6 @@ def recipient_combo(users: list, login: str = "", name: str = "") -> QComboBox:
             index = combo.count() - 1
         combo.setCurrentIndex(index)
     return combo
-
-
-class MentionEdit(QPlainTextEdit):
-    """Pole textu poznámky: po napsání „@“ nabídne uživatele (vybraný se stane adresátem)."""
-
-    mentioned = Signal(str)  # login vybraného uživatele
-
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.users: list = []
-
-    def keyPressEvent(self, event) -> None:  # noqa: N802 – Qt
-        before = self.textCursor().block().text()[:self.textCursor().positionInBlock()]
-        super().keyPressEvent(event)
-        if event.text() == "@" and self.users and (not before or before[-1].isspace()):
-            QTimer.singleShot(0, self._offer_users)
-
-    def _offer_users(self) -> None:
-        menu = QMenu(self)
-        for u in self.users:
-            menu.addAction(u.display).setData(u.login)
-        chosen = menu.exec(self.mapToGlobal(self.cursorRect().bottomLeft()))
-        if chosen is not None:
-            self.insertPlainText(chosen.data() + " ")
-            self.mentioned.emit(chosen.data())
 
 
 class NoteCard(QFrame):
@@ -171,10 +148,13 @@ class NoteCard(QFrame):
         if for_me:
             flags.append(f'<b style="color:{colors.label}">▶ pro vás</b>')
         elif note.recipient:
-            flags.append(f"pro {escape(note.recipient_name or note.recipient)}")
+            flags.append(f"pro {escape(panel.names.person(note.recipient, note.recipient_name))}")
+        if note.cc:
+            flags.append(f'<b style="color:{colors.label}">▷ na vědomí</b>' if note.is_cc(me) and not for_me
+                         else cc_label(note.cc, me, panel.names))
         if note.resolved:
             flags.append(f"vyřízeno ({escape(note.resolved_by or '')}, {fmt_time(note.resolved_at)})")
-        head = f"<b>{escape(note.author)}</b> · {fmt_time(note.created_at)}"
+        head = f"<b>{escape(panel.names.author(note.user, note.author))}</b> · {fmt_time(note.created_at)}"
         if note.edited_at:
             head += f" · upraveno {fmt_time(note.edited_at)}"
         self.head = self._label(_new_mark(bool(self.news)) + head
@@ -205,7 +185,8 @@ class NoteCard(QFrame):
             reply_lay.setContentsMargins(8, 0, 0, 0)
             reply_lay.setSpacing(1)
             reply_lay.addWidget(self._label(
-                f"{_new_mark(new)}<b>{escape(r.author)}</b> · {fmt_time(r.created_at)}{edited}", sizes.meta))
+                f"{_new_mark(new)}<b>{escape(panel.names.author(r.user, r.author))}</b> · "
+                f"{fmt_time(r.created_at)}{edited}", sizes.meta))
             text = self._label(markdown_to_html(r.text), sizes.text)
             if new:
                 self._bold(text)
@@ -235,7 +216,8 @@ class NoteCard(QFrame):
         self.editor_box = QWidget()
         ed_lay = QVBoxLayout(self.editor_box)
         ed_lay.setContentsMargins(0, 2, 0, 0)
-        self.editor = QPlainTextEdit()
+        self.editor = CompleterEdit()
+        self.editor.users = panel.users
         self.editor.setMaximumHeight(110)
         self.recipient: QComboBox | None = None
         self.rec_row = QHBoxLayout()
@@ -312,11 +294,11 @@ class NoteCard(QFrame):
         if not text:
             return
         if self._mode == "reply":
-            self.panel.reply(self.note, text)
+            self.panel.reply(self.note, text, cc_of(text, self.panel.users))
         elif self._mode == "edit":
             login = self.recipient.currentData() if self.recipient else self.note.recipient
             name = self.recipient.currentText() if self.recipient and login else ""
-            self.panel.edit(self.note, text, login, name)
+            self.panel.edit(self.note, text, login, name, cc_of(text, self.panel.users, login or ""))
 
 
 class NotesPanel(QWidget):
@@ -333,6 +315,7 @@ class NotesPanel(QWidget):
         self.name: str | None = None
         self.notes: list[Note] = []
         self.users: list = []
+        self.names = Names([])              # aktuální jména uživatelů (změněná přezdívka)
         self.selection: list[str] = []      # vybrané ve stromu
         self.seen_get = lambda name: 0      # poslední zobrazená změna (nastaví okno)
         self.seen_set = lambda name, seq: None
@@ -396,10 +379,9 @@ class NotesPanel(QWidget):
         about_row.addWidget(self.about_project)
         about_row.addStretch()
         comp.addLayout(about_row)
-        self.editor = MentionEdit()
-        self.editor.setPlaceholderText("Napište poznámku…  (@jméno = pro koho, Ctrl+Enter = odeslat)")
+        self.editor = CompleterEdit()
+        self.editor.setPlaceholderText("Napište poznámku…  (@jméno = na vědomí, Ctrl+Enter = odeslat)")
         self.editor.setMaximumHeight(90)
-        self.editor.mentioned.connect(self._set_recipient)
         _ctrl_enter(self.editor, self.send)
         comp.addWidget(self.editor)
         send_row = QHBoxLayout()
@@ -438,6 +420,7 @@ class NotesPanel(QWidget):
             except OSError:
                 self.users = []
             self.editor.users = self.users
+            self.names = Names(self.users)
             self.recipient.clear()
             self.recipient.addItem("všem", "")
             for u in self.users:
@@ -482,10 +465,6 @@ class NotesPanel(QWidget):
 
     def targets(self) -> list[str]:
         return list(self.selection) if self.selection and self.about.isChecked() else []
-
-    def _set_recipient(self, login: str) -> None:
-        index = self.recipient.findData(login.lower()) if login else 0
-        self.recipient.setCurrentIndex(max(index, 0))
 
     # --- načtení a zobrazení -------------------------------------------------------------
 
@@ -585,9 +564,7 @@ class NotesPanel(QWidget):
             return
         login = self.recipient.currentData() or ""
         name = self.recipient.currentText() if login else ""
-        if not login:
-            login, name = mention(text, self.users)
-        draft = Draft(text, login, name, self.targets())
+        draft = Draft(text, login, name, self.targets(), cc=cc_of(text, self.users, login))
         if self._do(lambda: self.pm.add_notes(self.name, [draft])):
             self.editor.clear()
             self.recipient.setCurrentIndex(0)
@@ -598,13 +575,14 @@ class NotesPanel(QWidget):
             QTimer.singleShot(0, lambda: self._do(
                 lambda: self.pm.resolve_note(self.name, note.note_id, resolved=resolved)))
 
-    def reply(self, note: Note, text: str) -> None:
-        self._do(lambda: self.pm.reply_note(self.name, note.note_id, text))
+    def reply(self, note: Note, text: str, cc: list | None = None) -> None:
+        self._do(lambda: self.pm.reply_note(self.name, note.note_id, text, cc=cc))
 
-    def edit(self, note: Note, text: str, recipient: str | None, recipient_name: str) -> None:
+    def edit(self, note: Note, text: str, recipient: str | None, recipient_name: str,
+             cc: list | None = None) -> None:
         if note.parent_id:
             recipient, recipient_name = None, None
-        self._do(lambda: self.pm.edit_note(self.name, note.note_id, text, recipient, recipient_name))
+        self._do(lambda: self.pm.edit_note(self.name, note.note_id, text, recipient, recipient_name, cc=cc))
 
     def show_versions(self, note: Note) -> None:
         lines = [f"Aktuální znění ({fmt_time(note.edited_at)}):\n{note.text}"]
