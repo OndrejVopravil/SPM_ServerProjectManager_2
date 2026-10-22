@@ -22,9 +22,13 @@ def write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def ARCH(tmp_path: Path) -> Path:
+    return tmp_path / "server" / ".spm" / "archiv"
+
+
 def manager(tmp_path, user="alice", archivers=("alice",)):
     s = Settings(server_root=str(tmp_path / "server"), local_root=str(tmp_path / f"l_{user}"),
-                 backup_count=10, archive_root="..\\Archiv", archive_keep_backups=2,
+                 backup_count=10, archive_keep_backups=2,
                  archivers=list(archivers))
     return ProjectManager(s, user=user, pc=f"PC-{user}")
 
@@ -48,7 +52,7 @@ def env(tmp_path):
 
 def test_permission_and_checks(env, tmp_path):
     alice, proj, _ = env
-    assert archive.archive_dir(alice.settings) == tmp_path / "Archiv"     # vzhledem k síťové složce
+    assert archive.archive_dir(alice.settings) == ARCH(tmp_path)   # pevně v síťové složce
     assert archive.archive_problems(alice, "Forma") == []
     bob = manager(tmp_path, "bob")
     assert "smí jen: alice" in archive.archive_problems(bob, "Forma")[0]
@@ -66,7 +70,7 @@ def test_permission_and_checks(env, tmp_path):
 def test_archive_and_restore(env, tmp_path):
     alice, proj, _ = env
     res = archive.archive_project(alice, "Forma", "zakázka předána")
-    assert res.zip_path == tmp_path / "Archiv" / "Forma.zip" and not proj.exists() and not res.leftover
+    assert res.zip_path == ARCH(tmp_path) / "Forma.zip" and not proj.exists() and not res.leftover
     with zipfile.ZipFile(res.zip_path) as zf:
         names = zf.namelist()
         info = json.loads(zf.read(archive.ARCHIVE_INFO))
@@ -77,7 +81,7 @@ def test_archive_and_restore(env, tmp_path):
     assert info["project"] == "Forma" and info["comment"] == "zakázka předána"
     assert info["project_comment"] == "Hotová forma" and info["files"] == 1
     # seznam archivu a náhled obsahu
-    (entry,) = archive.list_archives(tmp_path / "Archiv")
+    (entry,) = archive.list_archives(ARCH(tmp_path))
     assert entry.project == "Forma" and entry.archived_by and entry.restores == []
     assert archive.archive_files(res.zip_path) == ["deska.elt"]
     assert archive.is_archived(alice.settings, "Forma") and not archive.is_archived(alice.settings, "Jina")
@@ -89,7 +93,7 @@ def test_archive_and_restore(env, tmp_path):
         kinds = [c["kind"] for c in db.commits()]
     assert kinds[:2] == [dbm.UNARCHIVED, dbm.ARCHIVED]                      # historie pokračuje
     assert alice.restore_points("Forma").points[0].complete                 # aktuální stav obnovitelný
-    (entry,) = archive.list_archives(tmp_path / "Archiv")
+    (entry,) = archive.list_archives(ARCH(tmp_path))
     assert entry.restores[0]["as"] == "Forma"
     # tentýž projekt (stejná identita) podruhé obnovit nejde – ani pod jiným názvem
     assert archive.existing_identity(alice, res.zip_path) == "Forma"
@@ -120,7 +124,7 @@ def test_restore_other_project_with_same_name(env, tmp_path):
 
 def test_second_archive_and_failed_verification(env, tmp_path, monkeypatch):
     alice, proj, _ = env
-    write(tmp_path / "Archiv" / "Forma.zip", "jiny zip")                    # název je obsazený
+    write(ARCH(tmp_path) / "Forma.zip", "jiny zip")                    # název je obsazený
     monkeypatch.setattr(archive, "_verify", lambda *a: (_ for _ in ()).throw(ArchiveError("poškozený")))
     with pytest.raises(ArchiveError, match="poškozený"):
         archive.archive_project(alice, "Forma")
@@ -128,7 +132,7 @@ def test_second_archive_and_failed_verification(env, tmp_path, monkeypatch):
     assert not (proj / ".spm" / archive.MARKER).exists()
     with ProjectDB.for_project(proj) as db:
         assert dbm.ARCHIVED not in [c["kind"] for c in db.commits()]        # záznam se vrátil
-    assert [p.name for p in (tmp_path / "Archiv").iterdir()] == ["Forma.zip"]   # bez dočasných
+    assert [p.name for p in (ARCH(tmp_path)).iterdir()] == ["Forma.zip"]   # bez dočasných
     monkeypatch.undo()
     res = archive.archive_project(alice, "Forma")
     assert res.zip_path.name.startswith("Forma_") and res.zip_path.name != "Forma.zip"
@@ -181,10 +185,9 @@ def test_mirror_does_not_recreate_archived_project(env, tmp_path):
 
 def test_shared_config_archive_fields():
     from spm import shared_config as sc
-    archive_root = str(Path("..") / "Archiv")
-    values = sc.parse(json.dumps({"archive_root": f" {archive_root} ", "archive_keep_backups": 3,
-                                  "archivers": ["novak", " "]}))
-    assert values == {"archive_root": archive_root, "archive_keep_backups": 3, "archivers": ["novak"]}
+    values = sc.parse(json.dumps({"archive_root": "..\\Archiv",            # dřívější klíč se ignoruje
+                                  "archive_keep_backups": 3, "archivers": ["novak", " "]}))
+    assert values == {"archive_keep_backups": 3, "archivers": ["novak"]}
     with pytest.raises(sc.SharedConfigError, match="archivers"):
         sc.parse('{"archivers": "novak"}')
     with pytest.raises(sc.SharedConfigError, match="archive_keep_backups"):

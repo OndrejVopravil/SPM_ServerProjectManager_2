@@ -2298,12 +2298,12 @@ class MainWindow(QMainWindow):
         """Archiv projektů záložky – seznam, náhled, obnova do pracovní složky."""
         folder = archive.archive_dir(self.settings)
         if folder is None:
-            QMessageBox.information(self, "Archiv projektů",
-                                    "Archivní složka není nastavená (Nastavení → Společné nastavení).")
             return
         if not folder.is_dir():
-            QMessageBox.information(self, "Archiv projektů", f"Archivní složka zatím neexistuje "
-                                    f"nebo není dostupná:\n{folder}")
+            QMessageBox.information(self, "Archiv projektů",
+                                    "Archiv je zatím prázdný – žádný projekt se ještě nearchivoval."
+                                    if folder.parent.parent.is_dir() else
+                                    f"Síťová složka s projekty není dostupná:\n{folder.parent.parent}")
             return
 
         def restore(entry) -> bool:

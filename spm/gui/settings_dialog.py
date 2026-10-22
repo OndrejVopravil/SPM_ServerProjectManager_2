@@ -17,6 +17,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import shared_config as sc
+from .. import users as users_mod
 from ..config import AUTO_REFRESH_MIN, AUTO_REFRESH_OFF, Settings
 from .tab_bar import TAB_COLORS
 
@@ -118,6 +121,89 @@ class SecretsDialog(QDialog):
         self.accept()
 
 
+class UsersDialog(QDialog):
+    """Výběr uživatelů zaškrtnutím – z adresáře uživatelů síťové složky (jako adresát poznámky)."""
+
+    def __init__(self, title: str, users: list, selected: list[str], parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(380, 360)
+        info = QLabel("Nabízejí se všichni, kdo SPM s touto síťovou složkou spustili.")
+        info.setWordWrap(True)
+        self.list = QListWidget()
+        chosen = {u.lower() for u in selected}
+        known = set()
+        for u in users:
+            self._add(u.display, u.login, u.login.lower() in chosen)
+            known.add(u.login.lower())
+        for login in selected:  # vybraný uživatel, který SPM ještě nespustil
+            if login.lower() not in known:
+                self._add(login, login, True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+        layout.addWidget(self.list)
+        layout.addWidget(buttons)
+
+    def _add(self, text: str, login: str, checked: bool) -> None:
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, login)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        self.list.addItem(item)
+
+    def selected(self) -> list[str]:
+        return [self.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list.count())
+                if self.list.item(i).checkState() == Qt.CheckState.Checked]
+
+
+class UsersPicker(QWidget):
+    """Seznam vybraných uživatelů (jen ke čtení) a tlačítko Vybrat… – loginy se nepíšou ručně."""
+
+    def __init__(self, logins: list[str], server_root: Callable[[], str], title: str,
+                 empty: str = "nikdo", parent: QWidget | None = None):
+        super().__init__(parent)
+        self.server_root, self.title, self.empty = server_root, title, empty
+        self._logins: list[str] = []
+        self.text = QLineEdit()
+        self.text.setReadOnly(True)
+        self.button = QPushButton("Vybrat…")
+        self.button.clicked.connect(lambda: self.choose())
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.text, stretch=1)
+        lay.addWidget(self.button)
+        self.set_logins(logins)
+
+    def users(self) -> list:
+        root = self.server_root().strip()
+        try:
+            return users_mod.list_users(Path(root)) if root else []
+        except OSError:
+            return []
+
+    def logins(self) -> list[str]:
+        return list(self._logins)
+
+    def set_logins(self, logins: list[str]) -> None:
+        self._logins = [u.strip() for u in logins if u.strip()]
+        names = {u.login.lower(): u.display for u in self.users()}
+        shown = [names.get(u.lower(), u) for u in self._logins]
+        self.text.setText(", ".join(shown))
+        self.text.setPlaceholderText(self.empty)
+        self.text.setToolTip("\n".join(shown) or self.empty)
+
+    def choose(self) -> bool:
+        dlg = UsersDialog(self.title, self.users(), self._logins, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        self.set_logins(dlg.selected())
+        return True
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, shared: sc.SharedState | None = None,
                  parent: QWidget | None = None, workspace_name: str = "",
@@ -158,20 +244,16 @@ class SettingsDialog(QDialog):
         self.ignore = QLineEdit("; ".join(settings.ignore_patterns))
 
         # archivace dokončených projektů (společné nastavení)
-        self.archive_root = QLineEdit(settings.archive_root)
-        self.archive_root.setPlaceholderText("prázdné = archivace vypnutá")
-        self.archive_root.setToolTip("Kam se ukládají archivované projekty (zip). Zadejte cestu "
-                                     "\\\\server\\… nebo cestu vzhledem k síťové složce s projekty "
-                                     "(např. ..\\Archiv) – písmeno disku má každý připojené jinak.")
         self.archive_keep = QSpinBox()
         self.archive_keep.setRange(0, sc.BACKUP_COUNT_MAX)
         self.archive_keep.setValue(settings.archive_keep_backups)
         self.archive_keep.setSuffix(" záloh")
         self.archive_keep.setToolTip("Kolik posledních záloh každého souboru se při archivaci zachová "
                                      "(koš projektu se vysype celý).")
-        self.archivers = QLineEdit("; ".join(settings.archivers))
-        self.archivers.setPlaceholderText("loginy oddělené středníkem – prázdné = nikdo")
-        self.archivers.setToolTip("Kdo smí archivovat projekty a vracet je z archivu.")
+        self.archivers = UsersPicker(settings.archivers, lambda: self.server.text(),
+                                     "Kdo smí archivovat", "nikdo – archivovat nesmí nikdo")
+        self.archivers.button.setToolTip("Kdo smí archivovat projekty, vracet je z archivu a uklízet "
+                                         "zálohy a koš. Archiv je v síťové složce v .spm\\archiv.")
 
         self.check_chars = QCheckBox("Kontrolovat nepovolené znaky v názvech souborů a složek")
         self.check_chars.setToolTip("Česká diakritika, mezera a znaky ( ) & , . ; = ^ "
@@ -235,9 +317,12 @@ class SettingsDialog(QDialog):
         shared_form.addRow(hint)
         shared_form.addRow("Ignorované soubory:", self.ignore)
         shared_form.addRow(self.check_chars)
-        shared_form.addRow("Archivní složka:", self.archive_root)
         shared_form.addRow("Při archivaci ponechat:", self.archive_keep)
         shared_form.addRow("Archivovat smí:", self.archivers)
+        archive_hint = QLabel("Archivované projekty se ukládají do <i>.spm\\archiv</i> v síťové složce "
+                              "s projekty. Kdo smí archivovat, smí také uklízet zálohy a koš.")
+        archive_hint.setWordWrap(True)
+        shared_form.addRow(archive_hint)
         self.shared_info = QLabel()
         self.shared_info.setWordWrap(True)
         self.shared_info.setTextFormat(Qt.TextFormat.RichText)
@@ -303,7 +388,7 @@ class SettingsDialog(QDialog):
 
     def _shared_widgets(self) -> list[QWidget]:
         return [self.backup_enabled, self.backup_count, self.ignore, self.check_chars,
-                self.archive_root, self.archive_keep, self.archivers]
+                self.archive_keep, self.archivers]
 
     def _shared_values(self) -> dict:
         return {
@@ -311,9 +396,8 @@ class SettingsDialog(QDialog):
             "backup_count": self.backup_count.value(),
             "ignore_patterns": [p.strip() for p in self.ignore.text().split(";") if p.strip()],
             "check_forbidden_chars": self.check_chars.isChecked(),
-            "archive_root": self.archive_root.text().strip(),
             "archive_keep_backups": self.archive_keep.value(),
-            "archivers": [u.strip() for u in self.archivers.text().replace(",", ";").split(";") if u.strip()],
+            "archivers": self.archivers.logins(),
         }
 
     def _show_shared_values(self) -> None:
@@ -329,12 +413,10 @@ class SettingsDialog(QDialog):
             self.ignore.setText("; ".join(v["ignore_patterns"]))
         if "check_forbidden_chars" in v:
             self.check_chars.setChecked(v["check_forbidden_chars"])
-        if "archive_root" in v:
-            self.archive_root.setText(v["archive_root"])
         if "archive_keep_backups" in v:
             self.archive_keep.setValue(v["archive_keep_backups"])
         if "archivers" in v:
-            self.archivers.setText("; ".join(v["archivers"]))
+            self.archivers.set_logins(v["archivers"])
 
     def _update_shared_ui(self) -> None:
         s = self.shared
@@ -347,7 +429,7 @@ class SettingsDialog(QDialog):
 
         widgets = {"backup_enabled": self.backup_enabled, "backup_count": self.backup_count,
                    "ignore_patterns": self.ignore, "check_forbidden_chars": self.check_chars,
-                   "archive_root": self.archive_root, "archive_keep_backups": self.archive_keep,
+                   "archive_keep_backups": self.archive_keep,
                    "archivers": self.archivers}
         for key, w in widgets.items():
             w.setEnabled(not locked(key))

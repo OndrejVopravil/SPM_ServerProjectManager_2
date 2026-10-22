@@ -27,10 +27,10 @@ FORMAT_KEY = "spm_config"
 FORMAT = 1
 # Nastavení řízená společnou konfigurací (ostatní zůstávají vždy místní)
 SHARED_FIELDS = ("backup_enabled", "backup_count", "ignore_patterns", "check_forbidden_chars",
-                 "archive_root", "archive_keep_backups", "archivers")
+                 "archive_keep_backups", "archivers")
 LIST_FIELDS = ("ignore_patterns", "archivers")
 SERVER_ID, SERVER_NAME = "server_id", "server_name"
-OBSOLETE_KEYS = ("mirror_rules",)  # dřívější nastavení – při uložení se ze souboru odstraní
+OBSOLETE_KEYS = ("mirror_rules", "archive_root")  # dřívější nastavení – při uložení se ze souboru odstraní
 BACKUP_COUNT_MAX = 99
 
 # Stav společné konfigurace
@@ -96,10 +96,6 @@ def parse(text: str) -> dict:
         if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
             raise SharedConfigError("ignore_patterns: očekává se seznam textů, např. [\"*.tmp\"].")
         values["ignore_patterns"] = [p.strip() for p in patterns if p.strip()]
-    if "archive_root" in data:
-        if not isinstance(data["archive_root"], str):
-            raise SharedConfigError("archive_root: očekává se text (cesta k archivní složce).")
-        values["archive_root"] = data["archive_root"].strip()
     if "archive_keep_backups" in data:
         count = data["archive_keep_backups"]
         if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= BACKUP_COUNT_MAX:

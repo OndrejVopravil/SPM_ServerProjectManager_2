@@ -93,10 +93,9 @@ class Settings:
     tab_color: str = ""
     # Skripty spouštěné po odevzdání z této záložky (názvy souborů ve složce scripts, v pořadí běhu)
     scripts: list[str] = field(default_factory=list)
-    # Archivace dokončených projektů (společná konfigurace spm_config.json): archivní složka
-    # (\\server\… nebo cesta vzhledem k síťové složce), kolik záloh každého souboru se do
-    # archivu ponechá a kdo smí archivovat a vracet z archivu (loginy; prázdné = nikdo)
-    archive_root: str = ""
+    # Archivace dokončených projektů (společná konfigurace spm_config.json; archiv je vždy
+    # v <síťová složka>/.spm/archiv): kolik záloh každého souboru se do archivu ponechá a kdo
+    # smí archivovat, vracet z archivu a uklízet zálohy (loginy; prázdné = nikdo)
     archive_keep_backups: int = 2
     archivers: list[str] = field(default_factory=list)
     # --- převzato ze spm_config.json síťové složky záložky (viz shared_config) ---
@@ -173,7 +172,7 @@ INTERNAL_FIELDS = ("workspace_id", "_app")
 WORKSPACE_FIELDS = ("server_root", "local_root", "folder_root", "backup_enabled", "backup_count",
                     "check_forbidden_chars", "ignore_patterns", "known_default_ignore",
                     "server_id", "server_name", "tab_color", "scripts",
-                    "archive_root", "archive_keep_backups", "archivers")
+                    "archive_keep_backups", "archivers")
 PERSONAL_FIELDS = tuple(f.name for f in fields(Settings)
                         if f.name not in WORKSPACE_FIELDS + INTERNAL_FIELDS + ("ui",))
 DEFAULT_WORKSPACE_NAME = "Projekty"

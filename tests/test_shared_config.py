@@ -222,3 +222,29 @@ def test_main_window_takes_over_on_refresh(qapp, server, tmp_path):
             w._name_check.wait()
         w.close()
         qapp.processEvents()
+
+
+def test_dialog_archivers_picked_from_users(qapp, server, tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QDialog
+
+    from spm import users
+    from spm.gui import settings_dialog
+    users.register(server, users.UserInfo("novak", "Pepa"))
+    users.register(server, users.UserInfo("svoboda", full_name="Jan Svoboda"))
+    s = Settings(server_root=str(server), local_root=str(tmp_path / "l"), archivers=["Novak", "host"])
+    dlg = dialog(s)
+    assert dlg.archivers.text.isReadOnly()                                  # nepíše se ručně
+    assert dlg.archivers.text.text() == "Pepa (novak), host"               # neregistrovaný jako login
+
+    def exec_(d):
+        rows = {d.list.item(i).data(Qt.ItemDataRole.UserRole): d.list.item(i) for i in range(d.list.count())}
+        assert set(rows) == {"novak", "svoboda", "host"}
+        assert rows["novak"].checkState() == Qt.CheckState.Checked
+        rows["host"].setCheckState(Qt.CheckState.Unchecked)
+        rows["svoboda"].setCheckState(Qt.CheckState.Checked)
+        return QDialog.DialogCode.Accepted
+    monkeypatch.setattr(settings_dialog.UsersDialog, "exec", exec_)
+    assert dlg.archivers.choose()
+    assert sorted(dlg._shared_values()["archivers"]) == ["novak", "svoboda"]
+    assert "Jan Svoboda (svoboda)" in dlg.archivers.text.text()

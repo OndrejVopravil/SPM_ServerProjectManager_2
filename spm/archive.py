@@ -1,7 +1,7 @@
 """Archivace dokončených projektů a jejich obnova z archivu.
 
 Archivace (archive_project):
-1. kontrola – oprávnění (spm_config.json: archivers), archivní složka, nikdo nemá projekt
+1. kontrola – oprávnění (spm_config.json: archivers), nikdo nemá projekt
    aktivovaný, nemá neproběhlý skript ani nevyřízenou poznámku,
 2. projekt se označí „archivuje se“ (.spm/archiving.json – nelze ho aktivovat) a do historie se
    zapíše „Archivace“ (je pak i v archivu),
@@ -10,6 +10,8 @@ Archivace (archive_project):
    zapisuje se do dočasného souboru, ověří se (kontrolní součty, počet souborů) a teprve pak
    dostane konečný název,
 4. až potom se projekt z pracovní síťové složky smaže.
+Archivní složka je pevně <síťová složka s projekty>/.spm/archiv (tečka = v seznamu projektů
+se nezobrazí; s projekty se přesouvá i zálohuje spolu).
 V zipu je popis spm_archive.json (kdo, kdy, komentář…), takže seznam archivu zip nerozbaluje.
 
 Obnova (restore_archive): rozbalení do skryté dočasné složky v pracovní síťové složce, ověření,
@@ -37,6 +39,7 @@ from .db import ProjectDB, db_path
 from .lock import WriteLock, active_users, now_iso
 from .scanner import TEMP_SUFFIX, Progress, rmtree, to_rel
 
+ARCHIVE_SUBDIR = "archiv"                  # <síťová složka>/.spm/archiv
 ARCHIVE_INFO = "spm_archive.json"          # popis archivu v zipu
 MARKER = "archiving.json"                  # .spm/archiving.json – projekt se právě archivuje
 RESTORES_SUFFIX = ".restores.json"         # vedle zipu: kdy a kdo projekt obnovil
@@ -72,14 +75,12 @@ class ArchiveResult:
 # --- nastavení a kontroly ------------------------------------------------------------------
 
 def archive_dir(settings) -> Path | None:
-    """Archivní složka záložky (relativní cesta = vzhledem k síťové složce); None = vypnuto."""
-    root = (settings.archive_root or "").strip()
+    """Archivní složka záložky: <síťová složka s projekty>/.spm/archiv; None = síťová složka
+    není nastavená."""
+    root = (settings.server_root or "").strip()
     if not root:
         return None
-    path = Path(root)
-    if not path.is_absolute():
-        path = Path(settings.server_root) / path
-    return Path(os.path.normpath(path))
+    return Path(os.path.normpath(Path(root) / SPM_DIR / ARCHIVE_SUBDIR))
 
 
 def may_archive(settings, user: str) -> bool:
@@ -88,16 +89,14 @@ def may_archive(settings, user: str) -> bool:
 
 def permission_problem(settings, user: str) -> str | None:
     if archive_dir(settings) is None:
-        return ("Archivace není nastavená – archivní složka se nastavuje ve společné konfiguraci "
-                "(Nastavení → Společné nastavení).")
+        return "Síťová složka s projekty není nastavená."
     if not may_archive(settings, user):
         who = ", ".join(settings.archivers)
         return ("Archivovat a vracet z archivu smí jen: " + who if who else
                 "Archivovat zatím nesmí nikdo – oprávnění se nastavuje ve společné konfiguraci "
                 "(Nastavení → Společné nastavení → Archivovat smí).")
-    folder = archive_dir(settings)
-    if not folder.is_dir() and not folder.parent.is_dir():
-        return f"Archivní složka není dostupná:\n{folder}"
+    if not Path(settings.server_root).is_dir():
+        return f"Síťová složka s projekty není dostupná:\n{settings.server_root}"
     return None
 
 
