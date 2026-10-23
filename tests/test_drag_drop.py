@@ -341,3 +341,84 @@ def test_take_free_file_when_replacing_and_copy_of_held(panel, env, monkeypatch)
     settle_panel(panel)
     assert (local / "sestava/elektrody/E01_copy.elt").read_text(encoding="utf-8") == "nova E01"
     assert (local / "sestava/elektrody/E01.elt").read_text(encoding="utf-8") == "sestava/elektrody/E01.elt"
+
+
+# --- nová složka a vložení do projektu, který nemám aktivovaný -----------------------------
+
+@pytest.fixture
+def carol_window(env, tmp_path, monkeypatch):
+    """Okno uživatelky, která projekt nemá aktivovaný (alice a bob ho mají)."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from spm import config
+    from spm.gui.main_window import MainWindow
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    app = QApplication.instance() or QApplication([])
+    alice, bob, proj, src = env
+    carol = ProjectManager(Settings(server_root=str(proj.parent), local_root=str(tmp_path / "local_carol")),
+                           user="carol", pc="PC-carol")
+    w = MainWindow(carol.settings)
+    w.pm = w.panel.pm = carol
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    from conftest import settle_panel
+    settle_panel(w.panel)
+    yield w, carol
+    if w._name_check:
+        w._name_check.wait()
+    w._messages_check.wait()
+    w.close()
+    app.processEvents()
+
+
+def test_new_folder_in_inactive_project_activates_without_locks(carol_window, env, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog, QMessageBox
+
+    from conftest import settle_panel
+    alice, bob, proj, src = env
+    w, carol = carol_window
+    panel = w.panel
+    assert not panel.project.mine and panel.context_actions(["sestava/elektrody/"])["new_folder"]
+    assert panel.tree.can_drop()                                     # i do neaktivovaného
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: ("123", True))
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.No)
+    panel.create_folder("sestava/elektrody/")                        # odmítnutá aktivace
+    assert "bez zamčení souborů" in asked[-1] and not carol.local_dir("Forma").exists()
+    assert not w.selected().mine
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    panel.create_folder("sestava/elektrody/")
+    settle_panel(panel)
+    local = carol.local_dir("Forma")
+    assert (local / "sestava" / "elektrody" / "123").is_dir()         # celá cesta
+    assert not (local / "sestava" / "elektrody" / "E02.elt").exists()  # nic se nestahovalo
+    assert w.selected().mine and panel.project.mine
+    with ProjectDB.for_project(proj) as db:
+        session = db.active_session("carol", "PC-carol")
+        assert session is not None and db.locked_by(session) == set()  # nic nezamčeno
+    # soubor do nové složky a odevzdání
+    panel.drop_files([src / "nova.elt"], None, "sestava/elektrody/123/")
+    settle_panel(panel)
+    plan = carol.plan_upload("Forma")
+    assert [f.path for f in plan.new] == ["sestava/elektrody/123/nova.elt"]
+    assert plan.missing == [] and plan.modified == []                # nestažené nejsou smazané
+    carol.upload(plan, plan.default_assignments(), "nový soubor", end_session=True)
+    assert (proj / "sestava" / "elektrody" / "123" / "nova.elt").read_text(encoding="utf-8") == "nova"
+    assert (proj / "sestava" / "elektrody" / "E01.elt").exists()
+
+
+def test_drop_into_inactive_project_offers_activation(carol_window, env, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from conftest import settle_panel
+    alice, bob, proj, src = env
+    w, carol = carol_window
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.No)
+    w.panel.drop_files([src / "nova.elt"], None, "dily/")
+    assert not w.selected().mine and not carol.local_dir("Forma").exists()
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    w.panel.drop_files([src / "nova.elt"], None, "dily/")
+    settle_panel(w.panel)
+    assert w.selected().mine and (carol.local_dir("Forma") / "dily" / "nova.elt").exists()

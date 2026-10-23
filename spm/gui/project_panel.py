@@ -166,6 +166,9 @@ class ProjectPanel(QWidget):
         self.mirror_target_label: Callable[[object], str] = lambda target: target.label
         # lze vybraný projekt aktivovat? (nastaví hlavní okno – např. nepovolené znaky)
         self.can_activate: Callable[[], bool] = lambda: False
+        # aktivace bez zámků a bez stahování (nová složka / vložení souborů do projektu, který
+        # nemám aktivovaný); vrací, zda se povedla – nastaví hlavní okno
+        self.quick_activate: Callable[[], bool] = lambda: False
 
         self.title = QLabel()
         self.summary = QLabel()
@@ -205,7 +208,9 @@ class ProjectPanel(QWidget):
         # dovnitř = kopie do složky (nové soubory a mé aktivované – viz plan_copy_in)
         self.tree.drag_handler = self.drag_mime
         self.tree.drop_handler = self.drop_files
-        self.tree.can_drop = lambda: bool(self.project and (self.project.mine or self.project.local_only))
+        # do neaktivovaného projektu taky – před vložením se nabídne aktivace bez zámků
+        self.tree.can_drop = lambda: bool(self.project and (self.project.mine or self.project.local_only
+                                                            or self._can_quick_activate()))
         self.tree.itemDoubleClicked.connect(self._on_double_click)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._context_menu)
@@ -554,8 +559,9 @@ class ProjectPanel(QWidget):
                                      for e in inside))
                 or (single_folder and (bool(inside) or only_empty) and (local_only or all(
                     e.mine or e.local_new for e in inside))))),
-            # nová složka: v aktivovaném projektu nebo ve složce „Jen místně“
-            "new_folder": local_only or mine_project,
+            # nová složka: v aktivovaném projektu, ve složce „Jen místně“, nebo v neaktivovaném
+            # (nejdřív se aktivuje bez zámků a bez stahování)
+            "new_folder": local_only or mine_project or self._can_quick_activate(),
             # neaktuální zrcadlené soubory lze uvolnit (stanou se běžnými soubory projektu)
             "release_mirror": not local_only and any(e.mirror and e.mirror_stale for e in inside),
             # zip vzniká v místní kopii – jako nová složka / soubor
@@ -594,9 +600,36 @@ class ProjectPanel(QWidget):
         return any(f.lower() == prefix or f.lower().startswith(prefix + "/") for f in self.empty_folders) \
             and not any(e.path.lower().startswith(prefix + "/") for e in self.entries)
 
+    def _can_quick_activate(self) -> bool:
+        """Projekt na serveru, který nemám aktivovaný a který jde aktivovat."""
+        return bool(self.project and not self.project.mine and not self.project.local_only
+                    and self.can_activate())
+
+    def ensure_active(self, what: str) -> bool:
+        """Před změnou v místní kopii (nová složka, vložení souborů): projekt, který nemám
+        aktivovaný, se po potvrzení aktivuje bez zámků a bez stahování. Vrací, zda lze
+        pokračovat."""
+        if self.project is None:
+            return False
+        if self.project.mine or self.project.local_only:
+            return True
+        if not self._can_quick_activate():
+            return False
+        answer = QMessageBox.question(
+            self, "Aktivovat projekt",
+            f"Projekt {self.project.name} nemáte aktivovaný.\n\nAby šlo {what}, aktivuje se bez "
+            "zamčení souborů a bez stahování (rychle). Ostatní uvidí, že projekt máte aktivovaný; "
+            "nic jim tím nezamknete. Nové soubory pak odevzdáte jako obvykle.\n\nAktivovat?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        return self.quick_activate()
+
     def create_folder(self, parent: str) -> None:
-        """Nová složka v místní kopii: parent = '' (kořen projektu) nebo 'a/b/'."""
-        if self.project is None or not (self.project.mine or self.project.local_only):
+        """Nová složka v místní kopii: parent = '' (kořen projektu) nebo 'a/b/'. V projektu,
+        který nemám aktivovaný, se po zadání názvu nabídne aktivace bez zámků; složka se pak
+        vytvoří i s celou cestou (nadřazené složky se nestahovaly)."""
+        if self.project is None or not (self.project.mine or self.project.local_only
+                                        or self._can_quick_activate()):
             return
         title = "Nová složka"
         where = f"ve složce {parent.rstrip('/')}" if parent else "v hlavní složce projektu"
@@ -611,6 +644,8 @@ class ProjectPanel(QWidget):
             if not error:
                 break
             QMessageBox.warning(self, title, error)
+        if not self.ensure_active("vytvořit složku"):
+            return
         try:
             self.pm.create_local_folder(self.project.name, parent, name)
         except Exception as e:  # noqa: BLE001
@@ -799,6 +834,8 @@ class ProjectPanel(QWidget):
             QMessageBox.information(self, "Vložit", "Vložit lze jen do aktivovaného projektu "
                                                     "nebo do složky „Jen místně“.")
             return
+        if not self.ensure_active("vložit soubory"):
+            return
         mime = QApplication.clipboard().mimeData()
         info = clipboard_info(mime)
         if info and info["cut"]:
@@ -950,7 +987,7 @@ class ProjectPanel(QWidget):
     def drop_files(self, urls: list[Path], internal: list[tuple[str, str]] | None, target: str) -> None:
         """Puštění do stromu: soubory a složky ze systému (urls), nebo položky z tohoto stromu
         (internal = (cesta v projektu, cesta v cíli)); target = cílová složka v projektu."""
-        if self.project is None:
+        if self.project is None or not self.ensure_active("vložit soubory"):
             return
         name = self.project.name
         if internal is not None:

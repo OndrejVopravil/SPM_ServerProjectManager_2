@@ -574,6 +574,7 @@ class MainWindow(QMainWindow):
         self.panel.tree.itemSelectionChanged.connect(self._in(pane, self._on_tree_selection))
         self.panel.tree.itemClicked.connect(self._in(pane, self._on_tree_click))
         self.panel.can_activate = lambda: self.act_activate.isEnabled()
+        self.panel.quick_activate = self._in(pane, lambda: self.quick_activate())
         self.panel.mirror_source_label = self.mirror_source_label
         self.panel.mirror_target_label = self.mirror_target_label
         self.panel.tree.default_expanded = settings.tree_expanded  # výchozí stav složek ve stromu
@@ -1751,6 +1752,32 @@ class MainWindow(QMainWindow):
         run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
                  only_locked=only_locked, status_text="Přenáším data…",
                  on_done=done, on_error=lambda _: self.refresh())
+
+    def quick_activate(self) -> bool:
+        """Aktivace vybraného projektu bez zámků a bez stahování – pro novou složku nebo vložení
+        nových souborů do projektu, který nemám aktivovaný (z panelu stromu). Vrací, zda se
+        povedla."""
+        p = self.selected()
+        if not p or p.local_only:
+            return False
+        if p.mine:
+            return True
+        try:
+            with self._please_wait(f"Aktivuji projekt {p.name} bez stahování…"):
+                res = self.pm.activate(p.name, lock_paths=[], only_locked=True)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Aktivace", str(e))
+            self.refresh(check_names=False)
+            return False
+        self.refresh(check_names=False)
+        msg = ""
+        if res.moved_to:
+            msg = f"Původní místní složka projektu byla přesunuta do:\n{res.moved_to}"
+        if res.external:
+            QMessageBox.warning(self, "Aktivace", (msg + "\n\n" if msg else "") + format_external(res.external))
+        elif msg:
+            QMessageBox.information(self, "Aktivace", msg)
+        return True
 
     def take(self, preselect: str | list[str] | None = None) -> None:
         """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
