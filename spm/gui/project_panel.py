@@ -48,6 +48,7 @@ from ..sync import (
     validate_file_name,
     validate_folder_name,
 )
+from . import name_dialog
 from .check_tree import KEY_ROLE, PATH_ROLE, CheckTree, TreeEntry, in_scope
 from .project_tree import (
     CLIPBOARD_KEEP_S,
@@ -600,6 +601,19 @@ class ProjectPanel(QWidget):
         return any(f.lower() == prefix or f.lower().startswith(prefix + "/") for f in self.empty_folders) \
             and not any(e.path.lower().startswith(prefix + "/") for e in self.entries)
 
+    def folder_names(self, parent: str) -> list[str]:
+        """Názvy složek ve složce parent ('' = kořen) – ze serveru i z místní kopie (i prázdné);
+        nabízejí se při psaní názvu nové složky."""
+        paths = [e.path for e in self.entries] + [f.rstrip("/") + "/" for f in self.empty_folders]
+        return name_dialog.child_folders(paths, parent)
+
+    def copy_names(self, scopes: list[str]) -> str:
+        """Kopírovat název: názvy označených souborů a složek (bez cesty) do schránky – každý
+        na samostatném řádku."""
+        text = "\n".join(s.rstrip("/").rpartition("/")[2] for s in scopes)
+        QApplication.clipboard().setText(text)
+        return text
+
     def _can_quick_activate(self) -> bool:
         """Projekt na serveru, který nemám aktivovaný a který jde aktivovat."""
         return bool(self.project and not self.project.mine and not self.project.local_only
@@ -634,9 +648,9 @@ class ProjectPanel(QWidget):
         title = "Nová složka"
         where = f"ve složce {parent.rstrip('/')}" if parent else "v hlavní složce projektu"
         name = ""
+        siblings = self.folder_names(parent)
         while True:
-            name, ok = QInputDialog.getText(self, title, f"Název nové složky {where}:",
-                                            QLineEdit.EchoMode.Normal, name)
+            name, ok = name_dialog.ask_text(self, title, f"Název nové složky {where}:", name, siblings)
             name = name.strip()
             if not ok or not name:
                 return
@@ -1173,6 +1187,8 @@ class ProjectPanel(QWidget):
             act_take.setEnabled(enabled["take"])
         menu.addSeparator()
         act_copy = menu.addAction("Kopírovat" + many + "\tCtrl+C")
+        act_copy_name = menu.addAction("Kopírovat název" + ("y" if len(scopes) > 1 else ""))
+        act_copy_name.setToolTip("Do schránky jako text – jen název souboru nebo složky, bez cesty")
         act_cut = menu.addAction("Vyjmout" + many + "\tCtrl+X")
         act_cut.setEnabled(self.can_cut(scopes))
         act_paste = menu.addAction("Vložit\tCtrl+V")
@@ -1220,6 +1236,8 @@ class ProjectPanel(QWidget):
                                (clicked.rpartition("/")[0] + "/" if "/" in clicked else ""))
         elif chosen is act_copy:
             self.copy_selected(scopes)
+        elif chosen is act_copy_name:
+            self.copy_names(scopes)
         elif chosen is act_cut:
             self.copy_selected(scopes, cut=True)
         elif chosen is act_paste:

@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from .. import folder_ops, recycle, zip_ops
 from ..sync import ProjectManager
 from ..folder_zones import ProtectedZones, Zone
+from . import name_dialog
 from .project_tree import MIME_CLIPBOARD, clipboard_info
 
 
@@ -275,8 +276,11 @@ class FolderPanel(QWidget):
         if zone is not None:
             self.refuse(zone, "Novou složku sem nelze vytvořit", parent)
             return
-        name, ok = QInputDialog.getText(self, "Nová složka", f"Název nové složky v {parent}:",
-                                        QLineEdit.EchoMode.Normal, "")
+        try:  # názvy sousedních složek – nabízejí se při psaní
+            siblings = [p.name for p in parent.iterdir() if p.is_dir()]
+        except OSError:
+            siblings = []
+        name, ok = name_dialog.ask_text(self, "Nová složka", f"Název nové složky v {parent}:", "", siblings)
         name = name.strip()
         if not ok or not name:
             return
@@ -495,6 +499,8 @@ class FolderPanel(QWidget):
         act_open.setEnabled(len(paths) == 1 and paths[0].is_file())
         menu.addSeparator()
         act_copy = menu.addAction("Kopírovat" + many + "\tCtrl+C")
+        act_copy_name = menu.addAction("Kopírovat název" + ("y" if len(paths) > 1 else ""))
+        act_copy_name.setEnabled(bool(paths))
         act_cut = menu.addAction("Vyjmout" + many + "\tCtrl+X")
         act_paste = menu.addAction("Vložit\tCtrl+V")
         for act in (act_copy, act_cut):
@@ -521,6 +527,8 @@ class FolderPanel(QWidget):
             self._open_index(index)
         elif chosen is act_copy:
             self.copy_selected(paths)
+        elif chosen is act_copy_name:
+            QApplication.clipboard().setText("\n".join(p.name for p in paths))
         elif chosen is act_cut:
             self.copy_selected(paths, cut=True)
         elif chosen is act_paste:

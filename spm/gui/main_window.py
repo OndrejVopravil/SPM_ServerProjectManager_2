@@ -73,6 +73,7 @@ from .file_select_dialog import FileSelectDialog
 from .file_history_dialog import FileHistoryDialog
 from .project_panel import ProjectPanel
 from .publish_dialog import PublishDialog
+from . import name_dialog
 from .archive_dialog import ArchiveListDialog, ArchiveProjectDialog
 from .messages_window import MessagesWindow, Source, news as messages_news
 from .storage_dialog import StorageDialog
@@ -1681,11 +1682,14 @@ class MainWindow(QMainWindow):
             menu.exec(self.table.viewport().mapToGlobal(pos))
             return
         self.table.selectRow(row)
+        act_copy_name = QAction("Kopírovat název", menu)
+        act_copy_name.setToolTip("Název projektu do schránky")
+        act_copy_name.triggered.connect(lambda: self.copy_project_name())
         actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
                    self.act_deactivate, self.act_publish, None, self.act_open, self.act_history, self.act_notes,
                    self.act_restore, self.act_storage, self.act_archive, None, self.act_favorite,
                    self.act_comment,
-                   self.act_rename, None,
+                   self.act_rename, act_copy_name, None,
                    self.act_cancel, self.act_unlock,
                    None, act_create, self.act_refresh]
         if self.act_invalid.isEnabled():
@@ -2043,15 +2047,24 @@ class MainWindow(QMainWindow):
                     "Nyní se zobrazuje jako „Jen místně“ – pokud ji nepotřebujete, smažte ji.")
         QMessageBox.information(self, "Přejmenovat projekt", msg)
 
+    def copy_project_name(self) -> str:
+        """Kopírovat název: název vybraného projektu do schránky."""
+        p = self.selected()
+        if p is None:
+            return ""
+        QGuiApplication.clipboard().setText(p.name)
+        return p.name
+
     def create_project(self) -> None:
         """Nový projekt v místním úložišti (prázdná složka) – zobrazí se jako „Jen místně“
         a publikuje se na síť jako ručně vytvořená složka."""
         title = "Vytvořit projekt"
         name = ""
         while True:
-            name, ok = QInputDialog.getText(
+            name, ok = name_dialog.ask_text(
                 self, title, "Název nového projektu:\n(Vytvoří se složka v místním úložišti "
-                f"{self.pm.local_root}; na síť ji pak publikujete.)", QLineEdit.EchoMode.Normal, name)
+                f"{self.pm.local_root}; na síť ji pak publikujete.)", name,
+                [p.name for p in self.projects])  # nabízejí se názvy ostatních projektů
             name = name.strip()
             if not ok or not name:
                 return
