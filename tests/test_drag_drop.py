@@ -422,3 +422,29 @@ def test_drop_into_inactive_project_offers_activation(carol_window, env, monkeyp
     w.panel.drop_files([src / "nova.elt"], None, "dily/")
     settle_panel(w.panel)
     assert w.selected().mine and (carol.local_dir("Forma") / "dily" / "nova.elt").exists()
+
+
+def test_expand_active_folders(panel, env, tmp_path):
+    """Rozbalit aktivní složky: jen cesty k aktivovaným souborům, ostatní sbalené."""
+    from conftest import settle_panel
+    from spm.gui.project_panel import ProjectPanel
+    alice, bob, proj, src = env                                      # alice: E02, bob: E01
+    write(alice.local_dir("Forma") / "dily" / "nove" / "novy.elt", "n")   # můj nový soubor
+    panel.reload()
+    settle_panel(panel)
+    panel.tree.expandAll()
+    assert panel.expand_active() == 4
+    expanded = sorted(i.text(0)
+                      for i in panel.tree._folder_items() if i.isExpanded())
+    assert expanded == ["dily", "elektrody", "nove", "sestava"]
+    assert sorted(panel.active_paths()) == ["dily/nove/novy.elt", "sestava/elektrody/E02.elt"]
+    # projekt, který nemám aktivovaný: složky se soubory aktivovanými ostatními
+    carol = ProjectManager(Settings(server_root=str(proj.parent), local_root=str(tmp_path / "local_carol")),
+                           user="carol", pc="PC-carol")
+    other = ProjectPanel(carol)
+    other.show_project(carol.project_status("Forma"))
+    settle_panel(other)
+    assert sorted(other.active_paths()) == ["sestava/elektrody/E01.elt", "sestava/elektrody/E02.elt"]
+    other.expand_active()
+    assert sorted(i.text(0) for i in other.tree._folder_items() if i.isExpanded()) == ["elektrody", "sestava"]
+    other.deleteLater()

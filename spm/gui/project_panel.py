@@ -70,13 +70,14 @@ COLOR_FOUND = QColor("#fff176")  # podbarvení souborů nalezených hledáním
 SEARCH_EXPAND_DELAY_MS = 1000    # prodleva před rozbalením složek s nalezenými soubory
 
 
-def _tree_icon(expand: bool) -> QIcon:
-    """Ikona „rozbalit vše“ (⊞) / „sbalit vše“ (⊟): čtvereček s plusem / mínusem."""
+def _tree_icon(expand: bool, color: str = "#7a7a7a") -> QIcon:
+    """Ikona „rozbalit vše“ (⊞) / „sbalit vše“ (⊟): čtvereček s plusem / mínusem; barevná
+    varianta = „rozbalit aktivní složky“ (barva mých souborů ve stromu)."""
     pixmap = QPixmap(16, 16)
     pixmap.fill(QColor(0, 0, 0, 0))
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor("#7a7a7a"))
+    pen = QPen(QColor(color))
     pen.setWidthF(1.4)
     painter.setPen(pen)
     painter.drawRoundedRect(2, 2, 12, 12, 2, 2)
@@ -192,6 +193,11 @@ class ProjectPanel(QWidget):
                                             lambda: self.tree.expandAll())
         self.btn_collapse = self._tool_button(_tree_icon(expand=False), "Sbalit všechny složky",
                                               lambda: self.tree.collapseAll())
+        self.btn_expand_active = self._tool_button(
+            _tree_icon(expand=True, color=COLOR_MINE.name()),
+            "Rozbalit aktivní složky – jen složky s aktivovanými soubory (v mém aktivovaném "
+            "projektu moje zamčené a nové soubory, jinak soubory aktivované ostatními)",
+            lambda: self.expand_active())
         clear = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         clear.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)  # jen v panelu (pole, strom)
         clear.activated.connect(self.search.clear)
@@ -199,6 +205,7 @@ class ProjectPanel(QWidget):
         head.addWidget(self.title)
         head.addWidget(self.btn_expand)
         head.addWidget(self.btn_collapse)
+        head.addWidget(self.btn_expand_active)
         head.addStretch()
         head.addWidget(self.found)
         head.addWidget(self.search)
@@ -435,6 +442,33 @@ class ProjectPanel(QWidget):
         # (posun stromu sbalené složky sám rozbaluje)
         self._apply_search(scroll=False)
         self._expand_timer.start()  # znovu od nuly při každém dalším znaku
+
+    def active_paths(self) -> list[str]:
+        """Aktivované soubory: v mém aktivovaném projektu (nebo složce „Jen místně“) moje
+        zamčené a nové soubory, v projektu, který nemám aktivovaný, soubory aktivované ostatními."""
+        if self.project is None:
+            return []
+        if self.project.mine or self.project.local_only:
+            return [e.path for e in self.entries if (e.mine or e.local_new) and not e.local_deleted]
+        return [e.path for e in self.entries if e.owner is not None]
+
+    def expand_active(self) -> int:
+        """Rozbalí jen složky, ve kterých (i hlouběji) jsou aktivované soubory – ostatní sbalí.
+        Vrací počet rozbalených složek."""
+        folders: set[str] = set()
+        for path in self.active_paths():
+            parts = path.split("/")[:-1]
+            for i in range(1, len(parts) + 1):
+                folders.add("/".join(parts[:i]).lower() + "/")
+        self.tree.collapseAll()
+        first = None
+        for item in self.tree._folder_items():
+            if (item.data(0, PATH_ROLE) or "").lower() in folders:
+                item.setExpanded(True)
+                first = first or item
+        if first is not None:
+            self.tree.scrollToItem(first)
+        return len(folders)
 
     def expand_found(self) -> None:
         """Rozbalí složky, ve kterých jsou soubory odpovídající hledání (ostatní nechá být)."""

@@ -1,11 +1,15 @@
 """Lišta záložek s vlastní barvou každé záložky (světlá varianta ve světlém režimu, tmavá
-v tmavém – text zůstane čitelný) a přesouváním záložek myší."""
+v tmavém – text zůstane čitelný) a přesouváním záložek myší. Aktivní záložka (jejíž seznam
+projektů je vidět) má tučný, o něco větší text a pod sebou podtržení barvou zvýraznění."""
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QEvent, QRect, QSize
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPalette
 from PySide6.QtWidgets import QStyle, QStyleOptionTab, QStylePainter, QTabBar, QWidget
+
+ACTIVE_FONT_SCALE = 1.12     # aktivní záložka: o něco větší písmo
+UNDERLINE = 3                # tloušťka podtržení aktivní záložky (px)
 
 # klíč -> (název, světlá varianta, tmavá varianta)
 TAB_COLORS: dict[str, tuple[str, str, str]] = {
@@ -63,10 +67,27 @@ class ColorTabBar(QTabBar):
         self._colors = {(i - 1 if i > index else i): k for i, k in self._colors.items() if i != index}
         super().tabRemoved(index)
 
+    def active_font(self) -> QFont:
+        """Písmo aktivní záložky: tučné a o něco větší."""
+        font = QFont(self.font())
+        font.setBold(True)
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(font.pointSizeF() * ACTIVE_FONT_SCALE)
+        return font
+
+    def tabSizeHint(self, index: int) -> QSize:  # noqa: N802 – Qt
+        """Místo pro tučný větší text u všech záložek – lišta se při přepnutí neposouvá."""
+        size = super().tabSizeHint(index)
+        normal, active = self.fontMetrics(), QFontMetrics(self.active_font())
+        text = self.tabText(index)
+        size.setWidth(size.width() + max(0, active.horizontalAdvance(text) - normal.horizontalAdvance(text)) + 2)
+        size.setHeight(size.height() + max(0, active.height() - normal.height()) + UNDERLINE - 1)
+        return size
+
+    def minimumTabSizeHint(self, index: int) -> QSize:  # noqa: N802 – Qt
+        return self.tabSizeHint(index)
+
     def paintEvent(self, event) -> None:  # noqa: N802 – Qt
-        if not any(self._colors.values()):
-            super().paintEvent(event)
-            return
         painter = QStylePainter(self)
         dark = is_dark(self)
         current = self.currentIndex()
@@ -82,7 +103,18 @@ class ColorTabBar(QTabBar):
                 if not selected:  # nevybraná o něco méně sytě
                     color.setAlpha(190)
                 painter.fillRect(inner, color)
-            painter.drawControl(QStyle.ControlElement.CE_TabBarTabLabel, opt)
+            if i == current:  # aktivní: tučně, větší písmo, podtržení
+                font = self.active_font()
+                painter.save()
+                painter.setFont(font)
+                opt.fontMetrics = QFontMetrics(font)
+                painter.drawControl(QStyle.ControlElement.CE_TabBarTabLabel, opt)
+                painter.restore()
+                r = opt.rect
+                painter.fillRect(QRect(r.left() + 4, r.bottom() - UNDERLINE + 1, r.width() - 8, UNDERLINE),
+                                 self.palette().color(QPalette.ColorRole.Highlight))
+            else:
+                painter.drawControl(QStyle.ControlElement.CE_TabBarTabLabel, opt)
 
     def changeEvent(self, event) -> None:  # noqa: N802 – Qt
         if event.type() == QEvent.Type.PaletteChange:
