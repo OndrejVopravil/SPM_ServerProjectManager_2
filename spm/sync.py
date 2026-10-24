@@ -1527,17 +1527,26 @@ class ProjectManager:
         return messages, recorded
 
     def take(self, name: str, paths: Iterable[str], progress: Progress | None = None) -> RefreshResult:
-        """Převezme (zamkne) další soubory k úpravě a stáhne jejich aktuální verzi."""
+        """Převezme (zamkne) další soubory k úpravě a stáhne jejich aktuální verzi.
+
+        Soubor, který na serveru je, ale v evidenci zatím ne (aktivace bez stahování, projekt
+        začatý mimo SPM, soubor nakopírovaný na server ručně), se zaeviduje – stejně jako při
+        aktivaci: rezervace, zamčení a po zkopírování údaje (záznam „Načten do evidence“)."""
         server = self.server_dir(name)
         local, manifest = self._manifest(name)
         paths = list(paths)
+        reserved: dict[str, str] = {}  # cesta -> file_id rezervace (soubor dosud mimo evidenci)
         with self._write(server) as db:
             sid = self._my_session(db, manifest.session_id)
             files = db.active_files(include_pending=True)
             unknown = [p for p in paths if p not in files]
-            if unknown:
-                raise SyncError("Soubory nejsou v evidenci projektu (zkuste Aktualizovat):\n"
-                                + "\n".join(unknown[:15]))
+            gone = [p for p in unknown if not to_abs(server, p).is_file()]
+            if gone:
+                raise SyncError("Soubory na serveru nejsou (zkuste Aktualizovat):\n" + "\n".join(gone[:15]))
+            for p in unknown:
+                reserved[p] = db.add_file(p, None, None, None, pending=True)
+            if reserved:
+                files = db.active_files(include_pending=True)
             mirrored = db.mirrored()
             blocked = [p for p in paths if files[p].file_id in mirrored]
             if blocked:
@@ -1585,9 +1594,18 @@ class ProjectManager:
                     result.downloaded.append(f.path)
                 entry.sha256 = server_sha
             entry.db_sha = None
-            if server_sha != f.sha256:
+            if server_sha != f.sha256 and f.path not in reserved:
                 found.append((f.file_id, f.path, server_sha))
             set_readonly(lp, False)
+        if reserved:  # zaevidovat (údaje podle zkopírovaného souboru)
+            with self._write(server) as db:
+                commit_id = db.add_commit(sid, self.user, self.pc, dbm.SYNC,
+                                          "Soubory načtené do evidence při převzetí.")
+                for path, fid in reserved.items():
+                    st = to_abs(server, path).stat()
+                    sha = manifest.files[path].sha256
+                    db.update_file(fid, path, st.st_size, st.st_mtime, sha)
+                    db.add_change(commit_id, fid, dbm.IMPORTED, None, path, st.st_size, st.st_mtime, sha)
         result.external, _ = self._confirm_external(server, sid, found, "převzetí")
         manifest.save(local)
         return result

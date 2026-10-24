@@ -17,3 +17,8 @@ settings.json
 
 # Uživatelské skripty odevzdání (složka scripts vedle aplikace)
 /scripts/
+
+# Server statistiky (web/) – databáze a balíky ke stažení se do repozitáře nedávají
+web/data/*.sqlite*
+web/secret.php
+web/download/*.zip

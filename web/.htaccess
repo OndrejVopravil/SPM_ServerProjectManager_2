@@ -1,0 +1,5 @@
+# Statistika SPM – veřejné jsou jen index.php, api/ping.php a download/
+<FilesMatch "^(config|lib|secret)\.php$">
+    Require all denied
+</FilesMatch>
+Options -Indexes

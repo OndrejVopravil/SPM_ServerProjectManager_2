@@ -694,3 +694,38 @@ def test_modified_held_file_deleted_on_server_is_uploaded_and_recorded(tmp_path)
     # obnova ze záloh s ním počítá (soubor existuje)
     latest = pm.restore_points("Forma").points[0]
     assert "a.txt" in {path for path, _ in latest.files.values()} and not latest.missing
+
+
+def test_take_registers_files_missing_in_evidence(tmp_path):
+    """Projekt začatý mimo SPM, aktivace bez stahování: Převzít soubor, který v evidenci ještě
+    není, ho zaeviduje (dřív končilo chybou „nejsou v evidenci“)."""
+    server = tmp_path / "server" / "Stary"
+    write(server / "sestava" / "a.elt", "a")
+    write(server / "b.elt", "b")
+    pm = ProjectManager(Settings(server_root=str(server.parent), local_root=str(tmp_path / "l")),
+                        user="alice", pc="PC")
+    pm.activate("Stary", lock_paths=[], only_locked=True)           # nic se nestáhlo ani nezaevidovalo
+    with ProjectDB.for_project(server) as db:
+        assert "sestava/a.elt" not in db.active_files(include_pending=True)
+    res = pm.take("Stary", ["sestava/a.elt"])
+    assert res.downloaded == ["sestava/a.elt"] and res.external == []   # není to „změna mimo aplikaci“
+    local = pm.local_dir("Stary") / "sestava" / "a.elt"
+    assert local.read_text(encoding="utf-8") == "a" and not readonly(local)
+    with ProjectDB.for_project(server) as db:
+        f = db.active_files()["sestava/a.elt"]
+        assert f.sha256 == file_hash(server / "sestava" / "a.elt") and not f.pending
+        sid = db.active_session("alice", "PC")
+        assert f.file_id in db.locked_by(sid)
+        kinds = [c["kind"] for c in db.commits()]
+        assert kinds[0] == dbm.SYNC
+    # úprava a odevzdání převzatého souboru
+    write(local, "a2")
+    plan = pm.plan_upload("Stary")
+    assert [lf.path for _, lf in plan.modified] == ["sestava/a.elt"]
+    pm.upload(plan, plan.default_assignments(), "upraveno", end_session=True)
+    assert (server / "sestava" / "a.elt").read_text(encoding="utf-8") == "a2"
+    assert (server / "b.elt").read_text(encoding="utf-8") == "b"          # nestažený zůstal
+    # soubor, který na serveru není -> srozumitelná chyba
+    pm.activate("Stary", lock_paths=[], only_locked=True)
+    with pytest.raises(SyncError, match="na serveru nejsou"):
+        pm.take("Stary", ["neexistuje.elt"])

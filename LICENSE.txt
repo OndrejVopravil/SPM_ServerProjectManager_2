@@ -73,12 +73,26 @@ aplikace pochází od Microsoftu nebo je jím podporována, ani je šířit k po
 jiné platformě než Microsoft Windows.
 
 
-7. Zánik licence
+7. Anonymní statistika používání a kontrola nové verze
+
+Aplikace jednou denně odešle na server https://spm.vopravil.cz hash (SHA-256)
+uživatelského jména a názvu počítače a číslo verze aplikace. Neodesílá žádná jména,
+cesty, názvy projektů ani jejich obsah. Server IP adresu neukládá a souhrnnou statistiku
+zveřejňuje na https://spm.vopravil.cz. V odpovědi server sdělí číslo aktuální verze
+aplikace (upozornění na aktualizaci).
+
+Odesílání statistiky lze vypnout v Nastavení aplikace („Odesílat anonymní statistiku
+používání“), pro všechny uživatele síťové složky v souboru spm_config.json
+("usage_report": false). I s vypnutou statistikou se aplikace dotazuje na aktuální verzi,
+jen bez uvedeného hashe.
+
+
+8. Zánik licence
 
 Licence zaniká automaticky, pokud tyto podmínky porušíte. V takovém případě musíte
 užívání aplikace ukončit a její kopie odstranit.
 
 
-8. Rozhodné právo
+9. Rozhodné právo
 
 Tyto podmínky se řídí právním řádem České republiky.

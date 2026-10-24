@@ -180,6 +180,14 @@ class SettingsDialog(QDialog):
                                       "odpovědi) se přesunou do archivu vzkazů – nic se nemaže, "
                                       "v okně Vzkazy je lze zobrazit volbou „Zobrazit i archiv“.")
 
+        self.usage_report = QCheckBox("Odesílat anonymní statistiku používání")
+        self.usage_report.setChecked(settings.usage_report)
+        self.usage_report.setToolTip(
+            "Jednou denně se na spm.vopravil.cz odešle jen hash uživatelského jména a názvu počítače "
+            "a číslo verze SPM – žádná jména, cesty ani obsah projektů.\n"
+            "Souhrnná statistika je veřejně na https://spm.vopravil.cz.\n"
+            "Upozornění na novou verzi funguje i s vypnutou statistikou.")
+
         self.check_chars = QCheckBox("Kontrolovat nepovolené znaky v názvech souborů a složek")
         self.check_chars.setToolTip("Česká diakritika, mezera a znaky ( ) & , . ; = ^ "
                                     "(tečka před příponou souboru je povolená).\n"
@@ -245,6 +253,7 @@ class SettingsDialog(QDialog):
         shared_form.addRow("Při archivaci ponechat:", self.archive_keep)
         shared_form.addRow("Archivovat smí:", self.archivers)
         shared_form.addRow("Vyřízené vzkazy archivovat po:", self.messages_days)
+        shared_form.addRow(self.usage_report)
         archive_hint = QLabel("Archivované projekty se ukládají do <i>.spm\\archiv</i> v síťové složce "
                               "s projekty. Kdo smí archivovat, smí také uklízet zálohy a koš.")
         archive_hint.setWordWrap(True)
@@ -318,7 +327,7 @@ class SettingsDialog(QDialog):
 
     def _shared_widgets(self) -> list[QWidget]:
         return [self.backup_enabled, self.backup_count, self.ignore, self.check_chars,
-                self.archive_keep, self.archivers, self.messages_days]
+                self.archive_keep, self.archivers, self.messages_days, self.usage_report]
 
     def _shared_values(self) -> dict:
         return {
@@ -328,6 +337,7 @@ class SettingsDialog(QDialog):
             "check_forbidden_chars": self.check_chars.isChecked(),
             "archive_keep_backups": self.archive_keep.value(),
             "messages_archive_days": self.messages_days.value(),
+            "usage_report": self.usage_report.isChecked(),
             "archivers": self.archivers.logins(),
         }
 
@@ -348,6 +358,8 @@ class SettingsDialog(QDialog):
             self.archive_keep.setValue(v["archive_keep_backups"])
         if "messages_archive_days" in v:
             self.messages_days.setValue(v["messages_archive_days"])
+        if "usage_report" in v:
+            self.usage_report.setChecked(v["usage_report"])
         if "archivers" in v:
             self.archivers.set_logins(v["archivers"])
 
@@ -363,6 +375,7 @@ class SettingsDialog(QDialog):
         widgets = {"backup_enabled": self.backup_enabled, "backup_count": self.backup_count,
                    "ignore_patterns": self.ignore, "check_forbidden_chars": self.check_chars,
                    "archive_keep_backups": self.archive_keep, "messages_archive_days": self.messages_days,
+                   "usage_report": self.usage_report,
                    "archivers": self.archivers}
         missing_tip = ("V konfiguraci na síti zatím není – platí místní hodnota. Pro všechny ho nastavíte "
                        "tlačítkem Upravit síťovou konfiguraci.")

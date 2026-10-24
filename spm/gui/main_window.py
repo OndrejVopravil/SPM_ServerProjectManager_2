@@ -5,10 +5,11 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from html import escape as html_escape
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QEventLoop, QObject, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QKeySequence, QPalette, QShortcut
+from PySide6.QtCore import QByteArray, QEvent, QEventLoop, QObject, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QGuiApplication, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -60,7 +61,7 @@ from ..scripting.runtime import ScriptEnv, ScriptSession, clear_stale_marks
 from .comment_dialog import CommentDialog
 from .script_ui import GuiScriptUI
 from .scripts_dialog import ScriptsDialog
-from .. import archive, recycle, storage
+from .. import archive, recycle, storage, usage
 from .. import messages as msgs_mod
 from ..messages import MessageStore
 from ..users import list_users
@@ -99,6 +100,7 @@ STAR = "★"
 RECENT_COUNT = 15  # kolik naposledy otevřených projektů si pamatovat
 COMMENT_COLUMN_MAX = 300  # výchozí šířka sloupce Komentář nejvýše (zbytek je v tooltipu)
 LOCAL_NOT_DELETED = "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
+USAGE_DELAY_MS = 4000  # hlášení / kontrola nové verze až chvíli po spuštění
 FOCUS_REFRESH_MIN_GAP = 5.0  # s – při rychlém přepínání oken (Alt+Tab) neobnovovat pokaždé
 # stavový text v řádku záložek: při souběhu více činností se ukáže ta nejdůležitější
 BUSY_ORDER = ("task", "refresh", "names")
@@ -167,6 +169,34 @@ class MessagesCheck(QObject):
             self.done.emit(sources, result, errors)
         except RuntimeError:  # okno (a s ním tento objekt) mezitím zaniklo
             pass
+
+
+class UsageCheck(QObject):
+    """Hlášení používání / dotaz na novou verzi na pozadí (obyčejné vlákno Pythonu, výsledek
+    signálem v hlavním vlákně – viz MessagesCheck)."""
+
+    done = Signal(object)  # usage.UpdateInfo nebo None (server nedostupný)
+
+    def __init__(self, parent: QObject):
+        super().__init__(parent)
+        self.thread: threading.Thread | None = None
+
+    def running(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self, enabled: bool, login: str, pc: str) -> None:
+        def run() -> None:
+            info = usage.ping(enabled, login, pc, __version__)
+            try:
+                self.done.emit(info)
+            except RuntimeError:  # okno mezitím zaniklo
+                pass
+        self.thread = threading.Thread(target=run, daemon=True, name="SPM-verze")
+        self.thread.start()
+
+    def wait(self, timeout: float | None = None) -> None:
+        if self.thread is not None:
+            self.thread.join(timeout)
 
 
 class NameCheckThread(QThread):
@@ -267,6 +297,9 @@ class MainWindow(QMainWindow):
         self._message_stores: dict[str, MessageStore] = {}
         self._messages_check = MessagesCheck(self)
         self._messages_check.done.connect(self._on_messages)
+        self._usage_check = UsageCheck(self)
+        self._usage_check.done.connect(self._on_update_info)
+        self._update_info: usage.UpdateInfo | None = None
         self._messages_pending = 0
         # návrat do aplikace z jiné (klepnutí, Alt+Tab, hlavní panel) -> obnovit seznam
         QGuiApplication.instance().applicationStateChanged.connect(self._on_app_state)
@@ -368,6 +401,12 @@ class MainWindow(QMainWindow):
         self.btn_for_me.setToolTip("Otevřené poznámky pro vás – klepnutím vyberte projekt")
         self.btn_for_me.clicked.connect(lambda: self._for_me_menu())
         self.btn_for_me.hide()
+        # nová verze aplikace (odpověď serveru na denní hlášení) – klepnutím postup instalace
+        self.btn_update = QToolButton()
+        self.btn_update.setAutoRaise(True)
+        self.btn_update.setStyleSheet("QToolButton { color: #2f80ed; font-weight: bold; }")
+        self.btn_update.clicked.connect(lambda: self.show_update())
+        self.btn_update.hide()
         self.status_label = QLabel()
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.status_label.setContentsMargins(8, 0, 4, 0)
@@ -376,6 +415,7 @@ class MainWindow(QMainWindow):
         self.status_box = QWidget()
         status_lay = QHBoxLayout(self.status_box)
         status_lay.setContentsMargins(0, 0, 0, 0)
+        status_lay.addWidget(self.btn_update)
         status_lay.addWidget(self.btn_for_me)
         status_lay.addWidget(self.status_label)
 
@@ -777,6 +817,7 @@ class MainWindow(QMainWindow):
             with self.on_pane(pane):
                 if self.settings.ui.get("notes.detached" + pane.key) == "1":
                     self.toggle_notes_detached()
+        QTimer.singleShot(USAGE_DELAY_MS, self.check_usage)  # až po načtení seznamu projektů
 
     def _update_status_bar(self) -> None:
         with self.on_pane(self.active_pane):  # stavový řádek patří aktivnímu panelu
@@ -1605,6 +1646,7 @@ class MainWindow(QMainWindow):
         self.timer.stop()
         self._closing = True  # výsledky vláken na pozadí už nezobrazovat
         self._messages_check.wait(5)
+        self._usage_check.wait(1)
         if self._messages_window is not None:
             save_geometry(self.settings, "messages_window", self._messages_window)
             self._messages_window.close()
@@ -2732,6 +2774,81 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         return True
+
+    # --- hlášení používání a nová verze -------------------------------------------------
+
+    def usage_enabled(self) -> bool:
+        """Odesílat statistiku? Vypnutá u kterékoli záložky projektů (Nastavení nebo
+        spm_config.json) = neodesílá se vůbec – firma ji tak vypne pro všechny."""
+        views = [self.app_settings.view(w["id"]) for w in self.app_settings.workspaces]
+        return all(v.usage_report for v in views if not v.is_folder)
+
+    def check_usage(self, force: bool = False) -> None:
+        """Jednou denně na pozadí: hlášení (nebo jen dotaz na verzi) a upozornění na novou
+        verzi. Odpověď z dnešního dne se použije znovu (i po restartu)."""
+        if self._closing or self._usage_check.running():
+            return
+        today = time.strftime("%Y-%m-%d")
+        if not force and self.settings.ui.get("usage.last") == today:
+            try:
+                cached = json.loads(self.settings.ui.get("update.info") or "null")
+                if isinstance(cached, dict):
+                    self._on_update_info(usage.UpdateInfo(**cached), store=False)
+            except (ValueError, TypeError):
+                pass
+            return
+        self._usage_check.start(self.usage_enabled(), self.pm.user, self.pm.pc)
+
+    def _on_update_info(self, info, store: bool = True) -> None:
+        if self._closing or info is None:
+            return
+        if store:
+            self.settings.ui["usage.last"] = time.strftime("%Y-%m-%d")
+            self.settings.ui["update.info"] = json.dumps({"latest": info.latest, "url": info.url,
+                                                          "notes": info.notes})
+        newer = usage.is_newer(info.latest, __version__) and self.settings.ui.get("update.skip") != info.latest
+        self._update_info = info if newer else None
+        self.btn_update.setVisible(newer)
+        if not newer:
+            return
+        self.btn_update.setText(f"Nová verze {info.latest}")
+        self.btn_update.setToolTip(f"K dispozici je SPM {info.latest} (máte {__version__}) – klepnutím "
+                                   "zobrazíte, co je nového a jak ji nainstalovat")
+        if self.settings.ui.get("update.notified") != info.latest:  # dialog jen jednou za verzi
+            self.settings.ui["update.notified"] = info.latest
+            QTimer.singleShot(0, self.show_update)
+
+    def show_update(self) -> str:
+        """Okno nové verze: co je nového, odkaz ke stažení a postup instalace podle místa,
+        odkud SPM běží. Vrací volbu ("download" / "later" / "skip")."""
+        info = self._update_info
+        if info is None or QApplication.activeModalWidget() is not None:
+            return ""
+        steps = usage.install_steps(usage.app_folder(), info.latest)
+        notes = "".join(f"<li>{html_escape(line)}</li>" for line in info.notes.splitlines() if line.strip())
+        text = (f"<p>K dispozici je <b>SPM {html_escape(info.latest)}</b> (máte {__version__}).</p>"
+                + (f"<p><b>Co je nového:</b></p><ul>{notes}</ul>" if notes else "")
+                + f'<p><b>Stažení:</b> <a href="{html_escape(info.url)}">{html_escape(info.url)}</a></p>'
+                + "<p><b>Instalace:</b></p><ol>" + "".join(f"<li>{html_escape(s)}</li>" for s in steps) + "</ol>")
+        box = QMessageBox(QMessageBox.Icon.Information, "Nová verze SPM", text, parent=self)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        box.setStyleSheet("QLabel#qt_msgbox_label { min-width: 520px; }")  # odkaz a postup na méně řádků
+        download = box.addButton("Stáhnout", QMessageBox.ButtonRole.AcceptRole)
+        later = box.addButton("Připomenout později", QMessageBox.ButtonRole.RejectRole)
+        skip = box.addButton("Tuto verzi přeskočit", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(download)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is download:
+            QDesktopServices.openUrl(QUrl(info.url))
+            return "download"
+        if clicked is skip:
+            self.settings.ui["update.skip"] = info.latest
+            self._update_info = None
+            self.btn_update.hide()
+            return "skip"
+        return "later" if clicked is later else ""
 
     def open_notes(self, name: str | None = None) -> NotesPanel | None:
         """Zobrazí poznámky projektu (záložku vedle stromu, nebo odpojené okno)."""

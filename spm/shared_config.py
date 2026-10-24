@@ -27,7 +27,7 @@ FORMAT_KEY = "spm_config"
 FORMAT = 1
 # Nastavení řízená společnou konfigurací (ostatní zůstávají vždy místní)
 SHARED_FIELDS = ("backup_enabled", "backup_count", "ignore_patterns", "check_forbidden_chars",
-                 "archive_keep_backups", "archivers", "messages_archive_days")
+                 "archive_keep_backups", "archivers", "messages_archive_days", "usage_report")
 LIST_FIELDS = ("ignore_patterns", "archivers")
 SERVER_ID, SERVER_NAME = "server_id", "server_name"
 OBSOLETE_KEYS = ("mirror_rules", "archive_root")  # dřívější nastavení – při uložení se ze souboru odstraní
@@ -82,7 +82,7 @@ def parse(text: str) -> dict:
     if not isinstance(data, dict):
         raise SharedConfigError("Soubor musí obsahovat objekt { … }.")
     values: dict = {}
-    for key in ("backup_enabled", "check_forbidden_chars"):
+    for key in ("backup_enabled", "check_forbidden_chars", "usage_report"):
         if key in data:
             if not isinstance(data[key], bool):
                 raise SharedConfigError(f"{key}: očekává se true nebo false.")

@@ -32,3 +32,13 @@ def _name_dialog_via_get_text(monkeypatch):
     monkeypatch.setattr(name_dialog, "ask_text", lambda parent, title, label, text="", suggestions=():
                         QInputDialog.getText(parent, title, label, QLineEdit.EchoMode.Normal, text))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_usage_network(monkeypatch):
+    """Testy nikdy neposílají hlášení na skutečný server (spm.vopravil.cz)."""
+    from spm import usage
+    if not hasattr(usage, "real_ping"):
+        usage.real_ping = usage.ping
+    monkeypatch.setattr(usage, "ping", lambda *a, **k: None)
+    yield
