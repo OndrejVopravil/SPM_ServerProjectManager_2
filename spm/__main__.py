@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from .config import AppSettings
 from .gui.app_icon import app_icon
 from .gui.main_window import MainWindow
+from .gui.project_tree import forget_clipboard
 from .gui.style import AppStyle
 
 
@@ -41,6 +42,7 @@ def main() -> int:
     app.setWindowIcon(app_icon())  # všechna okna aplikace
     app.setStyle(AppStyle(app.style().name()))
     sys.excepthook = _show_unhandled
+    app.aboutToQuit.connect(forget_clipboard)  # soubory zkopírované v SPM po zavření nevložit
     window = MainWindow(AppSettings.load())
     window.show()
     return app.exec()

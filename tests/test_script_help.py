@@ -128,3 +128,64 @@ def test_shift_tab_spaces_and_single_line(qapp):
     assert ed.toPlainText() == "SET a = 1\nB"
     key(ed, Qt.Key.Key_Tab)                                  # bez výběru = běžný tabulátor
     assert ed.toPlainText() == "\tSET a = 1\nB"
+
+
+# --- hledání v editoru a zvýraznění stejného textu ------------------------------------------
+
+SCRIPT = "SET cil = \"Výkresy\"\nCOPY FILES TO {cil}\nLOG \"vykresy hotové\"\nLOG {cil}\n"
+
+
+def test_editor_search_bar(qapp):
+    from spm.gui.script_help import EditorSearchBar, ScriptEditor
+    ed = ScriptEditor()
+    ed.setPlainText(SCRIPT)
+    bar = EditorSearchBar(ed)
+    bar.field.setText("vykresy")                                   # bez diakritiky a velikosti
+    assert len(ed.search_matches) == 2 and bar.count.text() == "1 z 2"
+    assert ed.textCursor().selectedText() == "Výkresy"             # skočí na první
+    bar.step(1)
+    assert bar.count.text() == "2 z 2" and ed.textCursor().selectedText() == "vykresy"
+    bar.step(1)
+    assert bar.count.text() == "1 z 2"                              # dokola
+    bar.step(-1)
+    assert bar.count.text() == "2 z 2"
+    found = [s for s in ed.extraSelections() if s.format.background().color().name() in ("#fff176", "#ffa726")]
+    assert len(found) == 2
+    bar.field.setText("neexistuje")
+    assert bar.count.text() == "nenalezeno" and not bar.btn_next.isEnabled()
+    bar.field.clear()
+    assert ed.search_matches == [] and bar.count.text() == ""
+    # Ctrl+F: označený text se vezme jako hledaný
+    cursor = ed.textCursor()
+    cursor.setPosition(SCRIPT.index("COPY"))
+    cursor.setPosition(SCRIPT.index("COPY") + 4, cursor.MoveMode.KeepAnchor)
+    ed.setTextCursor(cursor)
+    bar.start()
+    assert bar.field.text() == "COPY" and len(ed.search_matches) == 1
+    # úprava textu – výskyty se přepočítají
+    ed.appendPlainText("COPY FILES TO \"x\"")
+    assert len(ed.search_matches) == 2
+
+
+def test_selection_highlights_same_text(qapp):
+    from spm.gui.script_help import ScriptEditor
+    ed = ScriptEditor()
+    ed.setPlainText(SCRIPT)
+    cursor = ed.textCursor()
+    start = SCRIPT.index("{cil}")
+    cursor.setPosition(start + 1)
+    cursor.setPosition(start + 4, cursor.MoveMode.KeepAnchor)         # „cil“
+    ed.setTextCursor(cursor)
+    assert ed.occurrences == [(4, 7), (SCRIPT.rindex("{cil}") + 1, SCRIPT.rindex("{cil}") + 4)]
+    assert len(ed.extraSelections()) == 2                              # označený se nepodbarví znovu
+    cursor.setPosition(start + 1)
+    cursor.setPosition(start + 2, cursor.MoveMode.KeepAnchor)         # 1 znak – nic
+    ed.setTextCursor(cursor)
+    assert ed.occurrences == []
+    cursor.setPosition(0)
+    cursor.setPosition(SCRIPT.index("COPY") + 2, cursor.MoveMode.KeepAnchor)   # přes víc řádků – nic
+    ed.setTextCursor(cursor)
+    assert ed.occurrences == []
+    cursor.clearSelection()
+    ed.setTextCursor(cursor)
+    assert ed.occurrences == [] and ed.extraSelections() == []

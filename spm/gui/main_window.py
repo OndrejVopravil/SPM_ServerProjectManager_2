@@ -5,6 +5,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 
@@ -15,12 +16,16 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -51,7 +56,9 @@ from ..sync import (
     UploadPlan,
     PublishResult,
     UploadResult,
+    OLD_COPY_DAYS,
     has_script_changes,
+    old_local_copy,
     selection_files,
     validate_project_name,
 )
@@ -74,7 +81,7 @@ from .file_select_dialog import FileSelectDialog
 from .file_history_dialog import FileHistoryDialog
 from .project_panel import ProjectPanel
 from .publish_dialog import PublishDialog
-from . import name_dialog
+from . import name_dialog, selection_style
 from .archive_dialog import ArchiveListDialog, ArchiveProjectDialog
 from .messages_window import MessagesWindow, Source, news as messages_news
 from .storage_dialog import StorageDialog
@@ -100,6 +107,10 @@ STAR = "★"
 RECENT_COUNT = 15  # kolik naposledy otevřených projektů si pamatovat
 COMMENT_COLUMN_MAX = 300  # výchozí šířka sloupce Komentář nejvýše (zbytek je v tooltipu)
 LOCAL_NOT_DELETED = "\n\nMístní kopii se nepodařilo celou smazat (některý soubor je otevřen)."
+# stav rozhraní, který si pamatuje každá záložka zvlášť (<klíč>.<id záložky>) – viz _ui_key
+WORKSPACE_UI_KEYS = ("favorites", "recent", "last_project", "activated", "activated_names")
+STALE_ACTIVATION_DAYS = 30  # aktivace starší = zvýraznit (mohla zůstat opuštěná – odešel PC, člověk…)
+COLOR_STALE = QColor("#d35400")
 USAGE_DELAY_MS = 4000  # hlášení / kontrola nové verze až chvíli po spuštění
 FOCUS_REFRESH_MIN_GAP = 5.0  # s – při rychlém přepínání oken (Alt+Tab) neobnovovat pokaždé
 # stavový text v řádku záložek: při souběhu více činností se ukáže ta nejdůležitější
@@ -125,6 +136,15 @@ class ProjectListThread(QThread):
             self.done.emit(self.pm.list_projects(), "")
         except Exception as e:  # noqa: BLE001 – tiché obnovení chybu nehlásí
             self.done.emit(None, str(e) or type(e).__name__)
+
+
+def activation_age_days(since: str, now: datetime | None = None) -> int | None:
+    """Stáří aktivace ve dnech (since = „2026-08-01 08:15:00“); None = neznámé."""
+    try:
+        start = datetime.fromisoformat(since.strip())
+    except ValueError:
+        return None
+    return ((now or datetime.now()) - start).days
 
 
 class MessagesCheck(QObject):
@@ -407,6 +427,11 @@ class MainWindow(QMainWindow):
         self.btn_update.setStyleSheet("QToolButton { color: #2f80ed; font-weight: bold; }")
         self.btn_update.clicked.connect(lambda: self.show_update())
         self.btn_update.hide()
+        # staré odsunuté / obnovené místní složky (<projekt>_puvodni_ / _obnova_<datum>) – úklid
+        self.btn_old_copies = QToolButton()
+        self.btn_old_copies.setAutoRaise(True)
+        self.btn_old_copies.clicked.connect(lambda: self.clean_old_copies())
+        self.btn_old_copies.hide()
         self.status_label = QLabel()
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.status_label.setContentsMargins(8, 0, 4, 0)
@@ -416,6 +441,7 @@ class MainWindow(QMainWindow):
         status_lay = QHBoxLayout(self.status_box)
         status_lay.setContentsMargins(0, 0, 0, 0)
         status_lay.addWidget(self.btn_update)
+        status_lay.addWidget(self.btn_old_copies)
         status_lay.addWidget(self.btn_for_me)
         status_lay.addWidget(self.status_label)
 
@@ -581,6 +607,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         self.table.setWordWrap(False)
         self.table.horizontalHeader().setStretchLastSection(True)
+        selection_style.install(self.table)  # výraznější označení vybraného projektu
         # šířky sloupců: uložené od minula, jinak se jednou nastaví podle obsahu
         self._columns_sized = restore_header(settings, HEADER_KEY + pane.key, self.table.horizontalHeader())
         self.table.itemSelectionChanged.connect(self._in(pane, self._on_selection))
@@ -614,7 +641,9 @@ class MainWindow(QMainWindow):
         self.panel.modified.connect(self._in(pane, self._on_panel_modified))
         self.panel.tree.itemSelectionChanged.connect(self._in(pane, self._on_tree_selection))
         self.panel.tree.itemClicked.connect(self._in(pane, self._on_tree_click))
-        self.panel.can_activate = lambda: self.act_activate.isEnabled()
+        # lze projekt tohoto panelu aktivovat? – podle panelu stromu, ne podle lišty (ta patří
+        # aktivnímu panelu: při tažení z jednoho panelu do druhého je aktivní ten zdrojový)
+        self.panel.can_activate = self._in(pane, lambda: self._can_activate_selected())
         self.panel.quick_activate = self._in(pane, lambda: self.quick_activate())
         self.panel.mirror_source_label = self.mirror_source_label
         self.panel.mirror_target_label = self.mirror_target_label
@@ -785,6 +814,8 @@ class MainWindow(QMainWindow):
         self._update_actions()
         self._update_for_me()
         self._update_status_bar()
+        self._follow_messages_source()
+        self._update_old_copies()
 
     def _action(self, tb: QToolBar, text: str, slot, shortcut=None, tip: str = "") -> QAction:
         act = QAction(text, self)
@@ -799,6 +830,7 @@ class MainWindow(QMainWindow):
     def _startup(self) -> None:
         if self._closing:  # okno zavřené dřív, než se stihlo spustit
             return
+        self._prune_removed_workspaces()
         if self.dual:  # až po prvním rozvržení okna
             with self.on_pane(self.panes[0]):
                 self._sync_splitters()
@@ -915,6 +947,38 @@ class MainWindow(QMainWindow):
         return changed
 
     # --- záložky (pracovní prostory) --------------------------------------------
+
+    def _prune_ui(self) -> None:
+        """Tichý úklid nastavení po úspěšném načtení seznamu projektů: zapomenout projekty,
+        které v síťové složce už nejsou (viděné poznámky, oblíbené, naposledy otevřené).
+        Při prázdném seznamu nebo nedostupné síti se nic nemaže."""
+        names = {p.name.lower() for p in self.projects}
+        if not names or not self.pm.server_root.is_dir():
+            return
+        ui = self.settings.ui
+        prefix = f"notes_seen.{self.settings.workspace_id}."
+        for key in [k for k in ui if k.startswith(prefix) and k[len(prefix):].lower() not in names]:
+            del ui[key]
+        for key in ("favorites", "recent"):
+            value = ui.get(self._ui_key(key))
+            if value:
+                kept = [n for n in value.split("\n") if n and n.lower() in names]
+                if len(kept) != len([n for n in value.split("\n") if n]):
+                    ui[self._ui_key(key)] = "\n".join(kept)
+
+    def _prune_removed_workspaces(self) -> None:
+        """Při spuštění: zapomenout stav rozhraní záložek, které už neexistují."""
+        ids = {w["id"] for w in self.app_settings.workspaces}
+        ui = self.app_settings.base.ui
+        for key in list(ui):
+            if key.startswith("notes_seen."):
+                ws = key.split(".", 2)[1]
+            elif key.rsplit(".", 1)[0] in WORKSPACE_UI_KEYS and "." in key:
+                ws = key.rsplit(".", 1)[1]
+            else:
+                continue
+            if ws not in ids:
+                del ui[key]
 
     def _ui_key(self, key: str) -> str:
         """Klíč stavu rozhraní, který si pamatuje každá záložka zvlášť (např. poslední projekt)."""
@@ -1034,6 +1098,7 @@ class MainWindow(QMainWindow):
             self.refresh()
         else:
             self._update_config_label()
+        self._follow_messages_source()
 
     def _show_page(self) -> None:
         """Záložka projektů, nebo záložka „Složka“ (obyčejná složka mimo spolupráci)."""
@@ -1304,6 +1369,8 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
             self.set_busy("refresh", None)
         self._refreshed(error)
+        if not error:
+            self._prune_ui()
 
         self._render(current)
         self._update_tab_label()
@@ -1340,6 +1407,7 @@ class MainWindow(QMainWindow):
         self._refreshed()
         current = self.selected().name if self.selected() else self.settings.ui.get(self._ui_key("last_project"))
         self.projects = projects
+        self._prune_ui()
         self._render(current)
         self._update_tab_label()
         if check_names:
@@ -1395,6 +1463,77 @@ class MainWindow(QMainWindow):
     def issues_of(self, p: ProjectStatus | None) -> list[str]:
         return self.name_issues.get(p.name, []) if p and not p.mine else []
 
+    # --- staré místní složky ------------------------------------------------------------
+
+    def old_copies(self) -> list[tuple[str, str, datetime]]:
+        """Odsunuté / obnovené místní složky aktivního panelu starší než OLD_COPY_DAYS dní:
+        (název, druh, datum z názvu)."""
+        pane = self.active_pane
+        if pane.settings.is_folder:
+            return []
+        found = []
+        for p in pane.projects:
+            if p.local_only:
+                old = old_local_copy(p.name)
+                if old is not None:
+                    found.append((p.name, *old))
+        return sorted(found, key=lambda x: x[2])
+
+    def _update_old_copies(self) -> None:
+        if not hasattr(self, "btn_old_copies"):
+            return
+        old = self.old_copies()
+        self.btn_old_copies.setVisible(bool(old))
+        self.btn_old_copies.setText(f"Staré místní složky ({len(old)})")
+        self.btn_old_copies.setToolTip(
+            f"Složky odsunuté při aktivaci (_puvodni_) nebo obnovené ze zálohy (_obnova_) starší než "
+            f"{OLD_COPY_DAYS} dní – klepnutím je můžete přesunout do Koše")
+
+    def clean_old_copies(self) -> int:
+        """Okno se starými místními složkami: zaškrtnuté se přesunou do Koše (lze je z něj vrátit).
+        Vrací počet přesunutých."""
+        old = self.old_copies()
+        if not old:
+            return 0
+        local_root = self.active_pane.pm.local_root
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Staré místní složky")
+        dlg.setMinimumSize(560, 320)
+        info = QLabel(f"Tyto složky vznikly v místním úložišti {local_root} při aktivaci projektu "
+                      "(původní místní kopie se odsunula) nebo obnovou ze zálohy a jsou starší než "
+                      f"{OLD_COPY_DAYS} dní. Zaškrtnuté se přesunou do Koše – odtud je případně vrátíte.")
+        info.setWordWrap(True)
+        rows = QListWidget()
+        for name, kind, when in old:
+            item = QListWidgetItem(f"{name} – {kind}, {when.day}. {when.month}. {when.year}")
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setToolTip(str(local_root / name))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            rows.addItem(item)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Přesunout do Koše")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(info)
+        lay.addWidget(rows)
+        lay.addWidget(buttons)
+        accepted = self._exec_dialog(dlg, "old_copies")
+        names = [rows.item(i).data(Qt.ItemDataRole.UserRole) for i in range(rows.count())
+                 if rows.item(i).checkState() == Qt.CheckState.Checked]
+        dlg.deleteLater()
+        if not accepted or not names:
+            return 0
+        try:
+            recycle.to_recycle_bin([local_root / n for n in names])
+        except OSError as e:
+            QMessageBox.warning(self, "Staré místní složky", str(e))
+        with self.on_pane(self.active_pane):
+            self.refresh(check_names=False)
+        return len(names)
+
     def _render(self, current: str | None) -> None:
         # při překreslení celého seznamu jsou data čerstvá – výběr řádku nemá nic znovu načítat
         self._rendering = True
@@ -1410,13 +1549,14 @@ class MainWindow(QMainWindow):
             self.table.resizeColumnsToContents()
             self.table.setColumnWidth(COL_NAME, max(self.table.columnWidth(COL_NAME), 250))
             # i pro texty, které se objeví až později („Aktivováno mnou“, datum a čas)
-            for col, width in ((COL_STATE, 130), (COL_USERS, 110), (COL_SINCE, 140)):
+            for col, width in ((COL_STATE, 130), (COL_USERS, 110), (COL_SINCE, 175)):
                 self.table.setColumnWidth(col, max(self.table.columnWidth(col), width))
             self.table.setColumnWidth(COL_COMMENT, min(max(self.table.columnWidth(COL_COMMENT), 150),
                                                        COMMENT_COLUMN_MAX))
             self._columns_sized = True
         self._apply_filter()
         self._update_for_me()
+        self._update_old_copies()
 
     def _render_row(self, r: int, p: ProjectStatus) -> None:
         issues = self.issues_of(p)
@@ -1432,6 +1572,10 @@ class MainWindow(QMainWindow):
             state = "Volný"
         names = ["já" if not any(u is o for o in p.others) else u.user for u in p.users]
         since = min((u.since for u in p.users), default="").replace("T", " ")
+        stale_days = activation_age_days(since)
+        stale = stale_days is not None and stale_days > STALE_ACTIVATION_DAYS
+        if stale:
+            since += f" · {stale_days} dní"
         comment = p.comment.first_line + (" …" if "\n" in p.comment.text else "") if p.comment else ""
         shown_name = f"{STAR} {p.name}" if p.name in self.favorites() else p.name
         values = [shown_name, comment, state, ", ".join(names), since, "ano" if p.local_exists else ""]
@@ -1460,6 +1604,11 @@ class MainWindow(QMainWindow):
                     item.setToolTip("Bez komentáře – upravíte dvojklikem nebo v nabídce pravého tlačítka.")
             elif tip:
                 item.setToolTip(tip)
+            if c == COL_SINCE and stale:  # opuštěná aktivace? – jen tento sloupec, decentně
+                item.setForeground(COLOR_STALE)
+                item.setToolTip(f"Projekt je aktivovaný déle než {STALE_ACTIVATION_DAYS} dní. Zkontrolujte, zda "
+                                "na něm ještě někdo pracuje – zámky po odchodu kolegy nebo výměně "
+                                "počítače uvolníte pravým tlačítkem: Odebrat zámky uživatele…")
             if c == COL_NAME and p.script_pending:
                 item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxWarning))
                 item.setToolTip((item.toolTip() + "\n\n" if item.toolTip() else "")
@@ -1684,13 +1833,19 @@ class MainWindow(QMainWindow):
         save_geometry(self.settings, key, dlg)
         return accepted
 
+    def _can_activate_selected(self) -> bool:
+        """Lze vybraný projekt aktuálního panelu aktivovat (na serveru, ne můj, bez nepovolených
+        znaků)?"""
+        p = self.selected()
+        return bool(p and not p.mine and not p.local_only and not self.issues_of(p))
+
     def _update_actions(self) -> None:
         if self.pane is not self.active_pane:
             return  # lišta patří aktivnímu panelu
         p = self.selected()
         issues = bool(self.issues_of(p))
         mine = bool(p and p.mine)
-        self.act_activate.setEnabled(bool(p and not p.mine and not p.local_only and not issues))
+        self.act_activate.setEnabled(self._can_activate_selected())
         for act in (self.act_submit, self.act_update, self.act_take, self.act_deactivate, self.act_cancel):
             act.setEnabled(mine)
         # i se soubory s nepovolenými znaky – dialog je nedovolí vybrat, zbytek publikovat lze
@@ -2545,20 +2700,29 @@ class MainWindow(QMainWindow):
         if self.settings.is_folder or not self.settings.is_complete():
             return
 
-        def show(infos) -> None:
-            if not infos:
+        def show(result) -> None:
+            infos, leftovers, problems = result if isinstance(result, tuple) else (result, [], [])
+            if not infos and not leftovers and not problems:
                 QMessageBox.information(self, "Zálohy a koš", "V síťové složce nejsou žádné projekty.")
                 return
             dlg = StorageDialog(self.pm.server_root, infos, self.pm.user, self.pm.pc,
                                 self.settings.backup_count, self,
-                                clean_problem=archive.cleanup_problem(self.settings, self.pm.user))
+                                clean_problem=archive.cleanup_problem(self.settings, self.pm.user),
+                                leftovers=leftovers, leftover_problems=problems)
             self._exec_dialog(dlg, "storage")
             dlg.deleteLater()
 
         if whole_server:
-            run_task(self, "Zálohy a koš na serveru", lambda progress=None:
-                     storage.server_storage(self.pm.server_root, progress),
-                     status_text="Procházím zálohy…", on_done=show)
+            def scan(progress=None):
+                infos = storage.server_storage(self.pm.server_root, progress)
+                problems: list[str] = []
+                try:  # zbytky operací jsou doplněk – jejich chyba nesmí zablokovat přehled záloh
+                    found = storage.leftovers(self.pm.server_root, problems=problems)
+                except Exception as e:  # noqa: BLE001
+                    found, problems = [], [f"Zbytky se nepodařilo zjistit: {e}"]
+                return infos, found, problems
+
+            run_task(self, "Zálohy a koš na serveru", scan, status_text="Procházím zálohy…", on_done=show)
             return
         p = self.selected()
         if not p or p.local_only:
@@ -2693,9 +2857,20 @@ class MainWindow(QMainWindow):
             self._messages_window = w
         return self._messages_window
 
+    def _follow_messages_source(self) -> None:
+        """Okno Vzkazy: síťová složka pro nový vzkaz podle aktivního panelu a jeho záložky
+        (záložka Složka nemá síťovou složku s projekty – výběr zůstane)."""
+        w = getattr(self, "_messages_window", None)  # (i během sestavování okna)
+        if w is None or getattr(self, "_closing", False):
+            return
+        view = self.active_pane.settings
+        if not view.is_folder and view.server_root.strip():
+            w.follow_server(view.server_root)
+
     def open_messages(self) -> MessagesWindow:
         w = self.messages_window()
         w.reload()
+        self._follow_messages_source()
         w.show_messages()
         self._messages_pending = 0
         self._update_messages_button()
@@ -2733,7 +2908,9 @@ class MainWindow(QMainWindow):
         if not self._messages_pending or self._closing or QApplication.activeModalWidget() is not None:
             return
         count, self._messages_pending = self._messages_pending, 0
-        self.messages_window().show_messages(new_count=count)
+        self.messages_window()
+        self._follow_messages_source()
+        self._messages_window.show_messages(new_count=count)
         self._update_messages_button()
 
     def _update_messages_button(self) -> None:

@@ -14,6 +14,7 @@ Do balíku s aplikací (`SPM.exe`) se nedává.
 | `lib.php` | Databáze (SQLite) a zápis hlášení. |
 | `data/` | Databáze `spm_usage.sqlite` (vznikne sama). Přístup z webu zakazuje `data/.htaccess`. |
 | `download/` | Balíky `SPM-<verze>.zip` ke stažení. |
+| `favicon.ico`, `icon-*.png`, `apple-touch-icon.png` | Ikona aplikace pro web (favicona, telefony, nadpis stránky). Vyrábí je `tools\make_icon.py --web` ze stejné kresby jako ikonu SPM.exe. |
 
 ## Nasazení
 

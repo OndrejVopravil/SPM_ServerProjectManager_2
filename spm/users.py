@@ -4,6 +4,12 @@ Aplikace v něm při spuštění zaregistruje svého uživatele (Windows login, 
 celé jméno z Windows, poslední počítač, verze SPM). Slouží k výběru adresáta poznámky – nabídnou se
 všichni, kdo kdy aplikaci s touto síťovou složkou spustili, nejen ti, kdo v projektu pracovali.
 Uživatel se pozná podle loginu (bez ohledu na velikost písmen), ne podle počítače.
+
+Kdo SPM nespustil INACTIVE_DAYS dní, je „neaktivní“ – v nabídkách je na konci a zašedlý (např.
+dovolená, občasný uživatel – adresovat mu lze dál). Záznamy uživatelů, kteří SPM nespustili
+DELETE_DAYS dní (odešli z firmy, přejmenovaný login), se samy mažou (purge – kterýkoli klient,
+nejvýš jednou denně). Smazání nic nerozbije: poznámky a vzkazy mají uložené jméno a záznam se
+při dalším spuštění SPM vytvoří znovu.
 """
 
 from __future__ import annotations
@@ -11,12 +17,16 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .lock import now_iso
 from .scanner import TEMP_SUFFIX
 
 USERS_DIR = ".spm_users"  # tečka na začátku = v seznamu projektů se nezobrazí
+INACTIVE_DAYS = 30   # bez spuštění SPM déle = neaktivní (v nabídkách na konci, zašedlý)
+DELETE_DAYS = 365    # bez spuštění SPM déle = záznam se smaže
+_purged_on: dict[str, str] = {}  # síťová složka -> den posledního úklidu (nejvýš jednou denně)
 
 
 @dataclass
@@ -27,6 +37,17 @@ class UserInfo:
     pc: str = ""
     seen: str = ""
     version: str = ""    # verze SPM, se kterou uživatel naposledy pracoval ("" = starší než 0.1.22)
+
+    def inactive(self, now: datetime | None = None) -> bool:
+        """SPM nespustil INACTIVE_DAYS dní (neznámé datum = aktivní)."""
+        seen = _parse(self.seen)
+        return seen is not None and seen < (now or datetime.now()) - timedelta(days=INACTIVE_DAYS)
+
+    @property
+    def seen_label(self) -> str:
+        """„neaktivní od 3. 9. 2026“ (pro popisek v nabídkách)."""
+        seen = _parse(self.seen)
+        return f"neaktivní od {seen.day}. {seen.month}. {seen.year}" if seen else "neaktivní"
 
     @property
     def short(self) -> str:
@@ -54,6 +75,44 @@ class Names:
     def person(self, login: str, stored: str = "") -> str:
         u = self._users.get((login or "").lower())
         return u.display if u else (stored or login)
+
+
+def _parse(iso: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(iso) if iso else None
+    except ValueError:
+        return None
+
+
+def active_first(users: list[UserInfo], now: datetime | None = None) -> list[UserInfo]:
+    """Aktivní uživatelé, za nimi neaktivní (každá skupina podle jména)."""
+    return sorted(users, key=lambda u: (u.inactive(now), u.display.lower()))
+
+
+def purge(server_root: Path, now: datetime | None = None) -> list[str]:
+    """Smaže záznamy uživatelů, kteří SPM nespustili DELETE_DAYS dní. Nejvýš jednou denně za
+    síťovou složku; chyby (síť, právo zápisu) se tiše přeskočí. Vrací smazané loginy."""
+    now = now or datetime.now()
+    key = str(Path(server_root)).lower()
+    if _purged_on.get(key) == now.strftime("%Y-%m-%d"):
+        return []
+    _purged_on[key] = now.strftime("%Y-%m-%d")
+    limit = now - timedelta(days=DELETE_DAYS)
+    removed = []
+    try:
+        files = list(users_dir(server_root).glob("*.json"))
+    except OSError:
+        return []
+    for f in files:
+        user = read_user(f)
+        seen = _parse(user.seen) if user else None
+        if user is not None and seen is not None and seen < limit:
+            try:
+                f.unlink()
+                removed.append(user.login)
+            except OSError:
+                pass
+    return removed
 
 
 def display_name(nickname: str, full_name: str, login: str) -> str:
@@ -100,11 +159,12 @@ def read_user(path: Path) -> UserInfo | None:
 
 
 def list_users(server_root: Path) -> list[UserInfo]:
-    """Všichni registrovaní uživatelé síťové složky (seřazení podle zobrazovaného jména)."""
+    """Všichni registrovaní uživatelé síťové složky – aktivní, za nimi neaktivní (každá skupina
+    podle zobrazovaného jména)."""
     folder = users_dir(server_root)
     try:
         files = list(folder.glob("*.json"))
     except OSError:
         return []
     users = [u for u in (read_user(f) for f in files) if u is not None]
-    return sorted(users, key=lambda u: u.display.lower())
+    return active_first(users)

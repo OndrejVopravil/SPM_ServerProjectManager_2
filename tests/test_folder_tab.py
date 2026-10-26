@@ -49,7 +49,11 @@ def folder(tmp_path):
     write(data / "podklady" / "a.pdf", "a")
     p = FolderPanel()
     p.set_root(str(data), "ws-data")
-    return p, data
+    yield p, data
+    # okno bez rodiče smazat hned (ne až sběrem paměti uprostřed jiného testu)
+    import shiboken6
+    p.close()
+    shiboken6.delete(p)
 
 
 # --- nastavení ---------------------------------------------------------------------
@@ -237,3 +241,40 @@ def test_keep_both_on_name_clash(folder, clip, tmp_path, monkeypatch):
     assert (data / "podklady" / "a.pdf").read_text() == "a"               # složka se nesloučila
     assert (data / "podklady_copy" / "a.pdf").read_text() == "novy a"
     assert done
+
+
+def test_drag_over_folder_highlights_target(panel, env, folder):
+    """Tažení do záložky Složka (z projektu i odjinud): označí se složka pod myší, nad souborem
+    jeho složka, mimo položky kořen. Soubory projektu se kvůli tomu nepřipravují."""
+    import time
+
+    from PySide6.QtCore import QModelIndex, Qt
+    from PySide6.QtGui import QDragEnterEvent, QDragLeaveEvent, QDragMoveEvent
+    from PySide6.QtWidgets import QApplication
+    p, data = folder
+    tree = p.tree
+    p.resize(500, 300)
+    p.show()
+    deadline = time.time() + 5
+    while tree.model().rowCount(tree.rootIndex()) < 2 and time.time() < deadline:
+        QApplication.processEvents()
+    mime = panel.drag_mime(["dily/deska.elt"])
+
+    def drag_at(path):
+        pos = tree.visualRect(p.model.index(str(path))).center() if path else tree.viewport().rect().bottomLeft()
+        enter = QDragEnterEvent(pos, Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
+                                Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(tree.viewport(), enter)
+        move = QDragMoveEvent(pos, Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
+                              Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(tree.viewport(), move)
+        assert enter.isAccepted() and move.isAccepted() and tree._drop_active
+        index = QModelIndex(tree._drop_index)
+        return p.path_of(index) if index.isValid() else None
+
+    assert drag_at(data / "podklady") == data / "podklady"         # složka pod myší
+    assert drag_at(data / "vykres.dwg") is None                     # soubor v kořeni -> kořen
+    assert drag_at(None) is None                                    # prázdné místo -> kořen
+    QApplication.sendEvent(tree.viewport(), QDragLeaveEvent())
+    assert not tree._drop_active
+    assert not mime.rendered()                                      # nic se nepřipravilo

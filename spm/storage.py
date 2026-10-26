@@ -54,13 +54,18 @@ class CleanupPlan:
         return sum(size for _, size, _ in self.remove)
 
 
-def _files(folder: Path):
-    for dirpath, _dirs, names in os.walk(folder):
+def _files(folder: Path, errors: list[OSError] | None = None):
+    """Soubory složky s údaji (stat). Nečitelné podsložky a soubory se přeskočí; je-li zadáno
+    errors, přidají se do něj jejich chyby."""
+    onerror = errors.append if errors is not None else None
+    for dirpath, _dirs, names in os.walk(folder, onerror=onerror):
         for n in names:
             p = Path(dirpath) / n
             try:
                 yield p, p.stat()
-            except OSError:
+            except OSError as e:
+                if errors is not None:
+                    errors.append(e)
                 continue
 
 
@@ -175,3 +180,83 @@ def fmt_bytes(n: int) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}".replace(".", ",")
         n /= 1024
     return ""
+
+
+# --- zbytky nedokončených operací v síťové složce ---------------------------------------------
+
+# skryté složky v síťové složce s projekty, které po přerušené operaci zůstanou (tečka = v seznamu
+# projektů nejsou vidět): předpona -> popis
+LEFTOVER_KINDS = {
+    ".spm_restoring_": "nedokončená obnova z archivu",
+    ".spm_archived_": "zbytek archivovaného projektu (nešel celý smazat)",
+    ".spm_publish_": "nedokončené publikování",
+}
+LEFTOVER_MIN_AGE = timedelta(hours=24)  # mladší složka může patřit operaci, která právě běží
+
+
+@dataclass
+class Leftover:
+    path: Path
+    kind: str          # popis (LEFTOVER_KINDS)
+    size: int
+    files: int
+    modified: datetime
+
+
+def leftovers(server_root: Path, now: datetime | None = None,
+              problems: list[str] | None = None) -> list[Leftover]:
+    """Zbytky nedokončených operací v síťové složce – jen starší než LEFTOVER_MIN_AGE (podle
+    poslední změny čehokoliv v nich).
+
+    Složka, kterou nejde celou přečíst (právo, síť, mezitím smazaná), se přeskočí – bez úplného
+    obsahu nelze spolehlivě určit její stáří, a tedy ani nabídnout smazání. Do problems se pak
+    přidá popis pro uživatele (stejně jako když nejde projít celá síťová složka)."""
+    now = now or datetime.now()
+    problems = problems if problems is not None else []
+    result = []
+    try:
+        entries = list(os.scandir(server_root))
+    except OSError as e:
+        problems.append(f"Síťovou složku nelze projít: {e.strerror or e}")
+        return []
+    for e in entries:
+        kind = next((label for prefix, label in LEFTOVER_KINDS.items() if e.name.startswith(prefix)), None)
+        if kind is None:
+            continue
+        errors: list[OSError] = []
+        size = files = 0
+        try:
+            if not e.is_dir():
+                continue
+            latest = e.stat().st_mtime
+        except OSError as err:
+            errors.append(err)
+            latest = 0.0
+        if not errors:
+            for _p, st in _files(Path(e.path), errors):
+                size += st.st_size
+                files += 1
+                latest = max(latest, st.st_mtime)
+        if errors:
+            problems.append(f"{e.name}: nelze celou přečíst ({errors[0].strerror or errors[0]}) – přeskočeno")
+            continue
+        modified = datetime.fromtimestamp(latest)
+        if now - modified >= LEFTOVER_MIN_AGE:
+            result.append(Leftover(Path(e.path), kind, size, files, modified))
+    return sorted(result, key=lambda x: x.modified)
+
+
+def remove_leftovers(server_root: Path, items: list[Leftover]) -> list[Path]:
+    """Trvale smaže zbytky (jen skryté složky s předponou z LEFTOVER_KINDS přímo v síťové
+    složce – pojistka proti smazání čehokoliv jiného). Vrací smazané."""
+    from .scanner import rmtree
+    root = Path(server_root).resolve()
+    removed = []
+    for item in items:
+        path = Path(item.path)
+        if path.parent.resolve() != root or not path.name.startswith(tuple(LEFTOVER_KINDS)):
+            continue
+        rmtree(path)
+        if not path.exists():
+            removed.append(path)
+    return removed

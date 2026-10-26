@@ -266,3 +266,9 @@ def test_dialog_locks_settings_missing_in_older_file(qapp, server, tmp_path):
     dlg._accept()
     assert sc.probe(str(server)).values["messages_archive_days"] == 30   # doplněno do souboru
     assert s.messages_archive_days == 30
+
+
+def test_dialog_shows_support_contact(qapp, server, tmp_path):
+    s = Settings(server_root=str(server), local_root=str(tmp_path / "l"))
+    dlg = dialog(s)
+    assert 'href="mailto:ondrej@vopravil.cz"' in dlg.support.text() and dlg.support.openExternalLinks()

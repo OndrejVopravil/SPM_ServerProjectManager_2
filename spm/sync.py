@@ -71,13 +71,34 @@ STATUS_WORKERS = 16
 
 
 # Složky, do kterých aktivace odkládá dřívější místní kopii (viz activate) – nejsou to projekty.
-ORIGINAL_COPY_RE = re.compile(r"_puvodni_\d{8}_\d{6}$")
+ORIGINAL_COPY_RE = re.compile(r"_puvodni_(\d{8}_\d{6})$")  # skupina 1 = datum
 # Dočasná složka na serveru při publikování (tečka na začátku = v seznamu projektů se nezobrazí)
 PUBLISH_TMP_PREFIX = ".spm_publish_"
 
 INVALID_NAME_CHARS = set('<>:"/\\|?*')
 RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
                   *(f"lpt{i}" for i in range(1, 10))}
+
+
+OLD_COPY_DAYS = 30  # odsunuté / obnovené místní složky starší = nabídnout úklid
+
+
+def old_local_copy(name: str, now: datetime | None = None, days: int = OLD_COPY_DAYS) -> tuple[str, datetime] | None:
+    """Odsunutá (<projekt>_puvodni_<datum>) nebo obnovená (<projekt>_obnova_<datum>) místní
+    složka starší než days dní -> (druh, datum z názvu); jinak None."""
+    for pattern, kind in ((ORIGINAL_COPY_RE, "odsunutá při aktivaci"), (RESTORE_DIR_RE, "obnova ze zálohy")):
+        m = pattern.search(name)
+        if m:
+            break
+    else:
+        return None
+    try:
+        when = datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+    if (now or datetime.now()) - when <= timedelta(days=days):
+        return None
+    return kind, when
 
 
 def original_copy_path(local: Path, name: str) -> Path:
@@ -498,6 +519,7 @@ class ProjectManager:
             self._full_name = current_full_name()
         users.register(self.server_root, users.UserInfo(self.user, self.settings.nickname.strip(),
                                                         self._full_name, self.pc, version=__version__))
+        users.purge(self.server_root)  # záznamy uživatelů, kteří SPM rok nespustili (1× denně)
 
     def users(self) -> list[users.UserInfo]:
         return users.list_users(self.server_root)

@@ -163,3 +163,58 @@ def test_paste_in_same_place_duplicates_with_copy_suffix(panel, env, clip):
     assert (local / "sestava/elektrody_copy/E01.elt").exists()
     assert (local / "sestava/elektrody_copy/E02_copy.elt").exists()
     assert not (local / "sestava/elektrody/E01_copy.elt").exists()
+
+
+def test_no_temp_copies_until_another_program_asks(panel, env, clip, tmp_path):
+    """Kopírovat / tažení: dočasné kopie vzniknou až ve chvíli, kdy si o soubory řekne jiný
+    program (data text/uri-list); vložení v SPM čte soubory z původního místa."""
+    from spm.gui import project_panel
+    alice, bob, proj, src = env
+    local = alice.local_dir("Forma")
+    staging = tmp_path / "staging"
+    assert panel.copy_selected(["dily/deska.elt", "sestava/"])        # jen pro čtení + složka
+    mime = clip.mimeData()
+    assert mime.hasUrls() and not mime.rendered()                     # nabízí soubory, ale nic nekopíruje
+    assert not (tmp_path / "clip").exists()
+    (local / "dily" / "deska.elt").chmod(0o666)
+    write(local / "dily" / "deska.elt", "deska novější")             # obsah po Ctrl+C
+    panel.paste_into("dily/")                                         # Vložit v SPM
+    settle_panel(panel)
+    copied = [p for p in (local / "dily").iterdir() if p.name.startswith("deska") and p.name != "deska.elt"]
+    assert copied and copied[0].read_text(encoding="utf-8") == "deska novější"   # aktuální obsah
+    assert not mime.rendered() and not (tmp_path / "clip").exists()    # pořád žádné dočasné kopie
+    urls = [p.toLocalFile() for p in mime.urls()]                     # Průzkumník si řekne
+    assert mime.rendered() and urls and all(Path(u).is_relative_to(tmp_path / "clip") for u in urls)
+    # tažení: stejné – připraví se až při vyžádání
+    drag = panel.drag_mime(["dily/deska.elt"])
+    assert not drag.rendered() and not staging.exists()
+    assert project_panel.MIME_SOURCE in drag.formats()
+
+
+def test_spm_clipboard_forgotten_on_quit(panel, env, clip):
+    """Při ukončení SPM se schránka se soubory z SPM vyprázdní (Windows by jinak při ukončení
+    převzaly celý obsah – u odložených kopií by se teprve kopírovalo); cizí obsah zůstane."""
+    from spm.gui.project_tree import forget_clipboard
+    assert panel.copy_selected(["dily/deska.elt"])
+    mime = clip.mimeData()
+    forget_clipboard()
+    assert not mime.rendered()                                        # nic se nekopírovalo
+    assert clip.mimeData() is None or not clip.mimeData().hasUrls()
+    clip.setText("cizí text")
+    forget_clipboard()
+    assert clip.text() == "cizí text"
+
+
+def test_paste_from_removed_tab_shows_error(panel, env, clip, monkeypatch):
+    """Zdrojová záložka mezitím zmizela: vložení skončí chybovým oknem, ne pádem."""
+    from PySide6.QtWidgets import QMessageBox
+    alice = env[0]
+    shown = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: shown.append(a[2]))
+
+    def removed(ws_id):
+        raise KeyError(ws_id)
+    monkeypatch.setattr(panel, "pm_for", removed)
+    panel.drop_spm({"ws": "zrusena", "project": "Jiny"}, [("a.elt", "a.elt")], "dily/")
+    assert shown and "Jiny" in shown[0]
+    assert not (alice.local_dir("Forma") / "dily" / "a.elt").exists()

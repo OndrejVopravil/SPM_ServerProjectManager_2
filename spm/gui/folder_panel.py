@@ -12,8 +12,8 @@ import os
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QDir, QMimeData, QModelIndex, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence
+from PySide6.QtCore import QDir, QMimeData, QModelIndex, QPersistentModelIndex, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 from .. import folder_ops, recycle, zip_ops
 from ..sync import ProjectManager
 from ..folder_zones import ProtectedZones, Zone
-from . import name_dialog
+from . import name_dialog, selection_style
 from .project_tree import MIME_CLIPBOARD, clipboard_info
 
 
@@ -111,22 +111,69 @@ class FolderTree(QTreeView):
         self.viewport().setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.setDropIndicatorShown(False)  # cílovou složku zvýrazní paintEvent
+        selection_style.install(self)  # výraznější označení vybraných řádků
+        self._drop_index = QPersistentModelIndex()  # složka pod myší při tažení (neplatný = kořen)
+        self._drop_active = False
+
+    def drop_index(self, pos) -> QModelIndex:
+        """Položka cílové složky pod myší: u souboru jeho složka, mimo položky kořen (neplatný)."""
+        index = self.indexAt(pos).siblingAtColumn(0)
+        if index.isValid() and not self.model().isDir(index):
+            index = index.parent()
+        return index if index.isValid() and index != self.rootIndex() else QModelIndex()
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802 – Qt
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+            self._drop_active = True
+            self._set_drop(self.drop_index(event.position().toPoint()))
         else:
             event.ignore()
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802
         if event.mimeData().hasUrls():
+            self._set_drop(self.drop_index(event.position().toPoint()))
             event.setDropAction(Qt.DropAction.MoveAction if event.source() is self
                                 else Qt.DropAction.CopyAction)
             event.accept()
         else:
             event.ignore()
 
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._clear_drop()
+        event.accept()
+
+    def _set_drop(self, index: QModelIndex) -> None:
+        if QModelIndex(self._drop_index) != index:
+            self._drop_index = QPersistentModelIndex(index)
+            self.viewport().update()
+
+    def _clear_drop(self) -> None:
+        self._drop_active = False
+        self._drop_index = QPersistentModelIndex()
+        self.viewport().update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if not self._drop_active:
+            return
+        painter = QPainter(self.viewport())
+        pen = QPen(QColor(self.palette().highlight().color()))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        index = QModelIndex(self._drop_index)
+        if index.isValid():
+            rect = self.visualRect(index)
+            rect.setLeft(0)
+            rect.setRight(self.viewport().width() - 1)
+        else:  # kořen složky
+            rect = self.viewport().rect()
+        painter.drawRect(rect.adjusted(1, 1, -1, -1))
+        painter.end()
+
     def dropEvent(self, event) -> None:  # noqa: N802
+        self._clear_drop()
         mime = event.mimeData()
         if not mime.hasUrls():
             event.ignore()

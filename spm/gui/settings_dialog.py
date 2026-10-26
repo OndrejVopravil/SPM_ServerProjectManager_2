@@ -32,6 +32,8 @@ from ..config import AUTO_REFRESH_MIN, AUTO_REFRESH_OFF, Settings
 from .tab_bar import TAB_COLORS
 from .user_picker import UsersPicker
 
+SUPPORT_EMAIL = "ondrej@vopravil.cz"  # technická podpora (Nastavení)
+
 
 def _color_icon(color: str) -> QIcon:
     """Čtvereček barvy pro výběr barvy záložky (prázdný = bez barvy)."""
@@ -253,11 +255,17 @@ class SettingsDialog(QDialog):
         shared_form.addRow("Při archivaci ponechat:", self.archive_keep)
         shared_form.addRow("Archivovat smí:", self.archivers)
         shared_form.addRow("Vyřízené vzkazy archivovat po:", self.messages_days)
-        shared_form.addRow(self.usage_report)
         archive_hint = QLabel("Archivované projekty se ukládají do <i>.spm\\archiv</i> v síťové složce "
                               "s projekty. Kdo smí archivovat, smí také uklízet zálohy a koš.")
         archive_hint.setWordWrap(True)
         shared_form.addRow(archive_hint)
+        shared_form.addRow(self.usage_report)
+        self.usage_hint = QLabel(
+            "Odesílá se jen jednou denně po spuštění aplikace, a to jen anonymní údaj: hash "
+            "uživatelského jména a názvu počítače a číslo verze SPM. Nic jiného – žádná jména, cesty, "
+            "názvy ani obsah projektů. Upozornění na novou verzi funguje i s vypnutou statistikou.")
+        self.usage_hint.setWordWrap(True)
+        shared_form.addRow(self.usage_hint)
         self.shared_info = QLabel()
         self.shared_info.setWordWrap(True)
         self.shared_info.setTextFormat(Qt.TextFormat.RichText)
@@ -304,6 +312,13 @@ class SettingsDialog(QDialog):
         secrets_lay.addWidget(self.btn_secrets)
         secrets_lay.addStretch()
         form.addRow("Tajné hodnoty pro skripty:", secrets_row)
+
+        self.support = QLabel(f'<a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>')
+        self.support.setTextFormat(Qt.TextFormat.RichText)
+        self.support.setOpenExternalLinks(True)  # otevře nový e-mail v poštovním programu
+        self.support.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.support.setToolTip("Dotazy, chyby a návrhy na vylepšení SPM")
+        form.addRow("Technická podpora:", self.support)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")

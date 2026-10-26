@@ -386,3 +386,41 @@ def test_background_check_archives_with_configured_days(qapp, pms, monkeypatch):
         wait_messages(w, qapp)
         w.close()
         qapp.processEvents()
+
+
+def test_source_follows_active_tab(qapp, tmp_path, monkeypatch):
+    """Okno Vzkazy: síťová složka pro nový vzkaz podle aktivní záložky / panelu."""
+    from spm.config import AppSettings
+    from spm.gui.main_window import MainWindow
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    for name in ("serverA", "serverB"):
+        (tmp_path / name / "P").mkdir(parents=True)
+    wa = AppSettings.new_workspace("A", Settings(server_root=str(tmp_path / "serverA"), local_root=str(tmp_path / "lA")))
+    wb = AppSettings.new_workspace("B", Settings(server_root=str(tmp_path / "serverB"), local_root=str(tmp_path / "lB")))
+    wf = AppSettings.new_workspace("Složka", Settings(folder_root=str(tmp_path)))
+    app_settings = AppSettings(Settings(), [wa, wb, wf], wa["id"])
+    w = MainWindow(app_settings)
+    try:
+        msg = w.open_messages()
+        assert msg.source.isVisibleTo(msg) and msg.current_source().server == tmp_path / "serverA"
+        w.switch_workspace(wb["id"])
+        assert msg.current_source().server == tmp_path / "serverB"      # přepnutí záložky
+        w.switch_workspace(wf["id"])
+        assert msg.current_source().server == tmp_path / "serverB"      # záložka Složka – beze změny
+        w.switch_workspace(wa["id"])
+        assert msg.current_source().server == tmp_path / "serverA"
+        msg.editor.setPlainText("rozepsáno")                             # rozepsaný vzkaz se nemění
+        w.switch_workspace(wb["id"])
+        assert msg.current_source().server == tmp_path / "serverA"
+        msg.editor.clear()
+        w.act_dual.setChecked(True)                                      # druhý panel aktivní
+        with w.on_pane(w.panes[1]):
+            w.switch_workspace(wb["id"])
+        w._activate_pane(w.panes[1])
+        assert msg.current_source().server == tmp_path / "serverB"
+        w._activate_pane(w.panes[0])
+        assert msg.current_source().server == tmp_path / "serverB"      # panel 0 má teď záložku B
+    finally:
+        wait_messages(w, qapp)
+        w.close()
+        qapp.processEvents()

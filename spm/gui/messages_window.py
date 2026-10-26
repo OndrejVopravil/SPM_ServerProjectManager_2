@@ -11,6 +11,7 @@ do které patří, a při psaní se složka vybírá.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
@@ -444,6 +445,23 @@ class MessagesWindow(QWidget):
         self.source.setVisible(multi)
         self.source_label.setVisible(multi)
         self._source_changed()
+
+    def composing(self) -> bool:
+        """Rozepsaný vzkaz (text nebo vybraní adresáti)."""
+        return bool(self.editor.toPlainText().strip() or self.recipients.logins())
+
+    def follow_server(self, server: str) -> bool:
+        """Síťová složka pro nový vzkaz podle aktivní záložky hlavního okna. U rozepsaného vzkazu
+        se nemění (adresáti jsou uživatelé zvolené složky). Vrací, zda se výběr změnil."""
+        if not server or self.composing():
+            return False
+        key = os.path.normcase(os.path.normpath(server))
+        index = next((i for i in range(self.source.count())
+                      if os.path.normcase(os.path.normpath(self.source.itemData(i) or "")) == key), -1)
+        if index < 0 or index == self.source.currentIndex():
+            return False
+        self.source.setCurrentIndex(index)
+        return True
 
     def current_source(self) -> Source | None:
         index = self.source.currentIndex()

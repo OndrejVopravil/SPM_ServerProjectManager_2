@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import quote, unquote
 
 from PySide6.QtCore import QEvent, QTimer, Qt, Signal
-from PySide6.QtGui import QFont, QKeySequence, QShortcut
+from PySide6.QtGui import QFont, QKeySequence, QPalette, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -104,10 +104,16 @@ def _ctrl_enter(editor: QPlainTextEdit, slot) -> None:
 
 
 def recipient_combo(users: list, login: str = "", name: str = "") -> QComboBox:
+    """Výběr adresáta: všem, aktivní uživatelé, za nimi zašedlí neaktivní (SPM dlouho nespustili)."""
     combo = QComboBox()
     combo.addItem("všem", "")
+    gray = combo.palette().color(QPalette.ColorRole.PlaceholderText)
     for u in users:
-        combo.addItem(u.display, u.login)
+        if u.inactive():
+            combo.addItem(f"{u.display} – {u.seen_label}", u.login)
+            combo.setItemData(combo.count() - 1, gray, Qt.ItemDataRole.ForegroundRole)
+        else:
+            combo.addItem(u.display, u.login)
     if login:
         index = combo.findData(login.lower())
         if index < 0:  # uživatel, který SPM ještě nespustil

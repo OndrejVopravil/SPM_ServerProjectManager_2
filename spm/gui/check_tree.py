@@ -10,13 +10,28 @@ from dataclasses import dataclass, field
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QIcon, QImage, QPixmap
-from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator, QWidget
+from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QWidget
 
-from . import icons
+from . import icons, selection_style
 
 KEY_ROLE = Qt.ItemDataRole.UserRole
 PATH_ROLE = Qt.ItemDataRole.UserRole + 1
 SAVED_FOREGROUND_ROLE = Qt.ItemDataRole.UserRole + 2  # barvy textu před podbarvením hledáním
+
+
+def all_items(tree: QTreeWidget) -> list[QTreeWidgetItem]:
+    """Všechny položky stromu shora dolů (jako QTreeWidgetItemIterator).
+
+    QTreeWidgetItemIterator se z Pythonu nepoužívá: registruje se u modelu stromu a ten ho
+    při mazání položek přepočítává – iterátor, který z Pythonu zůstal viset (nedokončený
+    generátor), pak při QTreeWidget.clear() sáhl do uvolněné paměti a shodil proces."""
+    result: list[QTreeWidgetItem] = []
+    stack = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount() - 1, -1, -1)]
+    while stack:
+        item = stack.pop()
+        result.append(item)
+        stack.extend(item.child(i) for i in range(item.childCount() - 1, -1, -1))
+    return result
 
 
 def in_scope(path: str, scope: str | list[str] | tuple[str, ...] | None) -> bool:
@@ -56,6 +71,7 @@ class CheckTree(QTreeWidget):
         self._items: dict[str, QTreeWidgetItem] = {}
         self._by_file: dict[str, QTreeWidgetItem] = {}  # soubor na disku -> položka (pro ikonu)
         self.itemChanged.connect(self._on_changed)
+        selection_style.install(self)  # výraznější označení vybraných řádků
         self._shell_icons = icons.shell_icons_available()
         if self._shell_icons:
             icons.loader().loaded.connect(self._on_icon)
@@ -146,16 +162,13 @@ class CheckTree(QTreeWidget):
         """Doplní text (a tooltip) sloupce podle cesty – soubor 'a/b.nc', složka 'a/'.
         Hodnota (text, tooltip) nebo (text, tooltip, barva) – barva místo výchozí color."""
         self.blockSignals(True)
-        it = QTreeWidgetItemIterator(self)
-        while it.value():
-            item = it.value()
+        for item in all_items(self):
             text, tip, *own = texts.get(item.data(0, PATH_ROLE), ("", ""))
             item.setText(column, text)
             item.setToolTip(column, tip or text)
             use = own[0] if own and own[0] is not None else color
             if use is not None and text:
                 item.setForeground(column, use)
-            it += 1
         self.blockSignals(False)
 
     def highlight(self, match, color: QColor) -> list[QTreeWidgetItem]:
@@ -197,25 +210,15 @@ class CheckTree(QTreeWidget):
 
     # --- výběr -----------------------------------------------------------
 
-    def _folder_items(self):
-        it = QTreeWidgetItemIterator(self)
-        while it.value():
-            item = it.value()
-            if not item.data(0, KEY_ROLE):
-                yield item
-            it += 1
+    def _folder_items(self) -> list[QTreeWidgetItem]:
+        return [item for item in all_items(self) if not item.data(0, KEY_ROLE)]
 
     def find_folder(self, path: str) -> QTreeWidgetItem | None:
         """Položka složky podle cesty ('a/b/')."""
         return next((item for item in self._folder_items() if item.data(0, PATH_ROLE) == path), None)
 
-    def leaf_items(self):
-        it = QTreeWidgetItemIterator(self)
-        while it.value():
-            item = it.value()
-            if item.data(0, KEY_ROLE):
-                yield item
-            it += 1
+    def leaf_items(self) -> list[QTreeWidgetItem]:
+        return [item for item in all_items(self) if item.data(0, KEY_ROLE)]
 
     def _selectable(self, item: QTreeWidgetItem) -> bool:
         return bool(item.flags() & Qt.ItemFlag.ItemIsUserCheckable)

@@ -6,7 +6,9 @@ from __future__ import annotations
 from typing import Callable
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -20,6 +22,9 @@ from PySide6.QtWidgets import (
 )
 
 
+INACTIVE_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
 class UsersDialog(QDialog):
     """Výběr uživatelů zaškrtnutím – z adresáře uživatelů síťové složky (jako adresát poznámky)."""
 
@@ -28,8 +33,13 @@ class UsersDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumSize(380, 360)
-        info = QLabel("Nabízejí se všichni, kdo SPM s touto síťovou složkou spustili.")
+        info = QLabel("Nabízejí se všichni, kdo SPM s touto síťovou složkou spustili. Kdo ho delší "
+                      "dobu nespustil, je mezi neaktivními.")
         info.setWordWrap(True)
+        self.show_inactive = QCheckBox("Zobrazit i neaktivní")
+        self.show_inactive.setToolTip("Uživatelé, kteří SPM déle než měsíc nespustili (dovolená, "
+                                      "občasní uživatelé…) – vybraní se zobrazí vždy")
+        self.show_inactive.toggled.connect(lambda _: self._filter(self.search.text()))
         self.search = QLineEdit()
         self.search.setPlaceholderText("Hledat…")
         self.search.setClearButtonEnabled(True)
@@ -40,7 +50,9 @@ class UsersDialog(QDialog):
         for u in users:
             if exclude and u.login.lower() == exclude.lower():
                 continue
-            self._add(u.display, u.login, u.login.lower() in chosen)
+            inactive = u.inactive()
+            self._add(f"{u.display} – {u.seen_label}" if inactive else u.display, u.login,
+                      u.login.lower() in chosen, inactive)
             known.add(u.login.lower())
         for login in selected:  # vybraný uživatel, který SPM ještě nespustil
             if login.lower() not in known:
@@ -53,11 +65,17 @@ class UsersDialog(QDialog):
         layout.addWidget(info)
         layout.addWidget(self.search)
         layout.addWidget(self.list)
+        layout.addWidget(self.show_inactive)
         layout.addWidget(buttons)
+        self.show_inactive.setVisible(any(self.list.item(i).data(INACTIVE_ROLE) for i in range(self.list.count())))
+        self._filter("")
 
-    def _add(self, text: str, login: str, checked: bool) -> None:
+    def _add(self, text: str, login: str, checked: bool, inactive: bool = False) -> None:
         item = QListWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, login)
+        item.setData(INACTIVE_ROLE, inactive)
+        if inactive:
+            item.setForeground(self.palette().color(QPalette.ColorRole.PlaceholderText))
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self.list.addItem(item)
@@ -66,8 +84,10 @@ class UsersDialog(QDialog):
         needle = text.strip().lower()
         for i in range(self.list.count()):
             item = self.list.item(i)
-            item.setHidden(bool(needle) and needle not in item.text().lower()
-                           and needle not in item.data(Qt.ItemDataRole.UserRole).lower())
+            hidden_inactive = (item.data(INACTIVE_ROLE) and not self.show_inactive.isChecked()
+                               and item.checkState() != Qt.CheckState.Checked)
+            item.setHidden(hidden_inactive or (bool(needle) and needle not in item.text().lower()
+                                               and needle not in item.data(Qt.ItemDataRole.UserRole).lower()))
 
     def selected(self) -> list[str]:
         return [self.list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.list.count())

@@ -24,7 +24,7 @@ from .scanner import TEMP_SUFFIX, Progress, copy_with_hash, same_stat, set_reado
 # změny, po kterých soubor v projektu není
 REMOVING = {dbm.DELETED, dbm.EXTERNAL_DELETED}
 # název složky s obnovou (v seznamu projektů se nezobrazuje jako „Jen místně“)
-RESTORE_DIR_RE = re.compile(r"_obnova_\d{8}_\d{6}(_\d+)?$")
+RESTORE_DIR_RE = re.compile(r"_obnova_(\d{8}_\d{6})(_\d+)?$")  # skupina 1 = datum
 
 
 class RestoreError(Exception):

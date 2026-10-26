@@ -45,9 +45,13 @@ class CompleterEdit(QPlainTextEdit):
 
     @users.setter
     def users(self, users: list) -> None:
-        """Uživatelé pro „@“ (UserInfo – zobrazí se jméno, vloží login)."""
+        """Uživatelé pro „@“ (UserInfo – zobrazí se jméno, vloží login). Neaktivní (SPM dlouho
+        nespustili) se nabídnou až po napsání části jména – na konci, s popiskem."""
         self._users = list(users)
-        self.providers["@"] = lambda: [(u.display, u.login) for u in self._users]
+        self.providers["@"] = lambda: [(u.display, u.login) for u in self._users if not u.inactive()]
+        self.providers["@+"] = lambda: (
+            [(u.display, u.login) for u in self._users if not u.inactive()]
+            + [(f"{u.display} – {u.seen_label}", u.login) for u in self._users if u.inactive()])
 
     def set_projects(self, names: Callable[[], list[str]] | None) -> None:
         """Projekty pro „#“ (None = „#“ nic nenabízí)."""
@@ -92,8 +96,9 @@ class CompleterEdit(QPlainTextEdit):
             self._trigger = ""
             return
         trigger, typed = found
-        if trigger != self._loaded_for or not self._trigger:
-            self._load(trigger)
+        source = "@+" if trigger == "@" and typed and "@+" in self.providers else trigger
+        if source != self._loaded_for or not self._trigger:
+            self._load(source)
         self._trigger, self._typed = trigger, typed
         self.completer.setCompletionPrefix(typed)
         if self.completer.completionCount() == 0:

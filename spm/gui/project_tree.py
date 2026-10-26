@@ -2,7 +2,10 @@
 
 - Ven (např. na plochu): označené soubory a složky se zkopírují. Kopie jsou zapisovatelné
   (i u souborů, které nemám aktivované – v místní kopii jsou jen pro čtení) a nestažené
-  soubory se vezmou ze serveru – proto se před tažením připraví v dočasné složce.
+  soubory se vezmou ze serveru – proto se připraví v dočasné složce, ale až ve chvíli, kdy si
+  o ně cíl řekne (LazyFilesMime – puštění / vložení v jiném programu). Uvnitř SPM se dočasné
+  kopie nedělají vůbec: cíl dostane jen odkud soubory jsou (MIME_SOURCE) a čte je z původního
+  místa.
 - Dovnitř (z Průzkumníka nebo mezi složkami stromu): kopie do složky pod myší; co se smí
   přidat a nahradit, rozhoduje panel (ProjectManager.plan_copy_in).
 """
@@ -17,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QMimeData, QPoint, Qt, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QMetaType, QMimeData, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDrag, QPainter, QPen
 from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTreeWidgetItem, QWidget
 
@@ -26,6 +29,9 @@ from .check_tree import PATH_ROLE, CheckTree
 MIME_FILES = "application/x-spm-files"   # (cesta v projektu, cesta v cíli) – tažení uvnitř stromu
 # schránka (Kopírovat / Vyjmout): odkud soubory jsou – záložka, projekt, položky, vyjmuto
 MIME_CLIPBOARD = "application/x-spm-clipboard"
+# odkud tažené soubory jsou (záložka, projekt) – puštění v SPM čte soubory z původního místa
+MIME_SOURCE = "application/x-spm-source"
+URI_LIST = "text/uri-list"
 STAGING_ROOT = Path(tempfile.gettempdir()) / "spm_drag"
 STAGING_KEEP_S = 600  # dočasné kopie pro tažení ven se mažou až po 10 min (Průzkumník je kopíruje)
 CLIPBOARD_ROOT = Path(tempfile.gettempdir()) / "spm_clip"
@@ -60,11 +66,67 @@ def clipboard_info(mime: QMimeData | None) -> dict | None:
         return None
 
 
-def files_mime(items: list[tuple[str, str]], urls: list[Path]) -> QMimeData:
-    mime = QMimeData()
-    mime.setUrls([QUrl.fromLocalFile(str(p)) for p in urls])
-    mime.setData(MIME_FILES, json.dumps(items).encode("utf-8"))
-    return mime
+class LazyFilesMime(QMimeData):
+    """Data tažení / schránky, jejichž soubory (text/uri-list) se připraví až ve chvíli, kdy
+    si o ně cíl řekne – jiný program (Průzkumník) při puštění nebo vložení. SPM sám je nečte
+    (bere MIME_FILES a MIME_SOURCE), takže uvnitř SPM žádné dočasné kopie nevzniknou.
+    render: připraví soubory a vrátí jejich cesty (volá se nejvýš jednou)."""
+
+    def __init__(self, render: Callable[[], list[Path]]):
+        super().__init__()
+        self._render = render
+        self._paths: list[Path] | None = None
+
+    def rendered(self) -> bool:
+        return self._paths is not None
+
+    def paths(self) -> list[Path]:
+        if self._paths is None:
+            try:
+                self._paths = list(self._render())
+            except Exception:  # noqa: BLE001 – voláno z Windows (puštění) – chybu ohlásí render
+                self._paths = []
+        return self._paths
+
+    def formats(self) -> list[str]:  # noqa: D401 – Qt
+        result = list(super().formats())
+        return result if URI_LIST in result else [URI_LIST, *result]
+
+    def hasFormat(self, mimetype: str) -> bool:  # noqa: N802 – Qt
+        return mimetype == URI_LIST or super().hasFormat(mimetype)
+
+    def retrieveData(self, mimetype: str, preferred_type):  # noqa: N802 – Qt
+        if mimetype == URI_LIST:
+            urls = [QUrl.fromLocalFile(str(p)) for p in self.paths()]
+            if preferred_type is not None and preferred_type.id() == QMetaType.Type.QByteArray.value:
+                return QByteArray("".join(u.toString() + "\r\n" for u in urls).encode("utf-8"))
+            return urls  # QMimeData.urls() (i převod pro Windows – CF_HDROP) chce seznam QUrl
+        return super().retrieveData(mimetype, preferred_type)
+
+
+def forget_clipboard() -> None:
+    """Při ukončení SPM: vyprázdnit schránku, pokud v ní jsou soubory zkopírované v SPM.
+    Jinak by Windows při ukončení převzaly celý obsah schránky – u LazyFilesMime by se tím
+    teprve zkopírovaly všechny soubory (i ze serveru) a zavření by se protáhlo. Po zavření
+    SPM tedy zkopírované soubory vložit nejde."""
+    import shiboken6
+    from PySide6.QtGui import QGuiApplication
+    clipboard = QGuiApplication.clipboard()
+    mime = clipboard.mimeData()
+    # jen data vložená do schránky tímto procesem (z jiného programu / jiné instance SPM je
+    # objekt dat vytvořený v Qt, ne v Pythonu)
+    if mime is not None and shiboken6.createdByPython(mime) and mime.hasFormat(MIME_CLIPBOARD):
+        clipboard.clear()
+
+
+def spm_source(mime: QMimeData | None) -> dict | None:
+    """Odkud tažené / zkopírované soubory jsou: {"ws", "project", "local_only"} (None = odjinud)."""
+    if mime is None or not mime.hasFormat(MIME_SOURCE):
+        return None
+    try:
+        return json.loads(bytes(mime.data(MIME_SOURCE)).decode("utf-8"))
+    except (ValueError, TypeError):
+        return None
 
 
 def mime_items(mime: QMimeData) -> list[tuple[str, str]] | None:
@@ -100,6 +162,8 @@ class ProjectTree(CheckTree):
         # (urls ze systému, položky z vlastního stromu, cílová složka) a zda lze sem kopírovat
         self.drag_handler: Callable[[list[str]], QMimeData | None] | None = None
         self.drop_handler: Callable[[list[Path], list[tuple[str, str]] | None, str], None] | None = None
+        # puštění souborů z jiného stromu SPM (jiný projekt / panel): (odkud, položky, cílová složka)
+        self.spm_drop_handler: Callable[[dict, list[tuple[str, str]], str], None] | None = None
         self.can_drop: Callable[[], bool] = lambda: False
         self._drop_item: QTreeWidgetItem | None = None
         self._drop_active = False
@@ -159,9 +223,15 @@ class ProjectTree(CheckTree):
             return
         mime = event.mimeData()
         internal = mime_items(mime) if event.source() is self else None
-        urls = [Path(u.toLocalFile()) for u in mime.urls() if u.isLocalFile()]
+        source = spm_source(mime) if internal is None else None
+        items = mime_items(mime) if source is not None else None
         event.setDropAction(Qt.DropAction.CopyAction)
         event.accept()
+        if source is not None and items is not None and self.spm_drop_handler is not None:
+            # z jiného stromu SPM: soubory z původního místa (bez dočasných kopií)
+            QTimer.singleShot(0, lambda: self.spm_drop_handler(source, items, target))
+            return
+        urls = [] if internal is not None else [Path(u.toLocalFile()) for u in mime.urls() if u.isLocalFile()]
         # zpracovat až po skončení tažení (dotaz nesmí blokovat Průzkumník, ze kterého se táhne)
         QTimer.singleShot(0, lambda: self.drop_handler(urls, internal, target))
 

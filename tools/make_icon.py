@@ -2,6 +2,9 @@
 
 Spuštění: .venv\\Scripts\\python.exe tools\\make_icon.py  (spouští ho i build.bat)
 ICO obsahuje všechny velikosti jako PNG (Windows Vista a novější).
+
+S parametrem --web vyrobí ikony pro web statistiky (web/favicon.ico a PNG pro prohlížeče,
+telefony a nadpis stránky): .venv\\Scripts\\python.exe tools\\make_icon.py --web
 """
 
 from __future__ import annotations
@@ -17,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from spm.gui.app_icon import SIZES, draw  # noqa: E402
 
 OUT = Path(__file__).resolve().parent / "spm.ico"
+WEB = Path(__file__).resolve().parent.parent / "web"
+# web: (soubor, velikost) – favicona v PNG, ikona pro telefony (apple-touch-icon), nadpis stránky
+WEB_PNGS = (("icon-32.png", 32), ("icon-96.png", 96), ("apple-touch-icon.png", 180), ("icon-192.png", 192))
 
 
 def png_bytes(size: int) -> bytes:
@@ -40,7 +46,21 @@ def write_ico(path: Path) -> None:
     path.write_bytes(header + entries + blobs)
 
 
+def write_web_icons(folder: Path) -> list[Path]:
+    """Ikony pro web: favicon.ico (16–256 px) a PNG; vrací vytvořené soubory."""
+    written = [folder / "favicon.ico"]
+    write_ico(written[0])
+    for name, size in WEB_PNGS:
+        (folder / name).write_bytes(png_bytes(size))
+        written.append(folder / name)
+    return written
+
+
 if __name__ == "__main__":
     app = QGuiApplication.instance() or QGuiApplication(sys.argv)
-    write_ico(OUT)
-    print(f"Ikona: {OUT}")
+    if "--web" in sys.argv:
+        for path in write_web_icons(WEB):
+            print(f"Ikona webu: {path}")
+    else:
+        write_ico(OUT)
+        print(f"Ikona: {OUT}")

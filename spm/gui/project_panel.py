@@ -49,14 +49,16 @@ from ..sync import (
     validate_folder_name,
 )
 from . import name_dialog
-from .check_tree import KEY_ROLE, PATH_ROLE, CheckTree, TreeEntry, in_scope
+from .check_tree import KEY_ROLE, PATH_ROLE, CheckTree, TreeEntry, all_items, in_scope
 from .project_tree import (
     CLIPBOARD_KEEP_S,
     CLIPBOARD_ROOT,
     MIME_CLIPBOARD,
+    MIME_FILES,
+    MIME_SOURCE,
+    LazyFilesMime,
     ProjectTree,
     clipboard_info,
-    files_mime,
     new_staging_dir,
 )
 from .notes_window import fmt_time
@@ -216,6 +218,7 @@ class ProjectPanel(QWidget):
         # dovnitř = kopie do složky (nové soubory a mé aktivované – viz plan_copy_in)
         self.tree.drag_handler = self.drag_mime
         self.tree.drop_handler = self.drop_files
+        self.tree.spm_drop_handler = self.drop_spm
         # do neaktivovaného projektu taky – před vložením se nabídne aktivace bez zámků
         self.tree.can_drop = lambda: bool(self.project and (self.project.mine or self.project.local_only
                                                             or self._can_quick_activate()))
@@ -412,10 +415,7 @@ class ProjectPanel(QWidget):
 
     def select_path(self, path: str) -> bool:
         """Označí soubor / složku ('/' na konci) ve stromu (z odkazu v okně poznámek)."""
-        from PySide6.QtWidgets import QTreeWidgetItemIterator
-        it = QTreeWidgetItemIterator(self.tree)
-        while it.value():
-            item = it.value()
+        for item in all_items(self.tree):
             if item.data(0, PATH_ROLE) == path:
                 parent = item.parent()
                 while parent is not None:
@@ -426,7 +426,6 @@ class ProjectPanel(QWidget):
                 item.setSelected(True)
                 self.tree.scrollToItem(item)
                 return True
-            it += 1
         return False
 
     def _tool_button(self, icon: QIcon, tip: str, slot) -> QToolButton:
@@ -809,22 +808,35 @@ class ProjectPanel(QWidget):
         return self._export_mime(self.drag_items(scopes), "Přetažení", new_staging_dir)
 
     def _export_mime(self, items: list[tuple[str, str]], title: str, staging):
+        """Data pro tažení / schránku. Soubory pro jiné programy se připraví až při puštění
+        nebo vložení (LazyFilesMime): přímo soubory místní kopie, pokud jsou to jen zapisovatelné
+        soubory, jinak kopie v dočasné složce. SPM sám čte soubory z původního místa."""
         if not items or self.project is None:
             return None
-        local = self.pm.local_dir(self.project.name)
-        direct = [to_abs(local, rel) for rel, out in items]
-        if all("/" not in out for _, out in items) and \
-                all(p.is_file() and os.access(p, os.W_OK) for p in direct):
-            return files_mime(items, direct)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            tops = self.pm.export_copies(self.project.name, items, staging())
-        except Exception as e:  # noqa: BLE001
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, title, f"Soubory se nepodařilo připravit:\n{e}")
-            return None
-        QApplication.restoreOverrideCursor()
-        return files_mime(items, tops)
+        name = self.project.name
+        pm = self.pm
+        local = pm.local_dir(name)
+
+        def render() -> list[Path]:
+            direct = [to_abs(local, rel) for rel, out in items]
+            if all("/" not in out for _, out in items) and \
+                    all(p.is_file() and os.access(p, os.W_OK) for p in direct):
+                return direct
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                return pm.export_copies(name, items, staging())
+            except Exception as e:  # noqa: BLE001 – voláno z puštění v jiném programu: ohlásit později
+                QTimer.singleShot(0, lambda: QMessageBox.critical(
+                    self, title, f"Soubory se nepodařilo připravit:\n{e}"))
+                raise
+            finally:
+                QApplication.restoreOverrideCursor()
+
+        mime = LazyFilesMime(render)
+        mime.setData(MIME_FILES, json.dumps(items).encode("utf-8"))
+        mime.setData(MIME_SOURCE, json.dumps({"ws": pm.settings.workspace_id, "project": name,
+                                              "local_only": self.project.local_only}).encode("utf-8"))
+        return mime
 
     # --- schránka (Kopírovat / Vyjmout / Vložit) ------------------------------------
 
@@ -889,12 +901,13 @@ class ProjectPanel(QWidget):
         if info and info["cut"]:
             self._paste_cut(info, target)
             return
+        if info and not info.get("folder") and info.get("project"):
+            # z projektu v SPM: aktuální obsah souborů z původního místa (bez dočasných kopií)
+            self.drop_spm(info, info["items"], target)
+            return
         urls = [Path(u.toLocalFile()) for u in mime.urls() if u.isLocalFile()] if mime else []
-        same = bool(info and info["ws"] == self.pm.settings.workspace_id
-                    and info.get("project") == self.project.name)
-        # ze stejného projektu se čte aktuální obsah souborů, odjinud kopie ze schránky
-        if urls or same:
-            self.drop_files(urls, info["items"] if same else None, target)
+        if urls:
+            self.drop_files(urls, None, target)
 
     def _paste_cut(self, info: dict, target: str) -> None:
         title = "Vložit"
@@ -919,10 +932,10 @@ class ProjectPanel(QWidget):
             self._changed()
             return
         # z jiného projektu: zkopírovat sem a ve zdrojovém projektu smazat (do Koše)
-        source_pm = self.pm_for(info["ws"])
         src_name = info["project"]
         sources = {target + out: rel for rel, out in info["items"]}
         try:
+            source_pm = self.pm_for(info["ws"])  # i záložka, která mezitím zmizela – chybové okno
             plan = self.pm.plan_copy_in(name, [(source_pm.file_source(src_name, rel), dst)
                                                for dst, rel in sources.items()])
         except Exception as e:  # noqa: BLE001
@@ -1031,6 +1044,27 @@ class ProjectPanel(QWidget):
                     out = f"{renamed[top]}/{rest}"
             result.append((rel, out))
         return result
+
+    def drop_spm(self, source: dict, items: list[tuple[str, str]], target: str) -> None:
+        """Soubory z jiného místa v SPM (strom jiného panelu / projektu, schránka SPM):
+        source = {"ws", "project"}; soubory se čtou z původního místa (místní kopie, jinak
+        server). Ze stejného projektu jako puštění uvnitř stromu."""
+        if self.project is None:
+            return
+        if source.get("ws") == self.pm.settings.workspace_id and source.get("project") == self.project.name:
+            self.drop_files([], items, target)
+            return
+        if not self.ensure_active("vložit soubory"):
+            return
+        src = source.get("project", "")
+        try:  # i zdroj ze záložky, která mezitím zmizela – chybové okno
+            source_pm = self.pm_for(source.get("ws", ""))
+            sources = [(source_pm.file_source(src, rel), target + out) for rel, out in items]
+            plan = self.pm.plan_copy_in(self.project.name, sources)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Kopírování", f"Soubory z projektu {src} nelze vložit:\n{e}")
+            return
+        self.copy_into(plan, target)
 
     def drop_files(self, urls: list[Path], internal: list[tuple[str, str]] | None, target: str) -> None:
         """Puštění do stromu: soubory a složky ze systému (urls), nebo položky z tohoto stromu

@@ -35,7 +35,7 @@ from ..scripting import lang, store
 from ..scripting.lang import ScriptSyntaxError
 from ..scripting.model import TEST
 from ..scripting.runtime import run_scripts
-from .script_help import HelpPanel, ScriptEditor
+from .script_help import EditorSearchBar, HelpPanel, ScriptEditor
 from .tab_bar import is_dark
 from .worker import run_task
 
@@ -180,6 +180,11 @@ class ScriptsDialog(QDialog):
         self.editor.document().modificationChanged.connect(lambda _m: self._update_buttons())
         self.cursor_label = QLabel()
         self.editor.cursorPositionChanged.connect(self._show_cursor)
+        # hledání ve skriptu (Ctrl+F, F3 / Shift+F3)
+        self.search_bar = EditorSearchBar(self.editor)
+        QShortcut(QKeySequence.StandardKey.Find, self, activated=lambda: self.search_bar.start())
+        QShortcut(QKeySequence(Qt.Key.Key_F3), self, activated=lambda: self.search_bar.step(1))
+        QShortcut(QKeySequence("Shift+F3"), self, activated=lambda: self.search_bar.step(-1))
         self.btn_save = QPushButton("Uložit")
         self.btn_save.setToolTip("Ctrl+S")
         self.btn_save.clicked.connect(lambda: self.save())
@@ -224,6 +229,7 @@ class ScriptsDialog(QDialog):
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
         right_lay.addLayout(tools)
+        right_lay.addWidget(self.search_bar)
         right_lay.addWidget(editor_split)
 
         split = QSplitter(Qt.Orientation.Horizontal)

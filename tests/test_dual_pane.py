@@ -168,6 +168,15 @@ def test_copy_between_panes(qapp, app_settings, tmp_path):
         left.panel.paste_into("")                        # do aktivovaného projektu Alfa (levý)
         settle_panel(left.panel)
         assert (Path(view_a.local_root) / "Alfa" / "dily" / "b.txt").read_text(encoding="utf-8") == "b"
+        from PySide6.QtWidgets import QApplication
+        assert not QApplication.clipboard().mimeData().rendered()   # mezi panely bez dočasných kopií
+        # tažení z pravého panelu do levého: soubory z původního místa (Beta nemám aktivovanou)
+        from spm.gui.project_tree import mime_items, spm_source
+        drag = right.panel.drag_mime(["dily/"])
+        left.panel.drop_spm(spm_source(drag), mime_items(drag), "kopie/")
+        settle_panel(left.panel)
+        assert (Path(view_a.local_root) / "Alfa" / "kopie" / "dily" / "b.txt").read_text(encoding="utf-8") == "b"
+        assert not drag.rendered()
     finally:
         close(w, qapp)
 
@@ -374,5 +383,43 @@ def test_panes_same_height_at_startup(qapp, app_settings):
             qapp.processEvents()
         for pane in w.panes:
             assert abs(w._ratio_of(pane.splitter) - ratio) < 0.02
+    finally:
+        close(w, qapp)
+
+
+def test_drag_into_other_pane_highlights_target_folder(qapp, app_settings):
+    """Tažení z panelu do panelu: cílový strom tažení přijme a označí složku pod myší – i když
+    projekt v cíli aktivovaný není (rozhoduje cílový panel, ne lišta aktivního = zdrojového)."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent
+    view_a = app_settings.view(app_settings.workspaces[0]["id"])
+    write(Path(view_a.server_root) / "Alfa" / "dily" / "c.txt", "c")
+    ProjectManager(view_a).activate("Alfa", lock_paths=[])          # vlevo aktivovaný, vpravo ne
+    w = make_window(qapp, app_settings)
+    try:
+        w.act_dual.setChecked(True)
+        left, right = w.panes
+        with w.on_pane(right):
+            w.switch_workspace(app_settings.workspaces[1]["id"])
+        for pane in (left, right):
+            with w.on_pane(pane):
+                pane.table.selectRow(0)
+            settle_panel(pane.panel)
+        for src, dst in ((left, right), (right, left)):
+            w._activate_pane(src)                                       # táhne se ze zdrojového
+            src.panel.tree.expandAll()
+            dst.panel.tree.expandAll()
+            mime = src.panel.drag_mime([src.panel.entries[0].path])
+            tree = dst.panel.tree
+            pos = tree.visualItemRect(tree.find_folder("dily/")).center()
+            enter = QDragEnterEvent(pos, Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
+                                    Qt.KeyboardModifier.NoModifier)
+            qapp.sendEvent(tree.viewport(), enter)
+            move = QDragMoveEvent(pos, Qt.DropAction.CopyAction, mime, Qt.MouseButton.LeftButton,
+                                  Qt.KeyboardModifier.NoModifier)
+            qapp.sendEvent(tree.viewport(), move)
+            assert enter.isAccepted() and move.isAccepted()
+            assert tree._drop_active and tree._drop_item is not None   # složka označená
+            tree._clear_drop()
     finally:
         close(w, qapp)
