@@ -9,11 +9,22 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QDir, QMimeData, QModelIndex, QPersistentModelIndex, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen
+from PySide6.QtCore import (
+    QDir,
+    QMimeData,
+    QModelIndex,
+    QObject,
+    QPersistentModelIndex,
+    Qt,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import QAction, QColor, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -26,6 +37,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QToolButton,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -35,7 +47,9 @@ from .. import folder_ops, recycle, zip_ops
 from ..sync import ProjectManager
 from ..folder_zones import ProtectedZones, Zone
 from . import name_dialog, selection_style
+from .project_panel import COLOR_FOUND, SEARCH_EXPAND_DELAY_MS, tree_icon
 from .project_tree import MIME_CLIPBOARD, clipboard_info
+from .search import wildcard_matcher
 
 
 def _same_or_inside(path: Path, root: Path) -> bool:
@@ -50,6 +64,60 @@ HEADERS = ("Název", "Velikost", "Typ", "Změněno")
 
 LOCK = "🔒"
 COLOR_PROTECTED = QColor("#8a8a8a")
+SEARCH_DELAY_MS = 300    # hledání v souborech složky až po krátké pauze v psaní
+SEARCHING = "Vyhledávám…"
+SEARCH_LIMIT = 2000      # víc nalezených se nepodbarvuje (zpřesněte hledání)
+EXPAND_LIMIT = 200       # rozbalí se složky nejvýš tolika prvních nalezených položek
+
+
+def _key(path: str | Path) -> str:
+    """Klíč cesty pro porovnání (velikost písmen, lomítka)."""
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def find_files(root: Path, match, limit: int = SEARCH_LIMIT,
+               cancelled: Callable[[], bool] = lambda: False) -> tuple[list[Path], bool]:
+    """Soubory a složky ve složce (i v podsložkách), jejichž název odpovídá match. Vrací
+    (nalezené v pořadí stromu – v každé složce nejdřív podsložky, pak soubory; zda se hledání
+    zastavilo na limitu). Nečitelné složky přeskočí."""
+    found: list[Path] = []
+    for dirpath, dirs, names in os.walk(root):
+        if cancelled():
+            break
+        dirs.sort(key=str.lower)
+        for name in dirs + sorted(names, key=str.lower):
+            if match(name):
+                found.append(Path(dirpath) / name)
+                if len(found) >= limit:
+                    return found, True
+    return found, False
+
+
+class FolderSearch(QObject):
+    """Hledání souborů ve složce na pozadí (složka může být velká nebo na síti). Výsledek
+    starého hledání (mezitím se psalo dál) se zahodí – podle čísla hledání."""
+    done = Signal(int, object, bool)  # číslo hledání, nalezené cesty, zastaveno na limitu
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.generation = 0
+
+    def start(self, root: Path, match) -> int:
+        self.generation += 1
+        generation = self.generation
+
+        def work() -> None:
+            found, limited = find_files(root, match, cancelled=lambda: generation != self.generation)
+            if generation == self.generation:
+                try:
+                    self.done.emit(generation, found, limited)
+                except RuntimeError:  # panel mezitím zanikl (zavřené okno)
+                    pass
+        threading.Thread(target=work, daemon=True).start()
+        return generation
+
+    def cancel(self) -> None:
+        self.generation += 1
 
 
 class FolderModel(QFileSystemModel):
@@ -71,6 +139,10 @@ class FolderModel(QFileSystemModel):
         return zones.zone_of(Path(self.filePath(index)), self.panel.root) if zones else None
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):  # noqa: D401 – Qt
+        if role in (Qt.ItemDataRole.BackgroundRole, Qt.ItemDataRole.ForegroundRole) \
+                and self.panel.found and _key(self.filePath(index)) in self.panel.found:
+            # nalezené hledáním: žlutě s černým textem (čitelné i v tmavém režimu) – jako v projektu
+            return COLOR_FOUND if role == Qt.ItemDataRole.BackgroundRole else QColor("black")
         if role in (Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.ToolTipRole) or (
                 role == Qt.ItemDataRole.DisplayRole and index.column() == 0):
             zone = self._zone(index)
@@ -97,7 +169,36 @@ class FolderModel(QFileSystemModel):
         if zone is not None:
             self.panel.refuse(zone, "Přejmenovat nelze", Path(self.filePath(index)))
             return False
+        if role == Qt.ItemDataRole.EditRole and isinstance(value, str) and not self.isDir(index):
+            value = value.strip()
+            if not value:
+                return False
+            value = name_dialog.keep_extension(self.fileName(index), value)  # smazaná koncovka zůstane
         return super().setData(index, value, role)
+
+
+class RenameDelegate(selection_style.SelectionDelegate):
+    """Přejmenování ve stromu (F2): našeptávání podle názvů na stejné úrovni a u souboru
+    označený jen název bez koncovky (jako v Průzkumníku). Kreslí se jako ostatní sloupce
+    (vzhled výběru)."""
+
+    def createEditor(self, parent, option, index):  # noqa: N802 – Qt
+        editor = super().createEditor(parent, option, index)
+        model = index.model()
+        if isinstance(editor, QLineEdit) and index.column() == 0 and isinstance(model, QFileSystemModel):
+            own = model.fileName(index).lower()
+            try:
+                names = [n for n in os.listdir(Path(model.filePath(index)).parent) if n.lower() != own]
+            except OSError:
+                names = []
+            name_dialog.set_suggestions(editor, names)
+        return editor
+
+    def setEditorData(self, editor, index):  # noqa: N802 – Qt
+        super().setEditorData(editor, index)
+        model = index.model()
+        if isinstance(editor, QLineEdit) and isinstance(model, QFileSystemModel):
+            name_dialog.select_stem(editor, not model.isDir(index))
 
 
 class FolderTree(QTreeView):
@@ -206,9 +307,43 @@ class FolderPanel(QWidget):
         btn_new.clicked.connect(lambda: self.create_folder(self.current_folder()))
         btn_explorer = QPushButton("Otevřít v Průzkumníku")
         btn_explorer.clicked.connect(lambda: self.root and os.startfile(self.root))  # noqa: S606
+        # hledání v názvech souborů a složek (i v podsložkách) – jako ve stromu projektu: „obsahuje“,
+        # * = cokoliv; nalezené se podbarví žlutě, po pauze se rozbalí jejich složky
+        self.found: set[str] = set()       # klíče (_key) nalezených souborů a složek
+        self.found_paths: list[Path] = []
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Hledat soubor nebo složku…  (* = cokoliv, Esc zruší)")
+        self.search.setClearButtonEnabled(True)
+        self.search.setMaximumWidth(300)
+        self.search.textChanged.connect(self._on_search_text)
+        self.found_label = QLabel()
+        # jako ve stromu projektu (rozbalit vše tu není – složka může být obrovská)
+        self.btn_collapse = QToolButton()
+        self.btn_collapse.setIcon(tree_icon(expand=False))
+        self.btn_collapse.setToolTip("Sbalit všechny složky")
+        self.btn_collapse.setAutoRaise(True)
+        self.btn_collapse.clicked.connect(lambda: self.tree.collapseAll())
+        self._searcher = FolderSearch(self)
+        self._searcher.done.connect(self._on_found)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(SEARCH_DELAY_MS)
+        self._search_timer.timeout.connect(self.run_search)
+        self._expand_timer = QTimer(self)
+        self._expand_timer.setSingleShot(True)
+        self._expand_timer.setInterval(SEARCH_EXPAND_DELAY_MS)
+        self._expand_timer.timeout.connect(self._expand_when_ready)
+        self._expand_pending = False
+        self._search_ready = True  # výsledek aktuálního hledání je k dispozici
+        clear = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        clear.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)  # jen v panelu (pole, strom)
+        clear.activated.connect(self.search.clear)
         head = QHBoxLayout()
         head.addWidget(self.title)
+        head.addWidget(self.btn_collapse)
         head.addStretch()
+        head.addWidget(self.found_label)
+        head.addWidget(self.search)
         head.addWidget(btn_new)
         head.addWidget(btn_explorer)
 
@@ -221,6 +356,8 @@ class FolderPanel(QWidget):
         self.tree.setSortingEnabled(True)
         self.tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self.tree.setEditTriggers(QAbstractItemView.EditTrigger.EditKeyPressed)
+        self._rename_delegate = RenameDelegate(self.tree)
+        self.tree.setItemDelegateForColumn(0, self._rename_delegate)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.tree.setColumnWidth(0, 360)
         self.tree.doubleClicked.connect(self._open_index)
@@ -252,6 +389,78 @@ class FolderPanel(QWidget):
         exists = self.root.is_dir()
         self.title.setText(f"<b>Složka</b> {self.root}" + ("" if exists else
                            "  <span style='color:#c0392b'>(složka neexistuje)</span>"))
+        if self.search.text().strip():
+            self.run_search()  # jiná složka – hledat znovu
+
+    # --- hledání -----------------------------------------------------------------
+
+    def _on_search_text(self, text: str) -> None:
+        self._search_ready = False
+        # hned při psaní: informace, že se hledá (výsledek „Nalezeno: N“ přepíše)
+        self.found_label.setText(SEARCHING if wildcard_matcher(text) else "")
+        self._search_timer.start()   # hledat po krátké pauze v psaní
+        self._expand_timer.start()   # rozbalit po delší pauze (jako ve stromu projektu)
+        self._expand_pending = False
+
+    def run_search(self) -> None:
+        """Spustí hledání podle pole (na pozadí); prázdné pole podbarvení zruší."""
+        self._search_timer.stop()
+        match = wildcard_matcher(self.search.text())
+        if match is None or self.root is None or not self.root.is_dir():
+            self._searcher.cancel()
+            self._show_found([], False, searched=match is not None)
+            return
+        self._search_ready = False
+        self.found_label.setText(SEARCHING)
+        # kořen ve tvaru, v jakém cesty vrací model (dlouhé názvy místo 8.3 – např. ONDREJ~1),
+        # aby se nalezené shodovaly s položkami stromu
+        self._searcher.start(self._model_root(), match)
+
+    def _model_root(self) -> Path:
+        """Kořen složky tak, jak ho vrací model (filePath kořenové položky stromu)."""
+        path = self.model.filePath(self.tree.rootIndex())
+        return Path(path) if path else self.root
+
+    def _on_found(self, generation: int, found: list, limited: bool) -> None:
+        if generation != self._searcher.generation:
+            return  # mezitím se hledá něco jiného
+        self._show_found(found, limited, searched=True)
+        if self._expand_pending:
+            self.expand_found()
+
+    def _show_found(self, found: list[Path], limited: bool, searched: bool) -> None:
+        self.found_paths = list(found)
+        self.found = {_key(p) for p in found}
+        self._search_ready = True
+        if not searched:
+            self.found_label.setText("")
+        else:
+            self.found_label.setText(f"Nalezeno: {len(found)}" + (" a další – zpřesněte hledání"
+                                                                  if limited else ""))
+        self.tree.viewport().update()
+
+    def _expand_when_ready(self) -> None:
+        if self._search_ready:
+            self.expand_found()
+        else:
+            self._expand_pending = True  # rozbalí se, až hledání doběhne
+
+    def expand_found(self) -> None:
+        """Rozbalí složky, ve kterých jsou nalezené soubory a složky (nejvýš EXPAND_LIMIT
+        prvních), a posune se na první nalezený; ostatní složky nechá být."""
+        self._expand_pending = False
+        if self.root is None or not self.found_paths:
+            return
+        root_key = _key(self._model_root())
+        for path in self.found_paths[:EXPAND_LIMIT]:
+            folders = []
+            parent = path.parent
+            while _key(parent) != root_key and parent != parent.parent:
+                folders.append(parent)
+                parent = parent.parent
+            for folder in reversed(folders):
+                self.tree.expand(self.model.index(str(folder)))
+        self.tree.scrollTo(self.model.index(str(self.found_paths[0])))
 
     def path_of(self, index: QModelIndex) -> Path:
         return Path(self.model.filePath(index))

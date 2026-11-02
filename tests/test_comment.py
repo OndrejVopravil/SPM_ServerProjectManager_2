@@ -207,10 +207,10 @@ def test_history_shows_comment_change(env):
         assert [c["comment"] or "" for c in dlg.visible_commits()] == [""]    # jen smazání komentáře
 
 
-def test_double_click_name_toggles_activation(window, monkeypatch):
+def test_double_click_name_take_or_submit(window, monkeypatch):
     from spm.gui.main_window import COL_COMMENT, COL_NAME, COL_STATE
     calls = []
-    for name in ("activate", "deactivate", "open_local", "edit_comment"):
+    for name in ("activate", "submit", "open_local", "edit_comment"):
         monkeypatch.setattr(window, name, lambda *a, n=name, **k: calls.append(n))
     r = row_of(window, "Forma")
     window.table.selectRow(r)
@@ -220,13 +220,13 @@ def test_double_click_name_toggles_activation(window, monkeypatch):
     window._on_double_click(model.index(r, COL_COMMENT))
     window._on_double_click(model.index(r, COL_STATE))
     assert calls == ["activate", "edit_comment", "open_local"]
-    # můj aktivovaný projekt -> deaktivace
+    # projekt, na kterém pracuji -> odevzdat
     window.pm.activate("Forma")
     window.refresh(check_names=False)
     window.table.selectRow(row_of(window, "Forma"))
     calls.clear()
     window._on_double_click(model.index(row_of(window, "Forma"), COL_NAME))
-    assert calls == ["deactivate"]
+    assert calls == ["submit"]
 
 
 def test_comment_colored_like_project_name(window, env):
@@ -248,3 +248,45 @@ def test_comment_colored_like_project_name(window, env):
     assert name == comment == COLOR_OTHER
     r = row_of(window, "Forma")
     assert "druhý řádek" in window.table.item(r, COL_COMMENT).toolTip()   # bublina = celý komentář
+
+
+def test_delete_local_only_project(window, monkeypatch):
+    """Projekt „Jen místně“: Smazat (pravé tlačítko) přesune celou místní složku do Koše;
+    u projektu na serveru akce není."""
+    import shutil
+
+    from PySide6.QtWidgets import QMessageBox
+
+    from spm import recycle
+    local = window.pm.local_dir("Lokalni")
+    (local / "pod").mkdir(parents=True)
+    (local / "pod" / "a.txt").write_text("a")
+    recycled, asked = [], []
+    monkeypatch.setattr(recycle, "to_recycle_bin", lambda paths: recycled.extend(paths)
+                        or [shutil.rmtree(p) for p in paths])
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.Yes)
+    window.refresh(check_names=False)
+    window.table.selectRow(row_of(window, "Forma"))
+    assert not window.act_delete_local.isEnabled() and not window.delete_local_project()
+    window.table.selectRow(row_of(window, "Lokalni"))
+    assert window.act_delete_local.isEnabled()
+    assert window.delete_local_project()
+    assert recycled == [local] and not local.exists() and "(1 souborů)" in asked[0]
+    assert "Lokalni" not in [p.name for p in window.projects]
+
+
+def test_copy_local_path(window):
+    """Kopírovat místní cestu: jen u projektu, na kterém pracuji, nebo „Jen místně“."""
+    from PySide6.QtGui import QGuiApplication
+    window.pm.local_dir("Lokalni").mkdir(parents=True)
+    window.refresh(check_names=False)
+    window.table.selectRow(row_of(window, "Forma"))
+    assert not window._has_local_copy() and window.copy_local_path() == ""
+    window.table.selectRow(row_of(window, "Lokalni"))
+    expected = str(window.pm.local_dir("Lokalni"))
+    assert window.copy_local_path() == expected and QGuiApplication.clipboard().text() == expected
+    window.pm.activate("Forma", lock_paths=[])
+    window.refresh(check_names=False)
+    window.table.selectRow(row_of(window, "Forma"))
+    assert window.copy_local_path() == str(window.pm.local_dir("Forma"))

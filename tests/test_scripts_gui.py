@@ -500,6 +500,8 @@ def confirm_upload(win, monkeypatch, end_session=True, edit=None):
     def accept(dlg, key):
         if hasattr(dlg, "comment"):
             dlg.comment.setPlainText("zmena")
+        if getattr(dlg, "selectable", False):
+            dlg._check_all(True)                    # Odevzdat: vybrat vše
         return True
     monkeypatch.setattr(win, "_exec_dialog", accept)
     win._confirm_upload(pm.plan_upload("058768"), end_session=end_session)
@@ -621,3 +623,28 @@ def test_old_mirror_settings_are_dropped(tmp_path, monkeypatch):
     app.save()
     saved = json.loads(settings.read_text(encoding="utf-8"))
     assert "mirror_rules" not in saved and "mirror_enabled" not in saved
+
+
+def test_before_action_is_deactivate_when_submit_ends_work(window, monkeypatch):
+    """Tlačítko Deaktivovat není – odevzdání všeho práci ukončí. Skript to pozná stejně jako
+    dřív: {ACTION} = deactivate už v BEFORE (zpětná kompatibilita skriptů)."""
+    use_script(window, 'BEFORE\n  STOP "akce {ACTION}"\nEND\n')
+    confirm_upload(window, monkeypatch, end_session=False)              # běžné Odevzdat – vše
+    assert "akce deactivate" in window.shown[-1][0]
+    # jen část (druhý soubor zůstane převzatý) -> odevzdání, práce pokračuje
+    write(window.pm.local_dir("058768") / "dily/nc_codes/E02.nc", "E02 v2")
+    plan = window.pm.plan_upload("058768")
+    e01 = next(bf.file_id for bf, _ in plan.modified if bf.path.endswith("E01.nc"))
+
+    class Part:
+        def __init__(self, *a, **k):
+            pass
+        assignments = staticmethod(lambda: {})
+        comment_text = staticmethod(lambda: "zmena")
+        selected_keys = staticmethod(lambda: {e01})
+        selected_notes = staticmethod(lambda: [])
+        deleteLater = staticmethod(lambda: None)
+    from spm.gui import main_window
+    monkeypatch.setattr(main_window, "UploadDialog", Part)
+    window._confirm_upload(plan, end_session=False)
+    assert "akce submit" in window.shown[-1][0]

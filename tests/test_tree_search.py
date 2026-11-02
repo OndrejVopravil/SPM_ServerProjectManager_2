@@ -154,3 +154,34 @@ def test_search_expands_matching_folders_after_delay(window, tmp_path):
     panel.search.setText("deska")
     panel._expand_timer.timeout.emit()
     assert find_item(panel.tree, "dily").isExpanded() and not find_item(panel.tree, "dily/nc").isExpanded()
+
+
+def test_searching_shown_before_result(window, monkeypatch):
+    """Během hledání (u velkého projektu chvíli trvá) je vidět „Vyhledávám…“, pak počet."""
+    panel = window.panel
+    seen = []
+    real = panel.tree.highlight
+
+    def highlight(match, color):
+        seen.append(panel.found.text())
+        return real(match, color)
+    monkeypatch.setattr(panel.tree, "highlight", highlight)
+    panel.search.setText("xyz")
+    assert seen[-1] == "Vyhledávám…" and panel.found.text() == "Nalezeno: 2"
+    panel.search.clear()
+    assert panel.found.text() == ""
+
+
+def test_search_finds_folders(window):
+    """Hledá se i v názvech složek – nalezená složka se podbarví a rozbalí se cesta k ní."""
+    from PySide6.QtCore import Qt
+    panel = window.panel
+    panel.tree.collapseAll()
+    panel.search.setText("DIL")                                        # složka „dily“
+    folder = find_item(panel.tree, "dily")
+    assert folder.background(0).style() != Qt.BrushStyle.NoBrush
+    assert highlighted(panel.tree) == [] and panel.found.text() == "Nalezeno: 1"
+    panel.search.setText("nc")                                         # složka dily/nc i soubory *.nc
+    assert panel.found.text() == "Nalezeno: 3"
+    panel.expand_found()
+    assert find_item(panel.tree, "dily").isExpanded()

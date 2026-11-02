@@ -190,7 +190,7 @@ def test_click_refreshes_row_without_full_refresh(app, pms, tmp_path, monkeypatc
     w.close()
 
 
-def test_f3_toggles_activation(app, pms, tmp_path, monkeypatch):
+def test_f3_take_or_submit(app, pms, tmp_path, monkeypatch):
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QKeySequence
 
@@ -205,20 +205,20 @@ def test_f3_toggles_activation(app, pms, tmp_path, monkeypatch):
     w.pm = w.panel.pm = bob
     calls = []
     monkeypatch.setattr(w, "activate", lambda: calls.append("activate"))
-    monkeypatch.setattr(w, "deactivate", lambda: calls.append("deactivate"))
+    monkeypatch.setattr(w, "submit", lambda: calls.append("submit"))
     w.refresh(check_names=False)
     names = [p.name for p in w.projects]
 
     keys = {a.shortcut().toString() for a in w.actions() + w.findChildren(type(w.act_refresh))}
     assert {"F3", "F5"} <= keys
 
-    w.table.selectRow(names.index("Forma"))   # volný -> aktivovat
-    w.toggle_activation()
-    w.table.selectRow(names.index("Moje"))    # můj -> deaktivovat
-    w.toggle_activation()
+    w.table.selectRow(names.index("Forma"))   # volný -> převzít (aktivovat)
+    w.toggle_work()
+    w.table.selectRow(names.index("Moje"))    # pracuji na něm -> odevzdat
+    w.toggle_work()
     w.table.clearSelection()                  # nic vybráno -> nic
-    w.toggle_activation()
-    assert calls == ["activate", "deactivate"]
+    w.toggle_work()
+    assert calls == ["activate", "submit"]
     w.panel._thread and settle_panel(w.panel)
     w.close()
 
@@ -425,7 +425,9 @@ def test_panel_delete_to_recycle_bin(app, pms, tmp_path, monkeypatch):
 
     e01 = next(e for e in w.panel.entries if e.path == "sestava/elektrody/E01.elt")
     assert e01.local_deleted
-    assert find(w.panel.tree, "sestava/elektrody/E01.elt").text(1) == "smazán – neodevzdaný"
+    with pytest.raises(KeyError):                                       # ve stromu není
+        find(w.panel.tree, "sestava/elektrody/E01.elt")
+    assert "smazané neodevzdané: <b>1</b>" in w.panel.summary.text()
     assert not any(e.path.endswith("E09.elt") for e in w.panel.entries)   # nový smazán úplně
     assert w.panel.context_actions("sestava/elektrody/E01.elt")["open"] is False
     assert w.panel.context_actions("sestava/elektrody/E01.elt")["delete"] is False
@@ -448,7 +450,8 @@ def test_activation_dialog_skip_option(app, pms):
     assert not on.skip_unlocked()
 
 
-def test_panel_open_unavailable_for_files_not_in_local_copy(app, pms, tmp_path, monkeypatch):
+def test_panel_open_for_files_not_in_local_copy(app, pms, tmp_path, monkeypatch):
+    """Nestažený soubor jde otevřít, pokud je volný (převezme se); cizí nestažený ne."""
     from spm import config
     from spm.gui.main_window import MainWindow
 
@@ -462,7 +465,9 @@ def test_panel_open_unavailable_for_files_not_in_local_copy(app, pms, tmp_path, 
     settle_panel(w.panel)
     app.processEvents()
     assert w.panel.context_actions("dily/deska.elt")["open"] is True
-    assert w.panel.context_actions("sestava/sestava.elt")["open"] is False   # nestaženo
+    assert w.panel.context_actions("sestava/sestava.elt")["open"] is True    # nestaženo, převezme se
+    w.panel.open_taking = None                                               # bez hlavního okna
+    assert w.panel.context_actions("sestava/sestava.elt")["open"] is False   # jen otevřít – nejde
     assert find(w.panel.tree, "sestava/sestava.elt").toolTip(0) == ""
     w.close()
 
@@ -571,6 +576,9 @@ def test_panel_rename_with_f2(app, pms, tmp_path, monkeypatch):
     assert (bob.local_dir("Forma") / "dily" / "deska_pevna.elt").exists()
     item = find(w.panel.tree, "dily/deska_pevna.elt")
     assert item.text(1) == "přejmenován" and "Původně: dily/deska.elt" in item.toolTip(1)
+    from spm.gui.project_panel import COLOR_MINE
+    assert item.foreground(0).color() == COLOR_MINE                            # název zelený – držím ho
+    assert item.foreground(1).color() != COLOR_MINE                            # stav šedě
     assert not any(e.path == "dily/deska.elt" for e in w.panel.entries)        # ne „smazán“
     keys = {a.shortcut().toString() for a in w.panel.tree.actions()}
     assert "F2" in keys
@@ -605,7 +613,11 @@ def test_panel_rename_folder_with_f2(app, pms, tmp_path, monkeypatch):
     assert shown and "nepovolené znaky" in shown[0]
     local = bob.local_dir("Forma")
     assert (local / "dily2" / "deska.elt").exists() and not (local / "dily").exists()
-    assert find(w.panel.tree, "dily2/deska.elt").text(1) == "cesta přejmenována"
+    item = find(w.panel.tree, "dily2/deska.elt")
+    from spm.gui.project_panel import COLOR_MINE
+    assert item.text(1) == "cesta přejmenována" and item.foreground(0).color() == COLOR_MINE
+    novy = find(w.panel.tree, "dily2/novy.elt")                  # nový (nedržený) zůstává šedý
+    assert novy.foreground(0).color() != COLOR_MINE
     w.close()
 
 
@@ -715,3 +727,192 @@ def test_panel_delete_key_deletes_selection(app, pms, tmp_path, monkeypatch):
     delete.trigger()
     assert sorted(p.name for p in kos.iterdir()) == ["E01.elt", "deska.elt"]    # cizí/volný zůstal
     w.close()
+
+
+def test_take_and_submit_route_by_project_state(app, pms, tmp_path, monkeypatch):
+    """Dvě akce místo pěti: Převzít u projektu, na kterém nepracuji, aktivuje (s upozorněním
+    na odsunutí existující místní složky); Odevzdat u složky „Jen místně“ publikuje."""
+    from spm import config
+    from spm.gui import main_window
+    from spm.gui.main_window import MainWindow
+    from spm.gui.project_panel import moved_aside_warning
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    alice, bob = pms
+    (bob.local_dir("Lokalni") / "a.txt").parent.mkdir(parents=True)
+    (bob.local_dir("Lokalni") / "a.txt").write_text("a")
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    calls = []
+    monkeypatch.setattr(w, "activate", lambda pre=None: calls.append("activate"))
+    monkeypatch.setattr(w, "publish", lambda pre=None: calls.append("publish"))
+    monkeypatch.setattr(w, "_start_upload", lambda **k: calls.append("upload"))
+    try:
+        w.refresh(check_names=False)
+        names = [p.name for p in w.projects]
+        w.table.selectRow(names.index("Forma"))
+        assert w.act_take.isEnabled() and not w.act_submit.isEnabled()
+        w.take()
+        w.table.selectRow(names.index("Lokalni"))
+        assert w.act_submit.isEnabled() and not w.act_take.isEnabled()
+        assert "nový projekt na serveru" in w.act_submit.toolTip()
+        w.submit()
+        assert calls == ["activate", "publish"]
+        # upozornění na odsunutí do _puvodni_ jen u existující místní složky
+        assert moved_aside_warning(bob, "Forma") == ""
+        bob.local_dir("Forma").mkdir(parents=True)
+        assert "Forma_puvodni_" in moved_aside_warning(bob, "Forma")
+        assert main_window.moved_aside_warning is moved_aside_warning
+    finally:
+        w.panel._thread and settle_panel(w.panel)
+        w.close()
+
+
+def test_submit_with_nothing_ends_work(app, pms, tmp_path, monkeypatch):
+    """Odevzdat, když nic nedržím a nemám nic k odevzdání (aktivace kvůli nové složce):
+    nabídne ukončit práci – projekt se deaktivuje."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from spm import config
+    from spm.gui import main_window
+    from spm.gui.main_window import MainWindow
+    from spm.lock import active_users
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+    alice, bob = pms
+    bob.activate("Forma", lock_paths=[], only_locked=True)
+
+    def run_now(parent, title, fn, *args, on_done=None, on_error=None, status_text=None, **kwargs):
+        res = fn(*args, progress=None, **kwargs)
+        if on_done:
+            on_done(res)
+    monkeypatch.setattr(main_window, "run_task", run_now)
+    asked, shown = [], []
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a[2]))
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    try:
+        w.refresh(check_names=False)
+        w.table.selectRow([p.name for p in w.projects].index("Forma"))
+        w.submit()
+        assert asked and "Ukončit práci" in asked[0]
+        assert "bob" not in [u.user for u in active_users(bob.server_dir("Forma"))]
+        assert shown and "skončila" in shown[-1]
+    finally:
+        w.panel._thread and settle_panel(w.panel)
+        w.close()
+
+
+@pytest.fixture
+def bob_window(app, pms, tmp_path, monkeypatch):
+    """Okno uživatele bob s okamžitými úlohami (bez vlákna) a zachycenými hláškami."""
+    from PySide6.QtWidgets import QMessageBox
+
+    from spm import config
+    from spm.gui import main_window
+    from spm.gui.main_window import MainWindow
+
+    monkeypatch.setattr(config, "APP_DIR", tmp_path / "app")
+
+    def run_now(parent, title, fn, *args, on_done=None, on_error=None, status_text=None, **kwargs):
+        res = fn(*args, progress=None, **kwargs)
+        if on_done:
+            on_done(res)
+    monkeypatch.setattr(main_window, "run_task", run_now)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    opened = []
+    monkeypatch.setattr(os, "startfile", lambda p: opened.append(str(p)), raising=False)
+    alice, bob = pms
+    w = MainWindow(bob.settings)
+    w.pm = w.panel.pm = bob
+    w.opened = opened
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    settle_panel(w.panel)
+    yield w
+    w.panel._thread and settle_panel(w.panel)
+    w.close()
+
+
+def test_open_takes_free_file_in_inactive_project(bob_window, pms):
+    """Otevřít volný soubor projektu, na kterém nepracuji: projekt se na pozadí aktivuje se
+    zámkem na soubor a soubor se otevře (zapisovatelný). Cizí soubor zůstane neaktivní."""
+    from spm.lock import active_users
+    w = bob_window
+    alice, bob = pms
+    alice.activate("Forma", lock_paths=["dily/deska.elt"])
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    settle_panel(w.panel)
+    assert w.panel.context_actions(["sestava/sestava.elt"])["open"]      # i když není stažený
+    assert not w.panel.context_actions(["dily/deska.elt"])["open"]       # drží alice, není místně
+    w.panel.open_files(["sestava/sestava.elt"])
+    local = bob.local_dir("Forma") / "sestava" / "sestava.elt"
+    assert w.opened == [str(local)] and os.access(local, os.W_OK)
+    assert "bob" in [u.user for u in active_users(bob.server_dir("Forma"))]
+    entries = {e.path: e for e in bob.file_entries("Forma")}
+    assert entries["sestava/sestava.elt"].mine
+
+
+def test_open_takes_free_file_in_my_project(bob_window, pms):
+    """Projekt, na kterém pracuji: Otevřít volný (jen pro čtení) soubor ho převezme; můj
+    soubor jen otevře."""
+    w = bob_window
+    alice, bob = pms
+    bob.activate("Forma", lock_paths=["dily/deska.elt"])
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    settle_panel(w.panel)
+    w.panel.open_files(["dily/deska.elt"])                              # už můj – jen otevřít
+    assert len(w.opened) == 1
+    w.panel.open_files(["sestava/sestava.elt"])
+    local = bob.local_dir("Forma") / "sestava" / "sestava.elt"
+    assert w.opened[-1] == str(local) and os.access(local, os.W_OK)
+    assert {e.path: e for e in bob.file_entries("Forma")}["sestava/sestava.elt"].mine
+
+
+def test_submit_on_project_selects_everything(bob_window, pms):
+    """Odevzdat na projektu (lišta, pravé tlačítko, F3): předem zaškrtnuté vše – převzaté
+    i nové soubory; ze stromu jen předvybrané."""
+    w = bob_window
+    alice, bob = pms
+    bob.activate("Forma", lock_paths=["dily/deska.elt", "sestava/sestava.elt"])
+    local = bob.local_dir("Forma")
+    (local / "dily" / "deska.elt").write_text("zmena")
+    (local / "novy.txt").write_text("novy")
+    w.refresh(check_names=False)
+    w.table.selectRow([p.name for p in w.projects].index("Forma"))
+    seen = {}
+
+    def capture(dlg, key):
+        seen.setdefault("checked", set(dlg.checked))
+        seen.setdefault("all", {e.key for _, e in dlg._entries()})
+        return False
+    w._exec_dialog = capture
+    w.submit()
+    assert seen["checked"] == seen["all"] and len(seen["all"]) == 3   # změna, beze změny, nový
+    seen.clear()
+    w.submit(preselect="novy.txt")
+    assert len(seen["checked"]) == 1
+
+
+def test_take_dialog_requires_a_file(bob_window):
+    """Převzít u projektu, na kterém nepracuji: bez vybraného souboru nejde potvrdit
+    (aktivace bez zámků jen přes novou složku / vložení souborů)."""
+    from PySide6.QtWidgets import QDialogButtonBox
+    w = bob_window
+    seen = []
+
+    def capture(dlg, key):
+        ok = dlg.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        seen.append(ok.isEnabled())
+        dlg.tree.set_all(True)
+        dlg._update_count()
+        seen.append(ok.isEnabled())
+        return False
+    w._exec_dialog = capture
+    w.take()
+    assert seen == [False, True]

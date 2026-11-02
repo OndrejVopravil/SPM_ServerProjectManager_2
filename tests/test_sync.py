@@ -243,15 +243,19 @@ def test_electrode_workflow(electrodes):
     write(local_b / "sestava" / "elektrody" / "E01_NC.nc", "nc program E01")
     plan_b = bob.plan_upload("ProjektA")
     assert [lf.path for lf in plan_b.new] == ["sestava/elektrody/E01_NC.nc"]
-    bob.upload(plan_b, plan_b.default_assignments(), "NC pro E01")
+    res = bob.upload(plan_b, plan_b.default_assignments(), "NC pro E01")
+    # B nic nedrží a vše odevzdal – práce na projektu skončila (místní kopie smazána)
+    assert res.auto_deactivated and [u.user for u in active_users(proj)] == ["alice"]
 
     # A mezitím dokončí E02 a deaktivuje; A si NC od B stáhne aktualizací
     assert alice.refresh("ProjektA").downloaded == ["sestava/elektrody/E01_NC.nc"]
     write(local_a / "sestava" / "elektrody" / "E02.elt", "elektroda 2 hotova")
     run_deactivate(alice, comment="E02 hotova, sestava hotova")
-    assert [u.user for u in active_users(proj)] == ["bob"]
+    assert active_users(proj) == []
 
-    assert bob.refresh("ProjektA").downloaded == ["sestava/elektrody/E02.elt"]
+    # B projekt znovu převezme (bez zámků) – stáhne se i E02
+    bob.activate("ProjektA", lock_paths=[])
+    assert (local_b / "sestava" / "elektrody" / "E02.elt").exists()
     write(local_b / "sestava" / "elektrody" / "E02_NC.nc", "nc program E02")
     run_deactivate(bob, comment="NC pro E02")
     assert active_users(proj) == []
@@ -385,15 +389,22 @@ def test_submitting_last_held_file_deactivates(electrodes):
     assert held
 
 
-def test_no_auto_deactivation_for_user_without_locks(electrodes):
-    """B nic nedrží, jen přidává NC soubory – po odevzdání pracuje dál."""
+def test_auto_deactivation_for_user_without_locks(electrodes):
+    """B nic nedrží, jen přidává NC soubory – po odevzdání všeho nic nedrží ani nemá
+    neodevzdané, práce na projektu končí (samostatné Deaktivovat není). Odevzdá-li jen část
+    nových souborů, pracuje dál."""
     alice, bob, proj = electrodes
     bob.activate("ProjektA", lock_paths=[])
     write(bob.local_dir("ProjektA") / "E01_NC.nc", "nc")
+    write(bob.local_dir("ProjektA") / "E02_NC.nc", "nc")
     plan = bob.plan_upload("ProjektA")
-    res = bob.upload(plan, plan.default_assignments(), "NC")
-    assert not res.auto_deactivated
+    res = bob.upload(plan, plan.default_assignments(), "NC", selected={new_key("E01_NC.nc")})
+    assert not res.auto_deactivated and "neodevzdaných nových" in res.note
     assert "bob" in [u.user for u in active_users(proj)]
+    plan = bob.plan_upload("ProjektA")
+    res = bob.upload(plan, plan.default_assignments(), "NC 2")
+    assert res.auto_deactivated and "bob" not in [u.user for u in active_users(proj)]
+    assert "alice" in [u.user for u in active_users(proj)]                 # cizí práce beze změny
 
 
 def test_no_auto_deactivation_with_unsubmitted_new_files(electrodes):
@@ -616,6 +627,32 @@ def test_rename_rules(electrodes):
         alice.rename_local("ProjektA", "zprava.docx", "nc.txt")           # obsazeno na serveru
     write(alice.local_dir("ProjektA") / "muj_novy.txt", "x")
     assert alice.rename_local("ProjektA", "muj_novy.txt", "muj_novy_2.txt") == "muj_novy_2.txt"  # nový soubor
+
+
+def test_rename_back_to_original_name(electrodes):
+    """A -> B a zpět B -> A: původní název patří mému převzatému souboru (v místní kopii chybí),
+    takže přejmenování zpět jde – u souboru i u složky; odevzdání pak nic nemění."""
+    alice, bob, proj = electrodes
+    local = alice.local_dir("ProjektA")
+    alice.rename_local("ProjektA", "sestava/sestava.elt", "sestava_2.elt")
+    assert alice.rename_local("ProjektA", "sestava/sestava_2.elt", "sestava.elt") == "sestava/sestava.elt"
+    assert alice.local_renames("ProjektA") == {}
+    alice.rename_local_folder("ProjektA", "sestava", "sestava_nova")
+    assert alice.rename_local_folder("ProjektA", "sestava_nova", "sestava") == "sestava"
+    assert (local / "sestava" / "sestava.elt").read_text(encoding="utf-8") == "sestava"
+    plan = alice.plan_upload("ProjektA")
+    assert not plan.has_changes
+    # jiný soubor na místo mého chybějícího – při odevzdání ho nahradí (je to můj soubor)
+    (local / "sestava" / "sestava.elt").unlink()
+    write(local / "sestava" / "nahrada.elt", "nahrada")
+    assert alice.rename_local("ProjektA", "sestava/nahrada.elt", "sestava.elt") == "sestava/sestava.elt"
+    plan = alice.plan_upload("ProjektA")
+    assert [lf.path for _, lf in plan.modified] == ["sestava/sestava.elt"]
+    # soubor, který nedržím, zůstává obsazený
+    bob.activate("ProjektA", lock_paths=[], only_locked=True)        # nic nestahuje
+    write(bob.local_dir("ProjektA") / "bobuv.elt", "b")
+    with pytest.raises(SyncError, match="nejdřív ho převezměte"):
+        bob.rename_local("ProjektA", "bobuv.elt", "zprava.docx")
 
 
 def test_project_list_reads_small_files_only_when_changed(tmp_path, monkeypatch):

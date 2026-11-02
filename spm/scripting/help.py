@@ -45,7 +45,9 @@ Esc = zrušit). Na příkaz nebo funkci skočíte odkazem:</p>
 
 <a name="zaklady"></a><h3>Jak skript běží</h3>
 <p>Skripty vybrané u záložky (okno Skripty, zaškrtnuté) se spustí při každém <b>odevzdání se
-změnami</b> – i při deaktivaci a publikování. Když jsou všechny odevzdávané soubory beze
+změnami</b> – i při odevzdání, kterým práce na projektu končí (vše odevzdáno – deaktivace,
+<code>{ACTION}</code> = deactivate), a při odevzdání složky „Jen místně“ na server
+(publikování, <code>{ACTION}</code> = publish). Když jsou všechny odevzdávané soubory beze
 změny, skript se nespustí.</p>
 <ol>
 <li>Potvrdíte dialog odevzdání.</li>
@@ -53,7 +55,7 @@ změny, skript se nespustí.</p>
 odevzdají také).</li>
 <li>Soubory se nahrají na server, zámky se uvolní.</li>
 <li>Proběhne zbytek skriptu (zrcadlení, kopie, archivy…).</li>
-<li>Při deaktivaci se smaže místní kopie.</li>
+<li>Při deaktivaci (odevzdáno vše) se smaže místní kopie.</li>
 </ol>
 <p>Skript pracuje <b>jen se soubory tohoto odevzdání</b> (množina <code>commit</code>) a smí je
 jen číst. Chyba v zápisu skriptu nebo chyba v BEFORE = <b>nic se neodevzdá</b>. Chyba po

@@ -29,7 +29,7 @@ def _name_dialog_via_get_text(monkeypatch):
     from spm.gui import name_dialog
     if not hasattr(name_dialog, "real_ask_text"):
         name_dialog.real_ask_text = name_dialog.ask_text
-    monkeypatch.setattr(name_dialog, "ask_text", lambda parent, title, label, text="", suggestions=():
+    monkeypatch.setattr(name_dialog, "ask_text", lambda parent, title, label, text="", suggestions=(), *a, **k:
                         QInputDialog.getText(parent, title, label, QLineEdit.EchoMode.Normal, text))
     yield
 

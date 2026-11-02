@@ -20,6 +20,34 @@ def test_child_folders():
     assert child_folders(paths, "sestava/elektrody/") == []
 
 
+def test_child_names_and_keep_extension():
+    from spm.gui.name_dialog import child_names, keep_extension
+    paths = ["sestava/elektrody/E01.elt", "sestava/sestava.elt", "sestava/Vykresy/", "dily/deska.elt",
+             "koren.txt"]
+    assert child_names(paths, "") == ["dily", "koren.txt", "sestava"]      # soubory i složky
+    assert child_names(paths, "sestava/") == ["elektrody", "sestava.elt", "Vykresy"]
+    assert keep_extension("vykres.pdf", "vykres_v2") == "vykres_v2.pdf"    # smazaná koncovka zůstane
+    assert keep_extension("vykres.pdf", "vykres_v2.") == "vykres_v2.pdf"
+    assert keep_extension("vykres.pdf", "vykres.dwg") == "vykres.dwg"      # jiná napsaná koncovka
+    assert keep_extension("README", "CTIMNE") == "CTIMNE"                  # bez koncovky
+
+
+def test_file_rename_dialog_selects_name_without_extension(qapp, monkeypatch):
+    from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit
+
+    from spm.gui import name_dialog
+    seen = {}
+
+    def exec_(dlg):
+        QApplication.processEvents()                                  # odložené označení
+        edit = dlg.findChild(QLineEdit)
+        seen["selected"] = edit.selectedText()
+        return QInputDialog.DialogCode.Accepted
+    monkeypatch.setattr(QInputDialog, "exec", exec_)
+    name_dialog.real_ask_text(None, "Přejmenovat soubor", "Název:", "deska.v2.pdf", ["a.pdf"], file_name=True)
+    assert seen["selected"] == "deska.v2"
+
+
 def test_dialog_offers_sibling_names(qapp, monkeypatch):
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QInputDialog, QLineEdit
@@ -58,7 +86,7 @@ def test_project_panel_suggests_and_copies_names(qapp, tmp_path, monkeypatch):
         (server / f).write_text("x", encoding="utf-8")
     pm = ProjectManager(Settings(server_root=str(tmp_path / "server"), local_root=str(tmp_path / "local")),
                         user="alice", pc="PC")
-    pm.activate("Forma", lock_paths=[])
+    pm.activate("Forma", lock_paths=["sestava/elektrody/E01.elt", "dily/deska.elt"])
     pm.create_local_folder("Forma", "sestava/", "Prazdna")              # prázdná místní složka
     panel = ProjectPanel(pm)
     panel.can_activate = lambda: True
@@ -73,6 +101,17 @@ def test_project_panel_suggests_and_copies_names(qapp, tmp_path, monkeypatch):
     assert offered == [[]] and (pm.local_dir("Forma") / "sestava/elektrody/E03").is_dir()
     panel.create_folder("sestava/")
     assert offered[-1] == ["elektrody", "Prazdna"]
+    # přejmenování souboru: nabízejí se soubory i složky na stejné úrovni, koncovka zůstane
+    offered.clear()
+    settle_panel(panel)                                                # strom i s novou složkou E03
+    monkeypatch.setattr(name_dialog, "ask_text",
+                        lambda *a, **k: offered.append((list(a[4]), k.get("file_name"))) or ("E05", True))
+    panel._rename("sestava/elektrody/E01.elt")
+    assert offered == [(["E02.elt", "E03"], True)]
+    assert (pm.local_dir("Forma") / "sestava/elektrody/E05.elt").is_file()
+    settle_panel(panel)
+    panel._rename("dily/")                                           # složka: sousedé v kořeni
+    assert offered[-1] == (["sestava"], None)
     # Kopírovat název – jen názvy, bez cesty
     assert panel.copy_names(["sestava/elektrody/E01.elt"]) == "E01.elt"
     assert QApplication.clipboard().text() == "E01.elt"

@@ -11,10 +11,17 @@ if (!defined('SPM_WEB')) {
 }
 
 // --- aktuální verze aplikace (odpověď na hlášení – upozornění na aktualizaci) ---
-const SPM_LATEST_VERSION = '0.1.27';
-const SPM_DOWNLOAD_URL = 'https://spm.vopravil.cz/download/SPM-0.1.27.zip';
-const SPM_RELEASE_NOTES = "Převzít zaeviduje soubory, které v evidenci chybí.\n"
-    . "Anonymní statistika používání a upozornění na novou verzi.";
+const SPM_LATEST_VERSION = '0.1.29';
+const SPM_DOWNLOAD_URL = 'https://spm.vopravil.cz/download/SPM-0.1.29.zip';
+const SPM_RELEASE_NOTES = "Jen dvě hlavní akce: Převzít a Odevzdat (F3 podle stavu projektu); složku „Jen místně“ Odevzdat publikuje na server.\n"
+    . "Po odevzdání všeho práce na projektu skončí sama (projekt se deaktivuje).\n"
+    . "Otevřít soubor, který nemáte převzatý, ho na pozadí převezme.\n"
+    . "Menu projektu: Kopírovat místní cestu; smazání složky „Jen místně“ do Koše.\n"
+    . "Přejmenování zachová koncovku, našeptává názvy na stejné úrovni a jde i zpět na původní název.\n"
+    . "Hledání i v názvech složek a v záložce Složka (Vyhledávám… / Nalezeno: N); Sbalit všechny složky.\n"
+    . "Vzkaz zůstává otevřený, dokud ho autor neoznačí jako dokončený.\n"
+    . "Smazané neodevzdané soubory se ve stromu neukazují; přejmenovaný převzatý soubor zůstává zelený.\n"
+    . "Nový vzhled webu.";
 
 // --- data ---
 // Složka s databází (SQLite). Nejlépe mimo veřejnou složku webu; když to hosting neumožní,

@@ -84,7 +84,7 @@ def test_two_panes_with_different_tabs(qapp, app_settings):
         assert w.table is right.table and names(w) == ["Beta"]
         right.table.selectRow(0)
         settle_panel(right.panel)
-        assert w.act_activate.isEnabled() and w.selected().name == "Beta"
+        assert w.act_take.isEnabled() and w.selected().name == "Beta"
         assert right.side.indexOf(right.notes) >= 0 and left.side.indexOf(left.notes) >= 0  # každý své
         assert w.notes.name == "Beta"
         left.table.selectRow(0)                       # výběr v neaktivním panelu lištu nemění

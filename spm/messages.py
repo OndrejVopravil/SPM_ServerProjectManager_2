@@ -10,10 +10,11 @@ nikdy nepřepíšou:
 
 Vzkaz má aspoň jednoho adresáta (může to být i sám autor – připomínka sobě); za vyřízený se
 považuje, když ho vyřeší aspoň jeden z adresátů, nebo když ho autor označí jako dokončený (je
-vidět kdo). Na vědomí (zmínka „@jméno“) může označit „přečteno“. Projekty zmíněné „#název“
-jsou odkazy (s identitou projektu, aby odkaz přežil přejmenování).
+vidět kdo). Otevřený zůstává, dokud ho autor neoznačí jako dokončený. Na vědomí (zmínka
+„@jméno“) může označit „přečteno“. Projekty zmíněné „#název“ jsou odkazy (s identitou
+projektu, aby odkaz přežil přejmenování).
 
-Archiv vzkazů: vzkaz vyřízený / dokončený před více než messages_archive_days dny (a bez nové
+Archiv vzkazů: vzkaz dokončený autorem před více než messages_archive_days dny (a bez nové
 odpovědi) přesune kterýkoli klient do <síťová složka>/.spm/vzkazy/_archiv/ – jen přejmenování
 složky, nic se nemaže. Běžná kontrola vzkazů archiv nečte (zobrazí se na vyžádání); každá
 změna archivovaného vzkazu (odpověď, vyřízení…) ho vrátí zpět mezi aktivní.
@@ -137,6 +138,12 @@ class Message:
     @property
     def resolved(self) -> bool:
         return bool(self.resolvers)
+
+    @property
+    def completed(self) -> bool:
+        """Autor vzkaz označil jako dokončený (u připomínky sobě = vyřídil ji) – až potom vzkaz
+        přestane být otevřený a může do archivu."""
+        return self.resolved_by(self.user)
 
     def resolved_by(self, login: str) -> bool:
         s = self.states.get(login.lower())
@@ -276,7 +283,7 @@ class MessageStore:
         return sorted(result, key=lambda m: m.last_activity, reverse=True)
 
     def archive_old(self, messages: list[Message], days: int, today: datetime | None = None) -> list[str]:
-        """Přesune do archivu vzkazy vyřízené / dokončené před více než days dny (bez nové
+        """Přesune do archivu vzkazy dokončené autorem před více než days dny (bez nové
         odpovědi). Nejvýš jednou denně; days 0 = nearchivovat. Vrací id přesunutých."""
         today = today or datetime.now()
         if days <= 0 or self._archived_on == today.strftime("%Y-%m-%d"):
@@ -285,7 +292,7 @@ class MessageStore:
         limit = (today - timedelta(days=days)).isoformat(timespec="seconds")
         moved = []
         for m in messages:
-            if m.archived or not m.resolved or m.closed_at >= limit:
+            if m.archived or not m.completed or m.closed_at >= limit:
                 continue
             try:
                 archive_message(m)

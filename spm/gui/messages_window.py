@@ -1,6 +1,7 @@
 """Okno Vzkazy – poznámky pro konkrétní uživatele, nevázané na projekt (viz messages.py).
 
-- Nahoře filtry: Otevřené / Pro mě / Odeslané / Vše (vidět jsou jen vzkazy, které se mě týkají).
+- Nahoře filtry: Otevřené / Pro mě / Odeslané / Vše (vidět jsou jen vzkazy, které se mě týkají);
+  otevřený je vzkaz, dokud ho autor neoznačí jako dokončený (i když ho adresát už vyřídil).
 - Karty vzkazů jako u poznámek projektu: vyřízení (adresát), přečteno (na vědomí), odpověď
   a úprava přímo v kartě; „#projekt“ je odkaz (vybere projekt v seznamu).
 - Dole psaní nového vzkazu: adresáti výběrem (aspoň jeden), „@jméno“ = na vědomí,
@@ -74,7 +75,7 @@ def visible(m: Message, flt: str, me: str) -> bool:
     if not m.involves(me):
         return False
     if flt == FILTER_OPEN:
-        return not m.resolved
+        return not m.completed   # vyřízený adresátem zůstává otevřený, dokud ho autor nedokončí
     if flt == FILTER_MINE:
         return for_me(m, me)
     if flt == FILTER_SENT:
@@ -173,7 +174,8 @@ class MessageCard(QFrame):
         if m.is_recipient(me):
             self.resolved = QCheckBox("Vyřízeno")
             self.resolved.setChecked(m.resolved_by(me))
-            self.resolved.setToolTip("Vzkaz je vyřízený, když ho vyřeší aspoň jeden z adresátů")
+            self.resolved.setToolTip("Vzkaz je vyřízený, když ho vyřeší aspoň jeden z adresátů; "
+                                     "otevřený zůstane, dokud ho autor neoznačí jako dokončený")
             self.resolved.toggled.connect(lambda on: window.resolve(m, on))
             row.addWidget(self.resolved)
         elif m.is_author(me):

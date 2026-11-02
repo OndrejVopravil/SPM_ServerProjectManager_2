@@ -32,12 +32,14 @@ class PublishDialog(QDialog):
         """files: soubory v místní složce; invalid: soubory s nepovolenými znaky (nelze vybrat);
         preselect: soubor / složka ('/' na konci) předvybraná – jinak je vybráno vše."""
         super().__init__(parent)
-        self.setWindowTitle(f"Publikovat projekt {name}")
+        self.setWindowTitle(f"Odevzdat na server jako nový projekt – {name}")
         self.resize(780, 640)
         self.total = len(files)
 
         intro = QLabel(
-            f"Vybrané soubory se přesunou na server jako nový projekt:<br><b>{server_path}</b><br><br>"
+            f"Složka zatím existuje jen u vás. Vybrané soubory se přesunou na server jako "
+            f"<b>nový projekt</b>, který uvidí a mohou na něm pracovat všichni uživatelé této "
+            f"síťové složky (publikování):<br><b>{server_path}</b><br><br>"
             "Po nahrání a ověření se z místní složky odstraní. Pokud nepublikujete vše, zbylé soubory "
             f"se odloží do místní složky <b>{name}_puvodni_&lt;datum&gt;</b> (zůstane „Jen místně“).")
         intro.setWordWrap(True)
@@ -70,7 +72,7 @@ class PublishDialog(QDialog):
         self.error.setStyleSheet("color: #c0392b;")
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Publikovat")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Odevzdat na server")
         self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)

@@ -52,6 +52,7 @@ class TreeEntry:
     enabled: bool = True                    # False = nelze vybrat (např. drží jiný uživatel)
     color: QColor | None = None             # barva textu dalších sloupců
     color_name: bool = False                # obarvit barvou i název souboru
+    name_color: QColor | None = None        # vlastní barva názvu (přednost před color_name)
     file_path: str | None = None            # skutečný soubor na disku – pro jeho vlastní ikonu
     tooltip: str = ""
     folder: bool = False                    # položka je (prázdná) složka – path končí '/' 
@@ -143,6 +144,8 @@ class CheckTree(QTreeWidget):
             if e.color is not None:
                 for c in range(0 if e.color_name else 1, extra + 1):
                     item.setForeground(c, e.color)
+            if e.name_color is not None:
+                item.setForeground(0, e.name_color)
             if not e.enabled:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsUserCheckable)
             elif self.checkable:
@@ -172,7 +175,8 @@ class CheckTree(QTreeWidget):
         self.blockSignals(False)
 
     def highlight(self, match, color: QColor) -> list[QTreeWidgetItem]:
-        """Podbarví soubory, jejichž název odpovídá match(název) (None = zrušit podbarvení).
+        """Podbarví soubory i složky, jejichž název odpovídá match(název) (None = zrušit
+        podbarvení).
         Text podbarvených je černý (čitelný na světlém pozadí i v tmavém motivu); po zrušení
         se vrátí původní barva textu. Vrací podbarvené položky."""
         found = []
@@ -180,7 +184,7 @@ class CheckTree(QTreeWidget):
         black = QBrush(QColor("black"))
         columns = range(self.columnCount())
         self.blockSignals(True)
-        for item in self.leaf_items():
+        for item in all_items(self):
             hit = match is not None and match(item.text(0))
             saved = item.data(0, SAVED_FOREGROUND_ROLE)
             if hit:

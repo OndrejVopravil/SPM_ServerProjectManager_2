@@ -57,6 +57,7 @@ from ..sync import (
     PublishResult,
     UploadResult,
     OLD_COPY_DAYS,
+    auto_deactivation,
     has_script_changes,
     old_local_copy,
     selection_files,
@@ -79,7 +80,7 @@ from .tab_bar import TAB_COLORS, ColorTabBar, is_dark
 from .. import notes as notes_mod
 from .file_select_dialog import FileSelectDialog
 from .file_history_dialog import FileHistoryDialog
-from .project_panel import ProjectPanel
+from .project_panel import ProjectPanel, moved_aside_warning
 from .publish_dialog import PublishDialog
 from . import name_dialog, selection_style
 from .archive_dialog import ArchiveListDialog, ArchiveProjectDialog
@@ -334,18 +335,14 @@ class MainWindow(QMainWindow):
         self.act_refresh = self._action(tb, "Obnovit", self.refresh_all, QKeySequence(Qt.Key.Key_F5),
                                         tip="Obnoví seznam projektů (F5)")
         tb.addSeparator()
-        self.act_activate = self._action(tb, "Aktivovat…", self.activate,
-                                         tip="Stáhne projekt a zamkne vybrané soubory k úpravě (F3)")
-        self.act_submit = self._action(tb, "Odevzdat…", self.submit,
-                                       tip="Nahraje vybrané změny na server a uvolní je – projekt zůstane aktivovaný")
+        # práce se soubory: jen dvě akce – Převzít (projekt, na kterém nepracuji, se aktivuje sám)
+        # a Odevzdat (po odevzdání všeho se projekt sám deaktivuje; složku „Jen místně“ odevzdá
+        # na server jako nový projekt – publikování). Popisky se mění podle projektu (_update_actions).
+        self.act_take = self._action(tb, "Převzít…", self.take)
+        self.act_submit = self._action(tb, "Odevzdat…", self.submit)
         self.act_update = self._action(tb, "Aktualizovat", self.update_from_server,
                                        tip="Stáhne ze serveru soubory, které odevzdali ostatní")
-        self.act_take = self._action(tb, "Převzít…", self.take,
-                                     tip="Zamkne další volné soubory k úpravě")
-        self.act_deactivate = self._action(tb, "Deaktivovat…", self.deactivate,
-                                           tip="Odevzdá vše, uvolní všechny zámky a ukončí aktivaci (F3)")
         tb.addSeparator()
-        self.act_publish = self._action(tb, "Publikovat…", self.publish)
         self.act_open = self._action(tb, "Otevřít místní složku", self.open_local)
         self.act_history = self._action(tb, "Historie", self.history)
         self.act_messages = self._action(tb, "Vzkazy", self.open_messages,
@@ -366,22 +363,19 @@ class MainWindow(QMainWindow):
         self._action(tb, "Nastavení", self.open_settings)
 
         # Popisky zkratek: v liště „Obnovit (F5)“, v kontextové nabídce zarovnaně vpravo.
-        # F3 je jedna zkratka pro dvě akce (viz toggle_activation), proto se u aktivace
-        # a deaktivace jen zobrazuje (text za tabulátorem), nenastavuje se jako shortcut.
+        # F3 je jedna zkratka pro dvě akce (viz toggle_work), proto se jen zobrazuje (text
+        # za tabulátorem), nenastavuje se jako shortcut.
         self.act_refresh.setIconText("Obnovit (F5)")
-        self.act_activate.setText("Aktivovat…\tF3")
-        self.act_activate.setIconText("Aktivovat (F3)")
-        self.act_deactivate.setText("Deaktivovat…\tF3")
-        self.act_deactivate.setIconText("Deaktivovat (F3)")
 
-        # F3 = aktivovat / deaktivovat podle stavu vybraného projektu
+        # F3 = převzít / odevzdat podle stavu vybraného projektu
         toggle = QAction(self)
         toggle.setShortcut(QKeySequence(Qt.Key.Key_F3))
-        toggle.triggered.connect(lambda: self.toggle_activation())
+        toggle.triggered.connect(lambda: self.toggle_work())
         self.addAction(toggle)
 
         # jen v kontextovém menu (pravé tlačítko)
-        self.act_cancel = QAction("Zrušit aktivaci…", self)
+        self.act_cancel = QAction("Zahodit neodevzdané změny a uvolnit zámky…", self)
+        self.act_cancel.setToolTip("Ukončí práci na projektu bez nahrání změn (zrušení aktivace)")
         self.act_cancel.triggered.connect(lambda: self.cancel_activation())
         self.act_unlock = QAction("Odebrat zámky uživatele…", self)
         self.act_unlock.triggered.connect(lambda: self.force_unlock())
@@ -389,6 +383,9 @@ class MainWindow(QMainWindow):
         self.act_rename.setShortcut(QKeySequence(Qt.Key.Key_F2))
         self.act_rename.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         self.act_rename.triggered.connect(lambda: self.rename_project())
+        self.act_delete_local = QAction("Smazat… (do Koše)", self)
+        self.act_delete_local.setToolTip("Přesune celou místní složku projektu „Jen místně“ do Koše")
+        self.act_delete_local.triggered.connect(lambda: self.delete_local_project())
         self.act_archive = QAction("Archivovat…", self)
         self.act_archive.setToolTip("Zabalí dokončený projekt do archivu (zip) a odstraní ho z pracovní složky")
         self.act_archive.triggered.connect(lambda: self.archive_selected())
@@ -611,7 +608,7 @@ class MainWindow(QMainWindow):
         # šířky sloupců: uložené od minula, jinak se jednou nastaví podle obsahu
         self._columns_sized = restore_header(settings, HEADER_KEY + pane.key, self.table.horizontalHeader())
         self.table.itemSelectionChanged.connect(self._in(pane, self._on_selection))
-        # dvojklik: název = aktivovat / deaktivovat, komentář = upravit, jinak místní složka projektu
+        # dvojklik: název = převzít / odevzdat, komentář = upravit, jinak místní složka projektu
         self.table.doubleClicked.connect(self._in(pane, self._on_double_click))
         self.table.addAction(self.act_rename)
         self.table.addAction(self.act_favorite)
@@ -645,6 +642,7 @@ class MainWindow(QMainWindow):
         # aktivnímu panelu: při tažení z jednoho panelu do druhého je aktivní ten zdrojový)
         self.panel.can_activate = self._in(pane, lambda: self._can_activate_selected())
         self.panel.quick_activate = self._in(pane, lambda: self.quick_activate())
+        self.panel.open_taking = self._in(pane, lambda paths: self.open_taking(paths))
         self.panel.mirror_source_label = self.mirror_source_label
         self.panel.mirror_target_label = self.mirror_target_label
         self.panel.tree.default_expanded = settings.tree_expanded  # výchozí stav složek ve stromu
@@ -1277,7 +1275,7 @@ class MainWindow(QMainWindow):
         if int(self.settings.ui.get(f"activated.{ws_id}") or 0):
             QMessageBox.warning(self, "Odebrat záložku",
                                 f"Na záložce „{ws['name']}“ máte aktivované projekty.\n"
-                                "Nejdřív je deaktivujte.")
+                                "Nejdřív je odevzdejte (nebo zahoďte neodevzdané změny).")
             return
         answer = QMessageBox.question(
             self, "Odebrat záložku",
@@ -1583,7 +1581,7 @@ class MainWindow(QMainWindow):
         if issues:
             color = COLOR_INVALID
             tip = ("Projekt obsahuje názvy s nepovolenými znaky – nelze ho "
-                   + ("publikovat" if p.local_only else "aktivovat")
+                   + ("odevzdat na server" if p.local_only else "převzít")
                    + ", dokud je neopravíte:\n\n" + format_invalid(issues))
         elif p.local_only:
             color = self.palette().color(QPalette.ColorRole.PlaceholderText)
@@ -1845,11 +1843,26 @@ class MainWindow(QMainWindow):
         p = self.selected()
         issues = bool(self.issues_of(p))
         mine = bool(p and p.mine)
-        self.act_activate.setEnabled(self._can_activate_selected())
-        for act in (self.act_submit, self.act_update, self.act_take, self.act_deactivate, self.act_cancel):
+        local_only = bool(p and p.local_only)
+        for act in (self.act_update, self.act_cancel):
             act.setEnabled(mine)
-        # i se soubory s nepovolenými znaky – dialog je nedovolí vybrat, zbytek publikovat lze
-        self.act_publish.setEnabled(bool(p and p.local_only))
+        can_take = self._can_activate_selected()
+        self.act_take.setEnabled(mine or can_take)
+        # i se soubory s nepovolenými znaky – dialog je nedovolí vybrat, zbytek odevzdat lze
+        self.act_submit.setEnabled(mine or local_only)
+        # F3 (toggle_work) u projektu, na kterém pracuji, odevzdá, jinak převezme
+        f3_take, f3_submit = ("", "\tF3") if mine else (("\tF3", "") if can_take else ("", ""))
+        self.act_take.setText("Převzít…" + f3_take)
+        self.act_take.setIconText("Převzít (F3)" if f3_take else "Převzít")
+        self.act_take.setToolTip(
+            "Zamkne další volné soubory k úpravě a stáhne jejich aktuální verzi" if mine else
+            "Stáhne projekt a zamkne vybrané soubory k úpravě – začnete na projektu pracovat (F3)")
+        self.act_submit.setText("Odevzdat…" + f3_submit)
+        self.act_submit.setIconText("Odevzdat (F3)" if f3_submit else "Odevzdat")
+        self.act_submit.setToolTip(
+            "Vytvoří ze složky „Jen místně“ nový projekt na serveru (publikování)" if local_only else
+            "Nahraje vybrané změny na server a uvolní je. Když odevzdáte vše, práce na projektu "
+            "skončí (projekt se deaktivuje) (F3)")
         self.act_invalid.setEnabled(issues)
         self.act_open.setEnabled(bool(self.settings.local_root))
         self.act_open.setToolTip(
@@ -1859,6 +1872,7 @@ class MainWindow(QMainWindow):
         self.act_notes.setEnabled(bool(p and not p.local_only))
         self.act_restore.setEnabled(bool(p and not p.local_only))
         self.act_rename.setEnabled(bool(p and not p.active))
+        self.act_delete_local.setEnabled(bool(p and p.local_only))
         self.act_comment.setEnabled(bool(p and not p.local_only))
         self.act_unlock.setEnabled(bool(p and p.others))
         self.act_rerun_scripts.setEnabled(bool(p and p.script_pending))
@@ -1882,11 +1896,15 @@ class MainWindow(QMainWindow):
         act_copy_name = QAction("Kopírovat název", menu)
         act_copy_name.setToolTip("Název projektu do schránky")
         act_copy_name.triggered.connect(lambda: self.copy_project_name())
-        actions = [self.act_activate, self.act_submit, self.act_update, self.act_take,
-                   self.act_deactivate, self.act_publish, None, self.act_open, self.act_history, self.act_notes,
+        act_copy_path = QAction("Kopírovat místní cestu", menu)
+        act_copy_path.setToolTip("Cesta k místní složce projektu do schránky")
+        act_copy_path.triggered.connect(lambda: self.copy_local_path())
+        act_copy_path.setEnabled(self._has_local_copy())
+        actions = [self.act_take, self.act_submit, self.act_update, None, self.act_open, self.act_history, self.act_notes,
                    self.act_restore, self.act_storage, self.act_archive, None, self.act_favorite,
                    self.act_comment,
-                   self.act_rename, act_copy_name, None,
+                   self.act_rename, act_copy_name, act_copy_path, None,
+                   *([self.act_delete_local, None] if self.act_delete_local.isEnabled() else []),
                    self.act_cancel, self.act_unlock,
                    None, act_create, self.act_refresh]
         if self.act_invalid.isEnabled():
@@ -1913,9 +1931,11 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
 
     def activate(self, preselect: str | list[str] | None = None) -> None:
-        """preselect: soubory / složky ('/' na konci) předem zaškrtnuté (označené v panelu stromu)."""
+        """První převzetí: projekt, na kterém zatím nepracuji, se aktivuje (stáhne) a vybrané
+        soubory se zamknou. preselect: soubory / složky ('/' na konci) předem zaškrtnuté
+        (označené v panelu stromu)."""
         p = self.selected()
-        if not p or not self.act_activate.isEnabled():
+        if not p or not self._can_activate_selected():
             return
         entries = self._entries(p)
         if entries is None:
@@ -1926,8 +1946,12 @@ class MainWindow(QMainWindow):
                  "Nové soubory můžete vytvářet kdekoliv.")
         if others:
             intro += f"\n\nNa projektu právě pracuje: {others}. Jejich soubory vybrat nelze."
-        dlg = FileSelectDialog(f"Aktivovat projekt {p.name}", intro, entries, "Aktivovat", self,
-                               root=self.pm.server_dir(p.name),
+        warning = moved_aside_warning(self.pm, p.name)
+        if warning:
+            intro += "\n\n" + warning
+        # bez vybraného souboru Převzít nejde (aktivace bez zámků jen přes novou složku / vložení)
+        dlg = FileSelectDialog(f"Převzít – projekt {p.name}", intro, entries, "Převzít", self,
+                               allow_empty=False, root=self.pm.server_dir(p.name),
                                skip_option=self.settings.skip_unlocked_download,
                                mirror_label=self.mirror_source_label, preselect=preselect)
         accepted = self._exec_dialog(dlg, "select_files")
@@ -1937,7 +1961,7 @@ class MainWindow(QMainWindow):
             return
 
         def done(res: ActivationResult) -> None:
-            msg = (f"Projekt {p.name} byl aktivován a zkopírován do:\n{self.pm.local_dir(p.name)}\n\n"
+            msg = (f"Projekt {p.name} byl stažen do:\n{self.pm.local_dir(p.name)}\n\n"
                    + (f"Staženo a zamčeno k úpravě: {len(paths)} souborů. Ostatní soubory se "
                       "nestahovaly (získáte je Převzetím)." if only_locked else
                       f"Zamčeno k úpravě: {len(paths)} souborů, ostatní jsou jen pro čtení."))
@@ -1945,12 +1969,12 @@ class MainWindow(QMainWindow):
                 msg += f"\n\nPůvodní místní složka byla přesunuta do:\n{res.moved_to}"
             self.refresh()
             if res.external:
-                QMessageBox.warning(self, "Aktivace", msg + "\n\n" + format_external(res.external))
+                QMessageBox.warning(self, "Převzít", msg + "\n\n" + format_external(res.external))
             else:
-                QMessageBox.information(self, "Aktivace", msg)
+                QMessageBox.information(self, "Převzít", msg)
             self._open_notes_if_new(p.name, only_for_me=False, after_activation=True)
 
-        run_task(self, f"Aktivace projektu {p.name}", self.pm.activate, p.name, paths,
+        run_task(self, f"Převzetí projektu {p.name}", self.pm.activate, p.name, paths,
                  only_locked=only_locked, status_text="Přenáším data…",
                  on_done=done, on_error=lambda _: self.refresh())
 
@@ -1981,9 +2005,14 @@ class MainWindow(QMainWindow):
         return True
 
     def take(self, preselect: str | list[str] | None = None) -> None:
-        """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
+        """Převzít: u projektu, na kterém pracuji, zamkne další soubory; jinak projekt aktivuje
+        (první převzetí – activate). preselect: soubor / složka ('/' na konci) předem zaškrtnutá
+        (z panelu stavu projektu)."""
         p = self.selected()
-        if not p or not p.mine:
+        if p and not p.mine:
+            self.activate(preselect)
+            return
+        if not p:
             return
         entries = self._entries(p)
         if entries is None:
@@ -2013,6 +2042,48 @@ class MainWindow(QMainWindow):
         run_task(self, f"Převzetí souborů – {p.name}", self.pm.take, p.name, paths,
                  status_text="Přenáším data…", on_done=done, on_error=lambda _: self.refresh())
 
+    def open_taking(self, paths: list[str]) -> None:
+        """Otevřít ze stromu: volné soubory, které nemám převzaté, se na pozadí převezmou
+        (u projektu, na kterém nepracuji, se projekt aktivuje – stáhne se jako při Převzít
+        podle nastavení „Nestahovat neaktivované soubory“) a pak se otevřou. Cizí soubory se
+        otevřou z místní kopie jen pro čtení."""
+        p = self.selected()
+        panel = self.panel
+        if not p or p.local_only:
+            return
+        to_take = [e.path for e in panel.entries if e.path in paths and e.free]
+        if not to_take:
+            panel.open_local_paths(paths)
+            return
+
+        def opened(external: list, conflicts: list[str] | None = None) -> None:
+            self.refresh()
+            panel.open_local_paths(paths)
+            notes = list(conflicts or [])
+            if external:
+                notes.append(format_external(external))
+            if notes:
+                QMessageBox.warning(self, "Otevřít", f"Převzato k úpravě: {len(to_take)} souborů.\n\n"
+                                    + "\n\n".join(notes))
+
+        if p.mine:
+            run_task(self, f"Převzetí souborů – {p.name}", self.pm.take, p.name, to_take,
+                     status_text="Přebírám soubory…",
+                     on_done=lambda res: opened(res.external, res.conflicts),
+                     on_error=lambda _: self.refresh())
+            return
+        if not self._can_activate_selected():
+            panel.open_local_paths(paths)
+            return
+        warning = moved_aside_warning(self.pm, p.name)
+        if warning and QMessageBox.question(
+                self, "Otevřít", f"Soubor se před otevřením převezme – na projektu {p.name} začnete "
+                f"pracovat.\n\n{warning}\n\nPokračovat?") != QMessageBox.StandardButton.Yes:
+            return
+        run_task(self, f"Převzetí projektu {p.name}", self.pm.activate, p.name, to_take,
+                 only_locked=self.settings.skip_unlocked_download, status_text="Přebírám soubory…",
+                 on_done=lambda res: opened(res.external), on_error=lambda _: self.refresh())
+
     def update_from_server(self) -> None:
         p = self.selected()
         if not p or not p.mine:
@@ -2030,19 +2101,24 @@ class MainWindow(QMainWindow):
         run_task(self, f"Aktualizace ze serveru – {p.name}", self.pm.refresh, p.name,
                  status_text="Přenáším data…", on_done=done, on_error=lambda _: self.refresh())
 
-    def toggle_activation(self) -> None:
-        """F3: můj aktivovaný projekt deaktivuje, jinak (lze-li) aktivuje."""
-        if self.act_deactivate.isEnabled():
-            self.deactivate()
-        elif self.act_activate.isEnabled():
+    def toggle_work(self) -> None:
+        """F3: u projektu, na kterém pracuji, Odevzdat, jinak (lze-li) Převzít."""
+        p = self.selected()
+        if p and p.mine:
+            self.submit()
+        elif self._can_activate_selected():
             self.activate()
 
     def submit(self, preselect: str | list[str] | None = None) -> None:
-        """preselect: soubor / složka ('/' na konci) předem zaškrtnutá (z panelu stavu projektu)."""
+        """Odevzdat: změny projektu, na kterém pracuji; složku „Jen místně“ odevzdá na server
+        jako nový projekt (publish). preselect: soubor / složka ('/' na konci) předem
+        zaškrtnutá (ze stromu souborů); bez něj (lišta, pravé tlačítko na projektu, F3) je
+        předem zaškrtnuté vše – převzaté i nové soubory."""
+        p = self.selected()
+        if p and p.local_only:
+            self.publish(preselect)
+            return
         self._start_upload(end_session=False, preselect=preselect)
-
-    def deactivate(self) -> None:
-        self._start_upload(end_session=True)
 
     def _start_upload(self, end_session: bool, preselect: str | list[str] | None = None) -> None:
         p = self.selected()
@@ -2084,6 +2160,9 @@ class MainWindow(QMainWindow):
 
     def _confirm_upload(self, plan: UploadPlan, end_session: bool,
                         preselect: str | list[str] | None = None) -> None:
+        if not end_session and not plan.held and not plan.has_changes and not plan.unsavable:
+            self._end_work(plan)  # nic nedržím a nic k odevzdání – jen ukončit práci
+            return
         check = self._check_open_files(plan, end_session)
         if check == "cancel":
             return
@@ -2093,7 +2172,8 @@ class MainWindow(QMainWindow):
                      on_done=lambda new: self._confirm_upload(new, end_session, preselect))
             return
         dlg = UploadDialog(plan, end_session, self, local=self.pm.local_dir(plan.name), preselect=preselect,
-                           drafts=self.pm.drafts(plan.name), users=self.notes.users or self._known_users())
+                           drafts=self.pm.drafts(plan.name), users=self.notes.users or self._known_users(),
+                           select_all=not preselect)
         accepted = self._exec_dialog(dlg, "upload")
         assignments, comment, selected = dlg.assignments(), dlg.comment_text(), dlg.selected_keys()
         notes = dlg.selected_notes()
@@ -2102,7 +2182,10 @@ class MainWindow(QMainWindow):
             return
         title = "Deaktivace" if end_session else "Odevzdání"
         files = selection_files(plan, assignments, selected)
-        session = self._before_session(plan.name, DEACTIVATE if end_session else SUBMIT, files,
+        # odevzdání, kterým práce skončí (vše odevzdáno), je pro skripty deaktivace – i v BEFORE
+        # ({ACTION} = deactivate jako dřív u tlačítka Deaktivovat; zpětná kompatibilita skriptů)
+        ends = end_session or auto_deactivation(plan, assignments, selected)[0]
+        session = self._before_session(plan.name, DEACTIVATE if ends else SUBMIT, files,
                                        comment, title) if has_script_changes(files) else None
         if session is False:
             return
@@ -2134,8 +2217,8 @@ class MainWindow(QMainWindow):
                    + f"\n\nUpravené: {res.modified}\nNové: {res.added}\n"
                    f"Přejmenované: {res.renamed}\nSmazané: {res.deleted}\nUvolněno: {res.released}")
             if res.auto_deactivated:
-                msg += (f"\n\nOdevzdal jste poslední soubory, které jste držel – projekt {plan.name} "
-                        "byl deaktivován.")
+                msg += (f"\n\nOdevzdal jste vše – práce na projektu {plan.name} skončila "
+                        "(projekt deaktivován).")
             elif res.note:
                 msg += "\n\n" + res.note
             if res.ended and self.settings.delete_local_after_deactivate and not res.local_deleted \
@@ -2169,6 +2252,27 @@ class MainWindow(QMainWindow):
 
         run_task(self, f"{title} – nahrávání projektu {plan.name}", work,
                  status_text="Přenáším data…", on_done=done, on_error=failed)
+
+    def _end_work(self, plan: UploadPlan) -> None:
+        """Odevzdat bez čehokoliv k odevzdání (nic nedržím, žádné změny – např. po aktivaci kvůli
+        nové složce): nabídne ukončit práci na projektu (deaktivace, místní kopie se smaže)."""
+        answer = QMessageBox.question(
+            self, "Odevzdat",
+            f"V projektu {plan.name} nedržíte žádný soubor a nemáte nic k odevzdání.\n\n"
+            "Ukončit práci na projektu? (Projekt se deaktivuje, místní kopie se smaže.)")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        def done(res) -> None:
+            self.refresh()
+            msg = f"Práce na projektu {plan.name} skončila (projekt deaktivován)."
+            if self.settings.delete_local_after_deactivate and not res.local_deleted:
+                msg += LOCAL_NOT_DELETED
+            QMessageBox.information(self, "Odevzdat", msg)
+
+        run_task(self, f"Ukončení práce – {plan.name}",
+                 lambda progress=None: self.pm.upload(plan, {}, "", None, end_session=True, progress=progress),
+                 status_text="Ukončuji…", on_done=done, on_error=lambda _: self.refresh())
 
     def _before_session(self, name: str, action: str, files: list[ScriptFile], comment: str,
                         title: str):
@@ -2251,6 +2355,22 @@ class MainWindow(QMainWindow):
             return ""
         QGuiApplication.clipboard().setText(p.name)
         return p.name
+
+    def _has_local_copy(self) -> bool:
+        """Má vybraný projekt místní složku, se kterou se pracuje? (na projektu pracuji, nebo
+        je jen místně)"""
+        p = self.selected()
+        return bool(p and (p.mine or p.local_only))
+
+    def copy_local_path(self) -> str:
+        """Kopírovat místní cestu: cesta k místní složce vybraného projektu do schránky (jen
+        u projektu, na kterém pracuji, nebo „Jen místně“)."""
+        p = self.selected()
+        if p is None or not self._has_local_copy():
+            return ""
+        path = str(self.pm.local_dir(p.name))
+        QGuiApplication.clipboard().setText(path)
+        return path
 
     def create_project(self) -> None:
         """Nový projekt v místním úložišti (prázdná složka) – zobrazí se jako „Jen místně“
@@ -2525,13 +2645,13 @@ class MainWindow(QMainWindow):
             self.refresh()
 
     def _on_double_click(self, index) -> None:
-        """Dvojklik: na názvu aktivace / deaktivace (jako F3), na komentáři jeho úprava,
-        jinde (a u projektu, který nelze aktivovat – např. Jen místně) otevření místní složky."""
+        """Dvojklik: na názvu Převzít / Odevzdat (jako F3), na komentáři jeho úprava,
+        jinde (a u projektu, který nelze převzít – např. Jen místně) otevření místní složky."""
+        p = self.selected()
         if index.column() == COL_COMMENT and self.act_comment.isEnabled():
             self.edit_comment()
-        elif index.column() == COL_NAME and (self.act_activate.isEnabled()
-                                             or self.act_deactivate.isEnabled()):
-            self.toggle_activation()
+        elif index.column() == COL_NAME and p and (p.mine or self._can_activate_selected()):
+            self.toggle_work()
         else:
             self.open_local(root_fallback=False)
 
@@ -3135,12 +3255,12 @@ class MainWindow(QMainWindow):
         drafts = [d for d in self.pm.drafts(name) if d.text.strip()]
         if not drafts:
             return True
-        box = QMessageBox(QMessageBox.Icon.Question, "Zrušit aktivaci",
+        box = QMessageBox(QMessageBox.Icon.Question, "Zahodit neodevzdané změny",
                           f"Máte {len(drafts)} rozepsaných poznámek. Co s nimi?", parent=self)
         publish = box.addButton("Zveřejnit", QMessageBox.ButtonRole.AcceptRole)
         keep = box.addButton("Ponechat na příště", QMessageBox.ButtonRole.ActionRole)
         discard = box.addButton("Zahodit", QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton("Nerušit aktivaci", QMessageBox.ButtonRole.RejectRole)
+        box.addButton("Zpět", QMessageBox.ButtonRole.RejectRole)
         box.exec()
         chosen = box.clickedButton()
         try:
@@ -3161,10 +3281,10 @@ class MainWindow(QMainWindow):
         if not p or not p.mine:
             return
         answer = QMessageBox.question(
-            self, "Zrušit aktivaci",
-            f"Zrušit aktivaci projektu {p.name}?\n\nŽádné změny se nenahrají na server a všechny "
-            "vaše zámky se uvolní. Místní kopie zůstane zachována, ale neodevzdané změny z ní už "
-            "nepůjde nahrát.",
+            self, "Zahodit neodevzdané změny",
+            f"Ukončit práci na projektu {p.name} bez odevzdání?\n\nŽádné změny se nenahrají na "
+            "server a všechny vaše zámky se uvolní (zrušení aktivace). Místní kopie zůstane "
+            "zachována, ale neodevzdané změny z ní už nepůjde nahrát.",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -3172,6 +3292,38 @@ class MainWindow(QMainWindow):
             return
         self._safe(lambda: self.pm.cancel_activation(p.name))
         self._reload_notes_window(p.name)
+
+    def delete_local_project(self) -> bool:
+        """Projekt „Jen místně“: celou jeho místní složku přesune do Koše (lze ji z něj vrátit).
+        Vrací, zda se smazala."""
+        p = self.selected()
+        if not p or not p.local_only:
+            return False
+        local = self.pm.local_dir(p.name)
+        # pojistka: jen složka přímo v místním úložišti (nikdy nic na serveru)
+        if not local.is_dir() or local.resolve().parent != Path(self.pm.local_root).resolve():
+            return False
+        try:
+            count = sum(1 for f in local.rglob("*") if f.is_file())
+        except OSError:
+            count = None
+        answer = QMessageBox.question(
+            self, "Smazat",
+            f"Smazat celou místní složku projektu {p.name}?\n\n{local}\n"
+            + (f"({count} souborů)\n" if count is not None else "")
+            + "\nProjekt je jen u vás (na serveru není). Složka se přesune do Koše – odtud ji "
+            "případně vrátíte.")
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            recycle.to_recycle_bin([local])
+        except OSError as e:
+            QMessageBox.warning(self, "Smazat", f"Složku se nepodařilo smazat (některý soubor je "
+                                f"otevřený?):\n{e}")
+            self.refresh(check_names=False)
+            return False
+        self.refresh(check_names=False)
+        return True
 
     def force_unlock(self) -> None:
         p = self.selected()

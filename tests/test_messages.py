@@ -141,12 +141,14 @@ def test_old_resolved_messages_move_to_archive(server):
     old = msgs.send(server, "alice", "PC", "Alča", [("bob", "")], "Starý vyřízený")
     open_ = msgs.send(server, "alice", "PC", "Alča", [("bob", "")], "Starý nevyřízený")
     msgs.set_resolved(load(server, old), "bob", "Bob")
+    msgs.set_resolved(load(server, open_), "bob", "Bob")      # vyřízený, ale autor nedokončil
+    msgs.set_resolved(load(server, old), "alice", "Alča")    # dokončeno autorem
     store = MessageStore(server)
     later = datetime.now() + timedelta(days=91)
     assert store.archive_old(store.load(), 0, later) == []                 # 0 = nearchivovat
     assert store.archive_old(store.load(), 90, datetime.now()) == []        # ještě není starý
     store._archived_on = ""
-    assert store.archive_old(store.load(), 90, later) == [old]              # jen vyřízený
+    assert store.archive_old(store.load(), 90, later) == [old]              # jen dokončený autorem
     assert store.archive_old(store.load(), 90, later) == []                 # nejvýš jednou denně
     assert [m.id for m in store.load()] == [open_]                          # běžné načtení bez archivu
     (arch,) = store.load_archive()

@@ -386,7 +386,7 @@ def test_new_folder_in_inactive_project_activates_without_locks(carol_window, en
     monkeypatch.setattr(QMessageBox, "question",
                         lambda *a, **k: asked.append(a[2]) or QMessageBox.StandardButton.No)
     panel.create_folder("sestava/elektrody/")                        # odmítnutá aktivace
-    assert "bez zamčení souborů" in asked[-1] and not carol.local_dir("Forma").exists()
+    assert "bez převzetí souborů" in asked[-1] and not carol.local_dir("Forma").exists()
     assert not w.selected().mine
     monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
     panel.create_folder("sestava/elektrody/")

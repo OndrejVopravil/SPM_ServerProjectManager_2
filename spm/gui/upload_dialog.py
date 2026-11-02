@@ -58,11 +58,13 @@ TABS = [
 class UploadDialog(QDialog):
     def __init__(self, plan: UploadPlan, end_session: bool, parent: QWidget | None = None,
                  local: Path | None = None, preselect: str | list[str] | None = None,
-                 drafts: list[Draft] | None = None, users: list | None = None):
+                 drafts: list[Draft] | None = None, users: list | None = None,
+                 select_all: bool = False):
         """local: místní kopie projektu (pro ikony souborů).
         preselect: soubor nebo složka (zakončená '/'), jejíž změny budou předem zaškrtnuté.
         drafts: rozepsané poznámky (ze starších verzí) – zaškrtnuté se zveřejní s odevzdáním.
-        users: známí uživatelé (adresát předávací poznámky)."""
+        users: známí uživatelé (adresát předávací poznámky).
+        select_all: vše předem zaškrtnuté (Odevzdat na projektu – lišta, pravé tlačítko)."""
         super().__init__(parent)
         self.plan = plan
         self.local = local
@@ -193,7 +195,9 @@ class UploadDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-        if preselect and self.selectable:
+        if select_all and self.selectable:
+            self.checked = {e.key for _, e in self._entries()}
+        elif preselect and self.selectable:
             old_paths = {bf.file_id: bf.path for bf in plan.missing}
             self.checked = {e.key for _, e in self._entries()
                             if in_scope(e.path, preselect) or in_scope(old_paths.get(e.key, ""), preselect)}
@@ -407,6 +411,6 @@ class UploadDialog(QDialog):
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not error)
         if self.selectable:
             ends, note = auto_deactivation(self.plan, self.assignments(), self.checked)
-            self.auto_info.setText("Odevzdáváte poslední soubory, které držíte – projekt se poté "
-                                   "deaktivuje." if ends else note)
+            self.auto_info.setText("Odevzdáváte vše – práce na projektu tím skončí (projekt se "
+                                   "deaktivuje, místní kopie se smaže)." if ends else note)
             self.auto_info.setVisible(bool(ends or note))

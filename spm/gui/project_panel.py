@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -72,7 +71,7 @@ COLOR_FOUND = QColor("#fff176")  # podbarvení souborů nalezených hledáním
 SEARCH_EXPAND_DELAY_MS = 1000    # prodleva před rozbalením složek s nalezenými soubory
 
 
-def _tree_icon(expand: bool, color: str = "#7a7a7a") -> QIcon:
+def tree_icon(expand: bool, color: str = "#7a7a7a") -> QIcon:
     """Ikona „rozbalit vše“ (⊞) / „sbalit vše“ (⊟): čtvereček s plusem / mínusem; barevná
     varianta = „rozbalit aktivní složky“ (barva mých souborů ve stromu)."""
     pixmap = QPixmap(16, 16)
@@ -123,10 +122,12 @@ class EntriesThread(QThread):
                 renames = self.pm.local_renames(self.name)
                 if renames:
                     old_of = {new: old for old, new in renames.items()}
-                    entries = [e for e in entries if not (e.local_deleted and e.path in renames)]
+                    held = {e.path for e in entries if e.local_deleted and e.path in renames}
+                    entries = [e for e in entries if e.path not in held]
                     for e in entries:
                         if e.local_new and e.path in old_of:
                             e.renamed_from = old_of[e.path]
+                            e.renamed_held = e.renamed_from in held
             local = self.pm.local_dir(self.name)
             if local.is_dir():  # co je v místní kopii, lze otevřít (cizí / volné jen pro čtení)
                 for e in entries:
@@ -138,6 +139,16 @@ class EntriesThread(QThread):
             self.done.emit(self.name, entries, "")
         except Exception as e:  # noqa: BLE001 – zobrazí se v panelu
             self.done.emit(self.name, [], str(e) or type(e).__name__)
+
+
+def moved_aside_warning(pm: ProjectManager, name: str) -> str:
+    """Upozornění pro první převzetí (aktivaci): existující místní složka projektu se odsune
+    do <projekt>_puvodni_<datum> ("" = složka neexistuje, nic se neodsune)."""
+    local = pm.local_dir(name)
+    if not local.exists():
+        return ""
+    return (f"Upozornění: místní složka {local} už existuje – před stažením projektu se "
+            f"přesune do složky {name}_puvodni_<datum> (nic se nesmaže).")
 
 
 class ProjectPanel(QWidget):
@@ -173,15 +184,18 @@ class ProjectPanel(QWidget):
         # aktivace bez zámků a bez stahování (nová složka / vložení souborů do projektu, který
         # nemám aktivovaný); vrací, zda se povedla – nastaví hlavní okno
         self.quick_activate: Callable[[], bool] = lambda: False
+        # Otevřít soubory, které nemám převzaté: na pozadí je převezme (u projektu, na kterém
+        # nepracuji, ho aktivuje) a pak otevře – nastaví hlavní okno (None = jen otevřít)
+        self.open_taking: Callable[[list[str]], None] | None = None
 
         self.title = QLabel()
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.only_locked = QCheckBox("Jen zamčené soubory")
         self.only_locked.toggled.connect(self._fill)
-        # hledání v názvech souborů („obsahuje“, * = cokoliv); nalezené se podbarví žlutě
+        # hledání v názvech souborů a složek („obsahuje“, * = cokoliv); nalezené se podbarví žlutě
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Hledat soubor…  (* = cokoliv, Esc zruší)")
+        self.search.setPlaceholderText("Hledat soubor nebo složku…  (* = cokoliv, Esc zruší)")
         self.search.setClearButtonEnabled(True)
         self.search.setMaximumWidth(300)
         self.search.textChanged.connect(self._on_search_text)
@@ -191,12 +205,12 @@ class ProjectPanel(QWidget):
         self._expand_timer.setSingleShot(True)
         self._expand_timer.setInterval(SEARCH_EXPAND_DELAY_MS)
         self._expand_timer.timeout.connect(self.expand_found)
-        self.btn_expand = self._tool_button(_tree_icon(expand=True), "Rozbalit všechny složky",
+        self.btn_expand = self._tool_button(tree_icon(expand=True), "Rozbalit všechny složky",
                                             lambda: self.tree.expandAll())
-        self.btn_collapse = self._tool_button(_tree_icon(expand=False), "Sbalit všechny složky",
+        self.btn_collapse = self._tool_button(tree_icon(expand=False), "Sbalit všechny složky",
                                               lambda: self.tree.collapseAll())
         self.btn_expand_active = self._tool_button(
-            _tree_icon(expand=True, color=COLOR_MINE.name()),
+            tree_icon(expand=True, color=COLOR_MINE.name()),
             "Rozbalit aktivní složky – jen složky s aktivovanými soubory (v mém aktivovaném "
             "projektu moje zamčené a nové soubory, jinak soubory aktivované ostatními)",
             lambda: self.expand_active())
@@ -344,16 +358,14 @@ class ProjectPanel(QWidget):
             return
 
         def tree_entry(e: FileEntry) -> TreeEntry:
-            if e.local_deleted:  # šedě = můj soubor smazaný v místní kopii, ještě neodevzdaný
-                return TreeEntry(e.path, e.path, ["smazán – neodevzdaný"], color=color_new,
-                                 color_name=True, file_path=str(to_abs(root, e.path)),
-                                 tooltip="Soubor je v Koši Windows. Na serveru se smaže až při "
-                                         "odevzdání (do koše projektu).")
-            if e.renamed_from:  # šedě = můj soubor přejmenovaný v místní kopii, neodevzdaný
-                # krátce (dlouhý text by zúžil sloupec s názvy); původní cesta je v bublině
+            if e.renamed_from:  # můj soubor přejmenovaný v místní kopii, neodevzdaný
+                # krátce (dlouhý text by zúžil sloupec s názvy); původní cesta je v bublině.
+                # Šedě jen stav ve sloupci Drží – název zůstane zelený, dokud soubor držím.
                 same_folder = e.renamed_from.rpartition("/")[0] == e.path.rpartition("/")[0]
                 return TreeEntry(e.path, e.path, ["přejmenován" if same_folder else "cesta přejmenována"],
-                                 color=color_new, color_name=True, file_path=str(to_abs(local, e.path)),
+                                 color=color_new, color_name=True,
+                                 name_color=COLOR_MINE if e.renamed_held else None,
+                                 file_path=str(to_abs(local, e.path)),
                                  tooltip=f"Původně: {e.renamed_from}\nPřejmenováno ve vaší místní kopii; "
                                          "na serveru se přejmenuje při odevzdání.\nDvojklikem otevřete.")
             if e.local_new:  # šedě = nový soubor jen v mé místní kopii
@@ -381,12 +393,15 @@ class ProjectPanel(QWidget):
                              color_name=True,
                              file_path=str(to_abs(root, e.path)), tooltip=tip)
 
-        shown = [e for e in self.entries
-                 if e.owner or e.local_new or not self.only_locked.isChecked()]
+        # můj soubor smazaný v místní kopii (v Koši Windows) se ve stromu nezobrazuje – na
+        # serveru se smaže až při odevzdání; vidět je v dialogu Odevzdat a v souhrnu nahoře
+        shown = [e for e in self.entries if not e.local_deleted
+                 and (e.owner or e.local_new or not self.only_locked.isChecked())]
         self.tree.set_entries([tree_entry(e) for e in shown] + empty)
         counts = Counter("já" if e.mine else e.owner.label for e in self.entries if e.owner)
         free = sum(1 for e in self.entries if e.free)
         new = sum(1 for e in self.entries if e.local_new)
+        deleted = sum(1 for e in self.entries if e.local_deleted)
         mirrored = sum(1 for e in self.entries if e.mirror and not e.owner)
         stale = sum(1 for e in self.entries if e.mirror and e.mirror_stale)
         parts = [f"{who}: <b>{n}</b>" for who, n in sorted(counts.items())]
@@ -398,6 +413,7 @@ class ProjectPanel(QWidget):
             + (f" (<span style='color:{COLOR_MIRROR_STALE.name()}'>neaktuální: <b>{stale}</b></span>)"
                if stale else "")
             + (f" &nbsp;|&nbsp; nové neodevzdané: <b>{new}</b>" if new else "")
+            + (f" &nbsp;|&nbsp; smazané neodevzdané: <b>{deleted}</b>" if deleted else "")
             + f" &nbsp;|&nbsp; na serveru celkem: {len(self.entries) - new}"
             + self._mark_mirror())
 
@@ -470,12 +486,12 @@ class ProjectPanel(QWidget):
         return len(folders)
 
     def expand_found(self) -> None:
-        """Rozbalí složky, ve kterých jsou soubory odpovídající hledání (ostatní nechá být)."""
+        """Rozbalí složky, ve kterých jsou nalezené soubory a složky (ostatní nechá být)."""
         match = wildcard_matcher(self.search.text())
         if match is None:
             return
         first = None
-        for item in self.tree.leaf_items():
+        for item in all_items(self.tree):
             if match(item.text(0)):
                 parent = item.parent()
                 while parent is not None:
@@ -486,8 +502,12 @@ class ProjectPanel(QWidget):
             self.tree.scrollToItem(first)
 
     def _apply_search(self, scroll: bool = False) -> None:
-        """Podbarví žlutě soubory, jejichž název obsahuje hledaný text (s * jako „cokoliv“)."""
+        """Podbarví žlutě soubory a složky, jejichž název obsahuje hledaný text (s * jako
+        „cokoliv“)."""
         match = wildcard_matcher(self.search.text())
+        if match is not None:  # u velkého projektu chvíli trvá – ukázat hned, že se hledá
+            self.found.setText("Vyhledávám…")
+            self.found.repaint()
         found = self.tree.highlight(match, COLOR_FOUND)
         self.found.setText(f"Nalezeno: {len(found)}" if match else "")
         if scroll and found:
@@ -579,8 +599,9 @@ class ProjectPanel(QWidget):
             # projekt, který nemám aktivovaný: aktivace s předvybranými soubory
             "activate": (not local_only and not mine_project and self.can_activate()
                          and any(e.free for e in inside)),
-            # otevřít jde jakýkoliv soubor, který je v místní kopii (cizí a volné jen pro čtení)
-            "open": not any_folder and any(e.in_local for e in inside),
+            # otevřít jde soubor v místní kopii (cizí jen pro čtení) a volný soubor – ten se
+            # před otevřením převezme (i když v místní kopii ještě není)
+            "open": not any_folder and any(e.in_local or self._can_take_to_open(e) for e in inside),
             # u složky vždy – dialog odevzdání ukáže, co v ní skutečně je
             "submit": mine_project and (any_folder or own),
             "take": mine_project and any(e.free for e in inside),
@@ -605,6 +626,35 @@ class ProjectPanel(QWidget):
             "unzip": ((local_only or mine_project) and single_file and zip_ops.is_zip(scopes[0])
                       and any(e.in_local for e in inside)),
         }
+
+    def _can_take_to_open(self, entry: FileEntry) -> bool:
+        """Volný soubor, který Otevřít převezme (v projektu, na kterém pracuji, nebo který lze
+        aktivovat)."""
+        if self.open_taking is None or self.project is None or self.project.local_only or not entry.free:
+            return False
+        return self.project.mine or self.can_activate()
+
+    def open_files(self, paths: list[str]) -> None:
+        """Otevřít (kontextové menu): volné soubory se nejdřív převezmou (hlavní okno, na
+        pozadí), ostatní se otevřou z místní kopie (cizí jen pro čtení)."""
+        if any(self._can_take_to_open(e) for e in self.entries if e.path in paths):
+            self.open_taking(paths)
+        else:
+            self._open(paths)
+
+    def open_local_paths(self, paths: list[str]) -> None:
+        """Otevře soubory z místní kopie podle cesty (po převzetí – strom se ještě načítá)."""
+        if self.project is None:
+            return
+        local = self.pm.local_dir(self.project.name)
+        existing = [p for p in paths if to_abs(local, p).is_file()]
+        if len(existing) > self.OPEN_CONFIRM_OVER and QMessageBox.question(
+                self, "Otevřít soubory", f"Otevřít najednou {len(existing)} souborů?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        for p in existing:
+            if not self._start(to_abs(local, p)):
+                break
 
     def release_mirror(self, scopes: list[str]) -> None:
         """Uvolní neaktuální zrcadlené soubory (po potvrzení)."""
@@ -640,6 +690,11 @@ class ProjectPanel(QWidget):
         paths = [e.path for e in self.entries] + [f.rstrip("/") + "/" for f in self.empty_folders]
         return name_dialog.child_folders(paths, parent)
 
+    def sibling_names(self, parent: str) -> list[str]:
+        """Názvy souborů a složek ve složce parent ('' = kořen) – nabízejí se při přejmenování."""
+        paths = [e.path for e in self.entries] + [f.rstrip("/") + "/" for f in self.empty_folders]
+        return name_dialog.child_names(paths, parent)
+
     def copy_names(self, scopes: list[str]) -> str:
         """Kopírovat název: názvy označených souborů a složek (bez cesty) do schránky – každý
         na samostatném řádku."""
@@ -662,11 +717,13 @@ class ProjectPanel(QWidget):
             return True
         if not self._can_quick_activate():
             return False
+        warning = moved_aside_warning(self.pm, self.project.name)
         answer = QMessageBox.question(
-            self, "Aktivovat projekt",
-            f"Projekt {self.project.name} nemáte aktivovaný.\n\nAby šlo {what}, aktivuje se bez "
-            "zamčení souborů a bez stahování (rychle). Ostatní uvidí, že projekt máte aktivovaný; "
-            "nic jim tím nezamknete. Nové soubory pak odevzdáte jako obvykle.\n\nAktivovat?")
+            self, "Začít pracovat na projektu",
+            f"Na projektu {self.project.name} zatím nepracujete.\n\nAby šlo {what}, projekt se "
+            "aktivuje bez převzetí souborů a bez stahování (rychle). Ostatní uvidí, že na projektu "
+            "pracujete; nic jim tím nezamknete. Nové soubory pak odevzdáte jako obvykle."
+            + (f"\n\n{warning}" if warning else "") + "\n\nPokračovat?")
         if answer != QMessageBox.StandardButton.Yes:
             return False
         return self.quick_activate()
@@ -723,17 +780,23 @@ class ProjectPanel(QWidget):
             self._rename_folder(path)
             return
         folder, _, old_name = path.rpartition("/")
+        ext = name_dialog.split_ext(old_name)[1]
+        siblings = [n for n in self.sibling_names(folder) if n.lower() != old_name.lower()]
         new_name = old_name
         while True:
-            new_name, ok = QInputDialog.getText(
+            new_name, ok = name_dialog.ask_text(
                 self, "Přejmenovat soubor",
                 f"Nový název souboru „{old_name}“"
                 + (f"\n(ve složce {folder})" if folder else "") + ":"
+                + (f"\nKoncovka {ext} se zachová, pokud nenapíšete jinou." if ext else "")
                 + ("" if self.project.local_only else
                    "\n\nPřejmenuje se ve vaší místní kopii, na serveru až při odevzdání."),
-                QLineEdit.EchoMode.Normal, new_name)
+                new_name, siblings, name_dialog.RENAME_HINT, file_name=True)
             new_name = new_name.strip()
-            if not ok or new_name == old_name:
+            if not ok or not new_name:
+                return
+            new_name = name_dialog.keep_extension(old_name, new_name)
+            if new_name == old_name:
                 return
             error = validate_file_name(new_name, self.pm.settings.check_forbidden_chars)
             if not error:
@@ -749,15 +812,16 @@ class ProjectPanel(QWidget):
         folder = path.rstrip("/")
         parent, _, old_name = folder.rpartition("/")
         title = "Přejmenovat složku"
+        siblings = [n for n in self.sibling_names(parent) if n.lower() != old_name.lower()]
         new_name = old_name
         while True:
-            new_name, ok = QInputDialog.getText(
+            new_name, ok = name_dialog.ask_text(
                 self, title,
                 f"Nový název složky „{old_name}“" + (f"\n(ve složce {parent})" if parent else "") + ":"
                 + ("" if self.project.local_only else
                    "\n\nPřejmenuje se ve vaší místní kopii, na serveru až při odevzdání "
                    "(soubory si ponechají historii i zálohy)."),
-                QLineEdit.EchoMode.Normal, new_name)
+                new_name, siblings, name_dialog.RENAME_HINT)
             new_name = new_name.strip()
             if not ok or new_name == old_name:
                 return
@@ -1242,11 +1306,11 @@ class ProjectPanel(QWidget):
         act_open.setEnabled(enabled["open"])
         menu.addSeparator()
         act_activate = act_submit = act_take = act_publish = None
-        if self.project.local_only:
-            act_publish = menu.addAction("Publikovat…" + many)
+        if self.project.local_only:  # odevzdání složky „Jen místně“ = nový projekt na serveru
+            act_publish = menu.addAction("Odevzdat na server…" + many)
             act_publish.setEnabled(enabled["publish"])
-        elif not self.project.mine:
-            act_activate = menu.addAction("Aktivovat…" + many)
+        elif not self.project.mine:  # první převzetí = aktivace projektu
+            act_activate = menu.addAction("Převzít…" + many)
             act_activate.setEnabled(enabled["activate"])
         else:
             act_submit = menu.addAction("Odevzdat…" + many)
@@ -1285,15 +1349,11 @@ class ProjectPanel(QWidget):
             act_note = menu.addAction("Přidat poznámku…" + many + "\tCtrl+N")
             act_history = menu.addAction("Historie souboru…")
             act_history.setEnabled(enabled["history"])
-        if not self.project.mine and not self.project.local_only:
-            menu.addSeparator()
-            note = menu.addAction("Odevzdat a převzít lze až u aktivovaného projektu")
-            note.setEnabled(False)
         chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if chosen is None:
             return
         if chosen is act_open:
-            self._open([s for s in scopes if not s.endswith("/")])
+            self.open_files([s for s in scopes if not s.endswith("/")])
         elif chosen is act_activate:
             self.activate_requested.emit(scopes)
         elif chosen is act_publish:
@@ -1362,6 +1422,10 @@ class ProjectPanel(QWidget):
             QMessageBox.warning(self, "Otevřít soubor",
                                 f"Soubor v místní kopii neexistuje (byl přejmenován nebo smazán?):\n{local}")
             return False
+        return self._start(local)
+
+    def _start(self, local: Path) -> bool:
+        """Otevře soubor výchozí aplikací Windows; False = nepodařilo se (chyba ohlášena)."""
         try:
             os.startfile(local)
         except OSError as e:

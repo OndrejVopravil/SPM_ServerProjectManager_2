@@ -207,6 +207,7 @@ class FileEntry:
     local_deleted: bool = False  # můj zamčený soubor, v místní kopii smazaný (do Koše), neodevzdaný
     in_local: bool = False       # soubor je v mé místní kopii (lze ho otevřít)
     renamed_from: str | None = None  # můj soubor přejmenovaný v místní kopii (původní cesta)
+    renamed_held: bool = False   # přejmenovaný soubor mám zamčený (držím původní cestu)
     mirror: str | None = None    # soubor spravuje zrcadlo z jiného serveru (cesta zdrojového projektu)
     mirror_server_id: str = ""   # identita zdrojové síťové složky (pro název záložky)
     mirror_server_name: str = ""
@@ -317,22 +318,22 @@ def auto_deactivation(plan: UploadPlan, assignments: dict[str, str | None],
                       selected: set[str] | None) -> tuple[bool, str]:
     """Deaktivuje se projekt po odevzdání? Vrací (ano/ne, důvod, proč ne – nebo "").
 
-    Ano, pokud odevzdáním uvolním poslední soubor ze serveru, který držím.
-    Ne, pokud jsem žádný soubor ze serveru nedržel (jen přidávám nové soubory – např.
-    NC programy k cizím elektrodám; pracuji dál), nebo pokud by se ztratila neodevzdaná
-    místní práce (deaktivace může smazat místní kopii)."""
+    Ano, pokud po odevzdání nedržím žádný zamčený soubor a v místní kopii nezůstane nic
+    neodevzdaného – i když jsem nic nedržel a jen přidával nové soubory (samostatné
+    tlačítko Deaktivovat není, práce na projektu tím končí). Ne, pokud by se ztratila
+    neodevzdaná místní práce (deaktivace může smazat místní kopii)."""
     held = plan.held
-    if not held or (selected is not None and any(f not in selected for f in held)):
+    if selected is not None and any(f not in selected for f in held):
         return False, ""
     targets = {p for p in assignments.values() if p}
     leftover = [lf.path for lf in plan.new if lf.path not in targets
                 and selected is not None and new_key(lf.path) not in selected]
     if leftover:
-        return False, (f"Odevzdáváte poslední držené soubory, ale v místní kopii zůstává "
-                       f"{len(leftover)} neodevzdaných nových souborů – projekt zůstane aktivovaný.")
+        return False, (f"V místní kopii zůstane {len(leftover)} neodevzdaných nových souborů – "
+                       "projekt zůstane aktivovaný (práce na něm neskončí).")
     if plan.unsavable:
-        return False, ("Odevzdáváte poslední držené soubory, ale místní kopie obsahuje změny, které "
-                       "nelze nahrát (viz Upozornění) – projekt zůstane aktivovaný.")
+        return False, ("Místní kopie obsahuje změny, které nelze nahrát (viz Upozornění) – projekt "
+                       "zůstane aktivovaný (práce na něm neskončí).")
     return True, ""
 
 
@@ -665,7 +666,7 @@ class ProjectManager:
         except OSError:
             on_server = False  # síť nedostupná – shoda se ověří při publikování
         if on_server:
-            raise SyncError(f"Na serveru už projekt {name} existuje – aktivujte ho, místo "
+            raise SyncError(f"Na serveru už projekt {name} existuje – převezměte ho, místo "
                             "vytváření nového.")
         path = self.local_dir(name)
         path.mkdir(parents=True)
@@ -810,8 +811,13 @@ class ProjectManager:
             if entry is not None and entry.file_id not in mine:
                 raise SyncError("Soubor nemáte zamčený – přejmenovat ho nelze. Nejdřív ho převezměte.")
             other = taken.get(new_path.lower())
-            if other is not None and not case_only and (entry is None or other.file_id != entry.file_id):
-                raise SyncError(f"Na serveru už je soubor s tímto názvem:\n{new_path}")
+            # můj převzatý soubor, který v místní kopii chybí (např. přejmenovaný A -> B a teď
+            # zpět B -> A): název je můj – při odevzdání se ten soubor nahradí tímto
+            own_missing = other is not None and other.file_id in mine and not dst.exists()
+            if other is not None and not case_only and not own_missing \
+                    and (entry is None or other.file_id != entry.file_id):
+                raise SyncError(f"Na serveru už je soubor s tímto názvem:\n{new_path}\n\n"
+                                "Pokud ho chcete nahradit, nejdřív ho převezměte.")
         os.rename(src, dst)
         return new_path
 
@@ -908,7 +914,10 @@ class ProjectManager:
                                 "v ní i ve všech podsložkách. Neaktivované:\n"
                                 + "\n".join(foreign[:15]) + ("\n…" if len(foreign) > 15 else ""))
             new_prefix = new_folder.lower() + "/"
-            if not case_only and any(p.lower().startswith(new_prefix) for p in files):
+            # složka se stejným názvem na serveru, jejíž soubory všechny držím a v místní kopii
+            # chybějí (přejmenovaná A -> B a teď zpět B -> A), je moje – lze
+            occupied = [f for p, f in files.items() if p.lower().startswith(new_prefix)]
+            if not case_only and any(f.file_id not in mine for f in occupied):
                 raise SyncError(f"Na serveru už je složka s tímto názvem:\n{new_folder}")
         os.rename(src, dst)
         return new_folder

@@ -100,6 +100,27 @@ def test_recipient_resolves_and_cc_marks_read(qapp, pms):
     assert wj.open_for_me() == 0
 
 
+def test_resolved_message_stays_open_until_author_completes(qapp, pms):
+    alice, bob, jana, server = pms
+    msgs.send(server, "alice", "PC", "Alča", [("bob", "Bobík")], "Výkres")
+    wb = window(bob)
+    (card,) = wb.card_widgets()
+    card.resolved.setChecked(True)                                  # adresát vyřídil
+    qapp.processEvents()
+    wb.reload()
+    assert wb.open_for_me() == 0 and len(wb.card_widgets()) == 1    # pořád v Otevřených
+    wa = window(alice)
+    (card,) = wa.card_widgets()
+    assert "vyřízeno: Bobík" in card.who.text()
+    card.resolved.setChecked(True)                                  # autor dokončil
+    qapp.processEvents()
+    wa.reload()
+    wb.reload()
+    assert wa.card_widgets() == [] and wb.card_widgets() == []
+    wa.set_filter("all")
+    assert len(wa.card_widgets()) == 1
+
+
 def test_reply_and_edit_in_card(qapp, pms):
     alice, bob, jana, server = pms
     msgs.send(server, "alice", "PC", "Alča", [("bob", "")], "Otázka")
@@ -334,6 +355,7 @@ def test_archive_view_and_seen_cleanup(qapp, pms):
     alice, bob, jana, server = pms
     old = msgs.send(server, "alice", "PC", "Alča", [("bob", "")], "Dávno vyřízený")
     msgs.set_resolved(next(m for m in MessageStore(server).load() if m.id == old), "bob", "Bob")
+    msgs.set_resolved(next(m for m in MessageStore(server).load() if m.id == old), "alice", "Alča")
     wb = window(bob, seen={"neexistujici_vzkaz": "2020-01-01T00:00:00"})
     wb.show_messages()
     assert "neexistujici_vzkaz" not in wb.state["seen"] and old in wb.state["seen"]   # úklid
@@ -371,6 +393,7 @@ def test_background_check_archives_with_configured_days(qapp, pms, monkeypatch):
     alice, bob, jana, server = pms
     old = msgs.send(server, "alice", "PC", "Alča", [("bob", "")], "Vyřízený")
     msgs.set_resolved(next(m for m in MessageStore(server).load() if m.id == old), "bob", "Bob")
+    msgs.set_resolved(next(m for m in MessageStore(server).load() if m.id == old), "alice", "Alča")
     bob.settings.messages_archive_days = 10                         # ze spm_config.json
     w = make_main(qapp, bob)
     try:

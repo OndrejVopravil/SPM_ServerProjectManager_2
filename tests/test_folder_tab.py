@@ -278,3 +278,116 @@ def test_drag_over_folder_highlights_target(panel, env, folder):
     QApplication.sendEvent(tree.viewport(), QDragLeaveEvent())
     assert not tree._drop_active
     assert not mime.rendered()                                      # nic se nepřipravilo
+
+
+def _wait(cond, timeout=5.0):
+    import time
+
+    from PySide6.QtWidgets import QApplication
+    deadline = time.time() + timeout
+    while not cond() and time.time() < deadline:
+        QApplication.processEvents()
+    return cond()
+
+
+def test_rename_in_folder_keeps_extension_and_suggests(folder):
+    """F2 ve Složce: našeptávání podle názvů na stejné úrovni, označený název bez koncovky,
+    smazaná koncovka se zachová."""
+    from PySide6.QtWidgets import QApplication, QLineEdit, QStyleOptionViewItem
+
+    p, data = folder
+    write(data / "vykres_b.dwg", "b")
+    p.resize(600, 400)
+    p.show()
+    index = p.model.index(str(data / "vykres.dwg"))
+    assert _wait(lambda: p.model.rowCount(p.model.index(str(data))) == 3)
+    delegate = p.tree.itemDelegateForColumn(0)
+    editor = delegate.createEditor(p.tree.viewport(), QStyleOptionViewItem(), index)
+    assert isinstance(editor, QLineEdit)
+    names = editor.completer().model().stringList()
+    assert sorted(names) == ["podklady", "vykres_b.dwg"]                 # bez sebe sama
+    delegate.setEditorData(editor, index)
+    assert editor.selectedText() == "vykres"
+    assert p.model.setData(index, "vykres_A")                            # koncovka smazaná
+    assert _wait(lambda: (data / "vykres_A.dwg").is_file())
+    assert not (data / "vykres_A").exists()
+    folder_index = p.model.index(str(data / "podklady"))
+    assert p.model.setData(folder_index, "podklady.old")                 # složka beze změny pravidla
+    assert _wait(lambda: (data / "podklady.old").is_dir())
+    editor.deleteLater()
+    QApplication.processEvents()
+
+
+def test_search_in_folder(folder):
+    """Hledání v záložce Složka (jako ve stromu projektu): „obsahuje“, * = cokoliv, bez
+    ohledu na velikost písmen a diakritiku, i v podsložkách; nalezené žlutě, jejich složky se
+    rozbalí; Esc hledání zruší."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QShortcut
+
+    from spm.gui.folder_panel import _key, find_files
+    from spm.gui.project_panel import COLOR_FOUND
+    from spm.gui.search import wildcard_matcher
+    p, data = folder
+    write(data / "podklady" / "hluboko" / "Výkres_A.PDF", "x")
+    found, limited = find_files(data, wildcard_matcher("*.pdf"))
+    assert [f.relative_to(data).as_posix() for f in found] == ["podklady/a.pdf", "podklady/hluboko/Výkres_A.PDF"]
+    assert not limited and find_files(data, wildcard_matcher("pdf"), limit=1)[1]
+
+    p.resize(600, 400)
+    p.show()
+    p.search.setText("vykres_a")                                      # bez diakritiky
+    p.run_search()
+    assert _wait(lambda: p.found_label.text() == "Nalezeno: 1")
+    target = data / "podklady" / "hluboko" / "Výkres_A.PDF"
+    assert p.found == {_key(target)}
+    index = p.model.index(str(target))
+    assert p.model.data(index, Qt.ItemDataRole.BackgroundRole) == COLOR_FOUND
+    assert p.model.data(p.model.index(str(data / "vykres.dwg")), Qt.ItemDataRole.BackgroundRole) != COLOR_FOUND
+    p.expand_found()
+    assert p.tree.isExpanded(p.model.index(str(data / "podklady")))
+    assert p.tree.isExpanded(p.model.index(str(data / "podklady" / "hluboko")))
+    shortcut = next(s for s in p.findChildren(QShortcut) if s.key().toString() == "Esc")
+    shortcut.activated.emit()
+    p.run_search()
+    assert p.search.text() == "" and p.found == set() and p.found_label.text() == ""
+
+
+def test_search_while_typing_expands_found(folder):
+    """Po dopsání (pauza) se hledá na pozadí a pak se rozbalí složky s nalezenými soubory."""
+    p, data = folder
+    p.resize(600, 400)
+    p.show()
+    p.search.setText("a.p")
+    p.search.setText("a.pdf")                                         # psaní dál – staré se zahodí
+    assert p.found_label.text() == "Vyhledávám…"                      # hned při psaní
+    assert _wait(lambda: p.tree.isExpanded(p.model.index(str(data / "podklady"))), timeout=8)
+    assert p.found_label.text() == "Nalezeno: 1"
+
+
+def test_collapse_all_folders(folder):
+    """Tlačítko Sbalit všechny složky (jako ve stromu projektu)."""
+    p, data = folder
+    p.show()
+    index = p.model.index(str(data / "podklady"))
+    p.tree.expand(index)
+    assert p.tree.isExpanded(index)
+    p.btn_collapse.click()
+    assert not p.tree.isExpanded(index) and p.btn_collapse.toolTip() == "Sbalit všechny složky"
+
+
+def test_search_in_folder_finds_folders(folder):
+    """Hledání v záložce Složka najde i složky (rozbalí cestu k nim)."""
+    p, data = folder
+    write(data / "podklady" / "Hluboko" / "x.txt", "x")
+    p.show()
+    p.search.setText("hlub")
+    p.run_search()
+    assert _wait(lambda: p.found_label.text() == "Nalezeno: 1")
+    p.expand_found()
+    assert p.tree.isExpanded(p.model.index(str(data / "podklady")))
+    from PySide6.QtCore import Qt
+
+    from spm.gui.project_panel import COLOR_FOUND
+    index = p.model.index(str(data / "podklady" / "Hluboko"))
+    assert p.model.data(index, Qt.ItemDataRole.BackgroundRole) == COLOR_FOUND
